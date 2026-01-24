@@ -76,3 +76,29 @@ pub trait LlmContractTests: LlmProvider {
 }
 
 impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Completion, LlmContractTests, LlmError, LlmProvider, Message};
+
+    struct FakeLlmProvider;
+
+    impl LlmProvider for FakeLlmProvider {
+        fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+            if messages.is_empty() {
+                return Err(LlmError::EmptyMessages);
+            }
+            Ok(Completion::new("fake response"))
+        }
+    }
+
+    #[test]
+    fn fake_provider_passes_happy_path_contract() {
+        FakeLlmProvider.contract_happy_path();
+    }
+
+    #[test]
+    fn fake_provider_passes_error_contract() {
+        FakeLlmProvider.contract_rejects_empty_messages();
+    }
+}
