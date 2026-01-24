@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod llm;
+
 #[must_use]
 pub const fn placeholder() -> bool {
     true
