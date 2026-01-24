@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 #[must_use]
-pub fn placeholder() -> bool {
+pub const fn placeholder() -> bool {
     true
 }
 

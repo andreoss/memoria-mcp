@@ -1,4 +1,6 @@
-fn crate_name() -> &'static str {
+#![forbid(unsafe_code)]
+
+const fn crate_name() -> &'static str {
     "cli"
 }
 
