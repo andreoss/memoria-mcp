@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
 pub mod embedding;
+pub mod error;
 pub mod llm;
 pub mod vector_store;
+
+pub use error::CoreError;
 
 #[must_use]
 pub const fn placeholder() -> bool {
