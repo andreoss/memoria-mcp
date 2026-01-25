@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod embedding;
 pub mod llm;
 
 #[must_use]
