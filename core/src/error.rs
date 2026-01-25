@@ -28,3 +28,64 @@ impl std::error::Error for CoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestSourceError(String);
+
+    impl fmt::Display for TestSourceError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for TestSourceError {}
+
+    #[test]
+    fn not_found_display_is_sensible() {
+        let err = CoreError::NotFound("memory 42".to_string());
+        assert_eq!(err.to_string(), "not found: memory 42");
+    }
+
+    #[test]
+    fn validation_display_is_sensible() {
+        let err = CoreError::Validation("empty content".to_string());
+        assert_eq!(err.to_string(), "validation error: empty content");
+    }
+
+    #[test]
+    fn provider_display_is_sensible() {
+        let src = TestSourceError("boom".to_string());
+        let err = CoreError::Provider {
+            message: "llm failed".to_string(),
+            source: Box::new(src),
+        };
+        assert_eq!(err.to_string(), "provider error: llm failed");
+    }
+
+    #[test]
+    fn provider_source_returns_wrapped_error() {
+        let src = TestSourceError("boom".to_string());
+        let err = CoreError::Provider {
+            message: "llm failed".to_string(),
+            source: Box::new(src),
+        };
+        let source = std::error::Error::source(&err).expect("Provider must expose a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn non_provider_variants_have_no_source() {
+        assert!(std::error::Error::source(&CoreError::NotFound("x".to_string())).is_none());
+        assert!(std::error::Error::source(&CoreError::Validation("x".to_string())).is_none());
+    }
+
+    #[test]
+    fn implements_std_error() {
+        fn assert_error<E: std::error::Error>() {}
+        assert_error::<CoreError>();
+    }
+}
