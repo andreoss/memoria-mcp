@@ -59,6 +59,12 @@ mod tests {
     }
 
     #[test]
+    fn config_display_is_sensible() {
+        let err = CoreError::Config("missing api key".to_string());
+        assert_eq!(err.to_string(), "config error: missing api key");
+    }
+
+    #[test]
     fn provider_display_is_sensible() {
         let src = TestSourceError("boom".to_string());
         let err = CoreError::Provider {
@@ -83,6 +89,7 @@ mod tests {
     fn non_provider_variants_have_no_source() {
         assert!(std::error::Error::source(&CoreError::NotFound("x".to_string())).is_none());
         assert!(std::error::Error::source(&CoreError::Validation("x".to_string())).is_none());
+        assert!(std::error::Error::source(&CoreError::Config("x".to_string())).is_none());
     }
 
     #[test]
