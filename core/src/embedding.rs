@@ -38,3 +38,29 @@ pub trait EmbeddingContractTests: EmbeddingProvider {
 }
 
 impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::{EmbeddingContractTests, EmbeddingError, EmbeddingProvider};
+
+    struct FakeEmbeddingProvider;
+
+    impl EmbeddingProvider for FakeEmbeddingProvider {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            if text.is_empty() {
+                return Err(EmbeddingError::EmptyInput);
+            }
+            Ok(vec![0.0, 1.0, 0.0])
+        }
+    }
+
+    #[test]
+    fn fake_provider_passes_happy_path_contract() {
+        FakeEmbeddingProvider.contract_happy_path();
+    }
+
+    #[test]
+    fn fake_provider_passes_error_contract() {
+        FakeEmbeddingProvider.contract_rejects_empty_string();
+    }
+}
