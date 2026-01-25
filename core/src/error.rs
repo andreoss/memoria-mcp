@@ -4,6 +4,7 @@ use std::fmt;
 pub enum CoreError {
     NotFound(String),
     Validation(String),
+    Config(String),
     Provider {
         message: String,
         source: Box<dyn std::error::Error>,
@@ -15,6 +16,7 @@ impl fmt::Display for CoreError {
         match self {
             Self::NotFound(message) => write!(f, "not found: {message}"),
             Self::Validation(message) => write!(f, "validation error: {message}"),
+            Self::Config(message) => write!(f, "config error: {message}"),
             Self::Provider { message, .. } => write!(f, "provider error: {message}"),
         }
     }
