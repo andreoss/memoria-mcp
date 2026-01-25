@@ -2,6 +2,7 @@
 
 pub mod embedding;
 pub mod llm;
+pub mod vector_store;
 
 #[must_use]
 pub const fn placeholder() -> bool {
