@@ -110,6 +110,25 @@ pub trait VectorStoreContractTests: VectorStore {
         );
     }
 
+    fn contract_update_then_get_reflects_change(&self) {
+        let original = VectorRecord::new("a", vec![1.0, 2.0], vec![9, 9]);
+        self.insert(original).expect("insert should succeed");
+        let updated = VectorRecord::new("a", vec![3.0, 4.0], vec![8, 8]);
+        self.update(updated.clone()).expect("update should succeed");
+        let fetched = self.get("a").expect("get should succeed");
+        assert_eq!(fetched, Some(updated), "updated record should be reflected");
+    }
+
+    fn contract_update_nonexistent_returns_not_found(&self) {
+        let record = VectorRecord::new("missing", vec![1.0, 2.0], vec![9, 9]);
+        let result = self.update(record);
+        assert_eq!(
+            result,
+            Err(VectorStoreError::NotFound),
+            "updating a nonexistent record should return NotFound"
+        );
+    }
+
     fn contract_search_orders_by_score(&self) {
         let records = [
             VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
@@ -247,5 +266,15 @@ mod tests {
     #[test]
     fn in_memory_store_passes_search_orders_by_score_contract() {
         InMemoryVectorStore::new().contract_search_orders_by_score();
+    }
+
+    #[test]
+    fn in_memory_store_passes_update_then_get_contract() {
+        InMemoryVectorStore::new().contract_update_then_get_reflects_change();
+    }
+
+    #[test]
+    fn in_memory_store_passes_update_nonexistent_contract() {
+        InMemoryVectorStore::new().contract_update_nonexistent_returns_not_found();
     }
 }
