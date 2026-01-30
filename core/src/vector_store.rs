@@ -119,6 +119,15 @@ pub trait VectorStoreContractTests: VectorStore {
         assert_eq!(fetched, Some(updated), "updated record should be reflected");
     }
 
+    fn contract_delete_nonexistent_is_idempotent(&self) {
+        let result = self.delete("never-inserted");
+        assert_eq!(
+            result,
+            Ok(()),
+            "deleting a record that was never inserted must be idempotent, not an error"
+        );
+    }
+
     fn contract_update_nonexistent_returns_not_found(&self) {
         let record = VectorRecord::new("missing", vec![1.0, 2.0], vec![9, 9]);
         let result = self.update(record);
@@ -276,5 +285,10 @@ mod tests {
     #[test]
     fn in_memory_store_passes_update_nonexistent_contract() {
         InMemoryVectorStore::new().contract_update_nonexistent_returns_not_found();
+    }
+
+    #[test]
+    fn in_memory_store_passes_delete_nonexistent_is_idempotent_contract() {
+        InMemoryVectorStore::new().contract_delete_nonexistent_is_idempotent();
     }
 }
