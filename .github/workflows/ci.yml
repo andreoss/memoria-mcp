@@ -8,6 +8,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  docs-in-ci:
+    name: Docs-in-CI Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Docs Check
+        run: bash scripts/check-docs.sh "${GITHUB_BASE_REF:-origin/master}" "${GITHUB_HEAD_REF:-HEAD}"
+
   build-clippy-test:
     name: Build, Clippy, and Test (Workspace)
     runs-on: ubuntu-latest
