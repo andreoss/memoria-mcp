@@ -1,3 +1,6 @@
+use crate::embedding::EmbeddingError;
+use crate::llm::LlmError;
+use crate::vector_store::VectorStoreError;
 use std::fmt;
 
 #[derive(Debug)]
@@ -27,6 +30,36 @@ impl std::error::Error for CoreError {
         match self {
             Self::Provider { source, .. } => Some(source.as_ref()),
             _ => None,
+        }
+    }
+}
+
+impl From<VectorStoreError> for CoreError {
+    fn from(err: VectorStoreError) -> Self {
+        match err {
+            VectorStoreError::NotFound => Self::NotFound("vector store record".to_string()),
+            other @ VectorStoreError::Backend(_) => Self::Provider {
+                message: other.to_string(),
+                source: Box::new(other),
+            },
+        }
+    }
+}
+
+impl From<LlmError> for CoreError {
+    fn from(err: LlmError) -> Self {
+        Self::Provider {
+            message: err.to_string(),
+            source: Box::new(err),
+        }
+    }
+}
+
+impl From<EmbeddingError> for CoreError {
+    fn from(err: EmbeddingError) -> Self {
+        Self::Provider {
+            message: err.to_string(),
+            source: Box::new(err),
         }
     }
 }
