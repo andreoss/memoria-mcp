@@ -92,109 +92,114 @@ pub trait VectorStoreContractTests: VectorStore {
 
 impl<T: VectorStore + ?Sized> VectorStoreContractTests for T {}
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+pub struct InMemoryVectorStore {
+    records: Mutex<HashMap<String, VectorRecord>>,
+}
+
+impl InMemoryVectorStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            records: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for InMemoryVectorStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VectorStore for InMemoryVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.records
+            .lock()
+            .expect("lock poisoned")
+            .insert(record.id.clone(), record);
+        Ok(())
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let records = self.records.lock().expect("lock poisoned");
+        let mut scored: Vec<SearchResult> = records
+            .values()
+            .map(|r| {
+                let score = r
+                    .vector
+                    .iter()
+                    .zip(vector.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, |acc, d| acc + d);
+                SearchResult {
+                    id: r.id.clone(),
+                    score,
+                    payload: r.payload.clone(),
+                }
+            })
+            .collect();
+        drop(records);
+        scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        Ok(self.records.lock().expect("lock poisoned").get(id).cloned())
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        let mut records = self.records.lock().expect("lock poisoned");
+        if records.contains_key(&record.id) {
+            records.insert(record.id.clone(), record);
+            drop(records);
+            Ok(())
+        } else {
+            drop(records);
+            Err(VectorStoreError::NotFound)
+        }
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        self.records.lock().expect("lock poisoned").remove(id);
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<String>, VectorStoreError> {
+        Ok(self
+            .records
+            .lock()
+            .expect("lock poisoned")
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.records.lock().expect("lock poisoned").clear();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        SearchResult, VectorRecord, VectorStore, VectorStoreContractTests, VectorStoreError,
-    };
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use super::{InMemoryVectorStore, VectorStoreContractTests};
 
-    struct FakeVectorStore {
-        records: Mutex<HashMap<String, VectorRecord>>,
-    }
-
-    impl FakeVectorStore {
-        #[must_use]
-        fn new() -> Self {
-            Self {
-                records: Mutex::new(HashMap::new()),
-            }
-        }
-    }
-
-    impl VectorStore for FakeVectorStore {
-        fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
-            self.records
-                .lock()
-                .expect("lock poisoned")
-                .insert(record.id.clone(), record);
-            Ok(())
-        }
-
-        fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorStoreError> {
-            let records = self.records.lock().expect("lock poisoned");
-            let mut scored: Vec<SearchResult> = records
-                .values()
-                .map(|r| {
-                    let score = r
-                        .vector
-                        .iter()
-                        .zip(vector.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0_f32, |acc, d| acc + d);
-                    SearchResult {
-                        id: r.id.clone(),
-                        score,
-                        payload: r.payload.clone(),
-                    }
-                })
-                .collect();
-            drop(records);
-            scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(top_k);
-            Ok(scored)
-        }
-
-        fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
-            Ok(self.records.lock().expect("lock poisoned").get(id).cloned())
-        }
-
-        fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
-            let mut records = self.records.lock().expect("lock poisoned");
-            if records.contains_key(&record.id) {
-                records.insert(record.id.clone(), record);
-                drop(records);
-                Ok(())
-            } else {
-                drop(records);
-                Err(VectorStoreError::NotFound)
-            }
-        }
-
-        fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
-            self.records.lock().expect("lock poisoned").remove(id);
-            Ok(())
-        }
-
-        fn list(&self) -> Result<Vec<String>, VectorStoreError> {
-            Ok(self
-                .records
-                .lock()
-                .expect("lock poisoned")
-                .keys()
-                .cloned()
-                .collect())
-        }
-
-        fn reset(&self) -> Result<(), VectorStoreError> {
-            self.records.lock().expect("lock poisoned").clear();
-            Ok(())
-        }
+    #[test]
+    fn in_memory_store_passes_insert_then_get_contract() {
+        InMemoryVectorStore::new().contract_insert_then_get_round_trips();
     }
 
     #[test]
-    fn fake_store_passes_insert_then_get_contract() {
-        FakeVectorStore::new().contract_insert_then_get_round_trips();
+    fn in_memory_store_passes_delete_then_get_contract() {
+        InMemoryVectorStore::new().contract_delete_then_get_returns_none();
     }
 
     #[test]
-    fn fake_store_passes_delete_then_get_contract() {
-        FakeVectorStore::new().contract_delete_then_get_returns_none();
-    }
-
-    #[test]
-    fn fake_store_passes_reset_contract() {
-        FakeVectorStore::new().contract_reset_clears_everything();
+    fn in_memory_store_passes_reset_contract() {
+        InMemoryVectorStore::new().contract_reset_clears_everything();
     }
 }
