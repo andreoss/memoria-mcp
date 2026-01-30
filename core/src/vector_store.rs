@@ -88,6 +88,42 @@ pub trait VectorStoreContractTests: VectorStore {
         let listed = self.list().expect("list should succeed");
         assert!(listed.is_empty(), "reset should clear all records");
     }
+
+    fn contract_search_respects_top_k(&self) {
+        let records = [
+            VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
+            VectorRecord::new("b", vec![0.0, 1.0], vec![2]),
+            VectorRecord::new("c", vec![1.0, 1.0], vec![3]),
+            VectorRecord::new("d", vec![2.0, 0.0], vec![4]),
+        ];
+        for record in records {
+            self.insert(record).expect("insert should succeed");
+        }
+        let top_k = 2;
+        let results = self
+            .search(&[0.0, 0.0], top_k)
+            .expect("search should succeed");
+        assert_eq!(
+            results.len(),
+            top_k,
+            "search should return exactly top_k results"
+        );
+    }
+
+    fn contract_search_orders_by_score(&self) {
+        let records = [
+            VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
+            VectorRecord::new("b", vec![0.0, 1.0], vec![2]),
+            VectorRecord::new("c", vec![5.0, 5.0], vec![3]),
+        ];
+        for record in records {
+            self.insert(record).expect("insert should succeed");
+        }
+        let results = self
+            .search(&[1.1, 0.0], 3)
+            .expect("search should succeed");
+        assert_eq!(results.first().expect("result").id, "a", "closest vector should come first");
+    }
 }
 
 impl<T: VectorStore + ?Sized> VectorStoreContractTests for T {}
@@ -201,5 +237,15 @@ mod tests {
     #[test]
     fn in_memory_store_passes_reset_contract() {
         InMemoryVectorStore::new().contract_reset_clears_everything();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_respects_top_k_contract() {
+        InMemoryVectorStore::new().contract_search_respects_top_k();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_orders_by_score_contract() {
+        InMemoryVectorStore::new().contract_search_orders_by_score();
     }
 }
