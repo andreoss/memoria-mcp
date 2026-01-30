@@ -138,6 +138,33 @@ pub trait VectorStoreContractTests: VectorStore {
         );
     }
 
+    fn contract_list_returns_all_inserted_ids(&self) {
+        let records = [
+            VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
+            VectorRecord::new("b", vec![0.0, 1.0], vec![2]),
+            VectorRecord::new("c", vec![1.0, 1.0], vec![3]),
+        ];
+        for record in records {
+            self.insert(record).expect("insert should succeed");
+        }
+        let listed = self.list().expect("list should succeed");
+        let mut listed = listed;
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "list should return every inserted id"
+        );
+    }
+
+    fn contract_list_on_empty_store_returns_empty(&self) {
+        let listed = self.list().expect("list should succeed on empty store");
+        assert!(
+            listed.is_empty(),
+            "list on an empty store should return an empty Vec, not an error"
+        );
+    }
+
     fn contract_search_orders_by_score(&self) {
         let records = [
             VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
@@ -290,5 +317,15 @@ mod tests {
     #[test]
     fn in_memory_store_passes_delete_nonexistent_is_idempotent_contract() {
         InMemoryVectorStore::new().contract_delete_nonexistent_is_idempotent();
+    }
+
+    #[test]
+    fn in_memory_store_passes_list_returns_all_inserted_ids_contract() {
+        InMemoryVectorStore::new().contract_list_returns_all_inserted_ids();
+    }
+
+    #[test]
+    fn in_memory_store_passes_list_on_empty_store_returns_empty_contract() {
+        InMemoryVectorStore::new().contract_list_on_empty_store_returns_empty();
     }
 }
