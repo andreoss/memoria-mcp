@@ -209,6 +209,18 @@ mod tests {
     }
 
     #[test]
+    fn contract_complete_is_unmodified_passthrough() {
+        let raw = "the sky is blue\nwater is wet";
+        let result = FakeLlmProvider::with_response(raw)
+            .complete(&[Message::new(Role::User, "ignored")]);
+        let completion = result.expect("expected a completion");
+        assert_eq!(
+            completion.content, raw,
+            "raw response must be returned unchanged without wrapping or reformatting"
+        );
+    }
+
+    #[test]
     fn extract_facts_happy_path() {
         let response = "Alice is an engineer.\nBob lives in Berlin.\nThe project started in 2021.";
         let provider = FakeLlmProvider::with_response(response);
