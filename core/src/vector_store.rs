@@ -1,15 +1,17 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorRecord {
     pub id: String,
     pub vector: Vec<f32>,
-    pub payload: Vec<u8>,
+    pub payload: HashMap<String, String>,
 }
 
 impl VectorRecord {
     #[must_use]
-    pub fn new(id: impl Into<String>, vector: Vec<f32>, payload: Vec<u8>) -> Self {
+    pub fn new(id: impl Into<String>, vector: Vec<f32>, payload: HashMap<String, String>) -> Self {
         Self {
             id: id.into(),
             vector,
@@ -22,7 +24,7 @@ impl VectorRecord {
 pub struct SearchResult {
     pub id: String,
     pub score: f32,
-    pub payload: Vec<u8>,
+    pub payload: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +49,12 @@ pub trait VectorStore {
     fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError>;
 
     #[allow(clippy::missing_errors_doc)]
-    fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorStoreError>;
+    fn search(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filters: &HashMap<String, String>,
+    ) -> Result<Vec<SearchResult>, VectorStoreError>;
 
     #[allow(clippy::missing_errors_doc)]
     fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError>;
@@ -67,14 +74,14 @@ pub trait VectorStore {
 
 pub trait VectorStoreContractTests: VectorStore {
     fn contract_insert_then_get_round_trips(&self) {
-        let record = VectorRecord::new("a", vec![1.0, 2.0], vec![9, 9]);
+        let record = VectorRecord::new("a", vec![1.0, 2.0], HashMap::new());
         self.insert(record.clone()).expect("insert should succeed");
         let fetched = self.get("a").expect("get should succeed");
         assert_eq!(fetched, Some(record), "inserted record should round-trip");
     }
 
     fn contract_delete_then_get_returns_none(&self) {
-        let record = VectorRecord::new("b", vec![3.0, 4.0], vec![8, 8]);
+        let record = VectorRecord::new("b", vec![3.0, 4.0], HashMap::new());
         self.insert(record).expect("insert should succeed");
         self.delete("b").expect("delete should succeed");
         let fetched = self.get("b").expect("get should succeed");
@@ -82,7 +89,7 @@ pub trait VectorStoreContractTests: VectorStore {
     }
 
     fn contract_reset_clears_everything(&self) {
-        let record = VectorRecord::new("c", vec![5.0, 6.0], vec![7, 7]);
+        let record = VectorRecord::new("c", vec![5.0, 6.0], HashMap::new());
         self.insert(record).expect("insert should succeed");
         self.reset().expect("reset should succeed");
         let listed = self.list().expect("list should succeed");
@@ -91,17 +98,17 @@ pub trait VectorStoreContractTests: VectorStore {
 
     fn contract_search_respects_top_k(&self) {
         let records = [
-            VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
-            VectorRecord::new("b", vec![0.0, 1.0], vec![2]),
-            VectorRecord::new("c", vec![1.0, 1.0], vec![3]),
-            VectorRecord::new("d", vec![2.0, 0.0], vec![4]),
+            VectorRecord::new("a", vec![1.0, 0.0], HashMap::new()),
+            VectorRecord::new("b", vec![0.0, 1.0], HashMap::new()),
+            VectorRecord::new("c", vec![1.0, 1.0], HashMap::new()),
+            VectorRecord::new("d", vec![2.0, 0.0], HashMap::new()),
         ];
         for record in records {
             self.insert(record).expect("insert should succeed");
         }
         let top_k = 2;
         let results = self
-            .search(&[0.0, 0.0], top_k)
+            .search(&[0.0, 0.0], top_k, &HashMap::new())
             .expect("search should succeed");
         assert_eq!(
             results.len(),
@@ -111,9 +118,9 @@ pub trait VectorStoreContractTests: VectorStore {
     }
 
     fn contract_update_then_get_reflects_change(&self) {
-        let original = VectorRecord::new("a", vec![1.0, 2.0], vec![9, 9]);
+        let original = VectorRecord::new("a", vec![1.0, 2.0], HashMap::new());
         self.insert(original).expect("insert should succeed");
-        let updated = VectorRecord::new("a", vec![3.0, 4.0], vec![8, 8]);
+        let updated = VectorRecord::new("a", vec![3.0, 4.0], HashMap::new());
         self.update(updated.clone()).expect("update should succeed");
         let fetched = self.get("a").expect("get should succeed");
         assert_eq!(fetched, Some(updated), "updated record should be reflected");
@@ -129,7 +136,7 @@ pub trait VectorStoreContractTests: VectorStore {
     }
 
     fn contract_update_nonexistent_returns_not_found(&self) {
-        let record = VectorRecord::new("missing", vec![1.0, 2.0], vec![9, 9]);
+        let record = VectorRecord::new("missing", vec![1.0, 2.0], HashMap::new());
         let result = self.update(record);
         assert_eq!(
             result,
@@ -140,9 +147,9 @@ pub trait VectorStoreContractTests: VectorStore {
 
     fn contract_list_returns_all_inserted_ids(&self) {
         let records = [
-            VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
-            VectorRecord::new("b", vec![0.0, 1.0], vec![2]),
-            VectorRecord::new("c", vec![1.0, 1.0], vec![3]),
+            VectorRecord::new("a", vec![1.0, 0.0], HashMap::new()),
+            VectorRecord::new("b", vec![0.0, 1.0], HashMap::new()),
+            VectorRecord::new("c", vec![1.0, 1.0], HashMap::new()),
         ];
         for record in records {
             self.insert(record).expect("insert should succeed");
@@ -167,24 +174,48 @@ pub trait VectorStoreContractTests: VectorStore {
 
     fn contract_search_orders_by_score(&self) {
         let records = [
-            VectorRecord::new("a", vec![1.0, 0.0], vec![1]),
-            VectorRecord::new("b", vec![0.0, 1.0], vec![2]),
-            VectorRecord::new("c", vec![5.0, 5.0], vec![3]),
+            VectorRecord::new("a", vec![1.0, 0.0], HashMap::new()),
+            VectorRecord::new("b", vec![0.0, 1.0], HashMap::new()),
+            VectorRecord::new("c", vec![5.0, 5.0], HashMap::new()),
         ];
         for record in records {
             self.insert(record).expect("insert should succeed");
         }
         let results = self
-            .search(&[1.1, 0.0], 3)
+            .search(&[1.1, 0.0], 3, &HashMap::new())
             .expect("search should succeed");
         assert_eq!(results.first().expect("result").id, "a", "closest vector should come first");
     }
+
+    fn contract_search_filters_by_metadata_key(&self) {
+        let alice = VectorRecord::new(
+            "alice-1",
+            vec![1.0, 0.0],
+            HashMap::from([("user_id".to_string(), "alice".to_string())]),
+        );
+        let bob = VectorRecord::new(
+            "bob-1",
+            vec![1.0, 0.0],
+            HashMap::from([("user_id".to_string(), "bob".to_string())]),
+        );
+        self.insert(alice).expect("insert should succeed");
+        self.insert(bob).expect("insert should succeed");
+
+        let filters = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let results = self
+            .search(&[0.0, 0.0], 10, &filters)
+            .expect("search should succeed");
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["alice-1"], "only alice's record should match");
+        assert!(
+            !ids.contains(&"bob-1"),
+            "bob's record must be filtered out"
+        );
+    }
+
 }
 
 impl<T: VectorStore + ?Sized> VectorStoreContractTests for T {}
-
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 pub struct InMemoryVectorStore {
     records: Mutex<HashMap<String, VectorRecord>>,
@@ -214,10 +245,20 @@ impl VectorStore for InMemoryVectorStore {
         Ok(())
     }
 
-    fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<SearchResult>, VectorStoreError> {
+    fn search(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filters: &HashMap<String, String>,
+    ) -> Result<Vec<SearchResult>, VectorStoreError> {
         let records = self.records.lock().expect("lock poisoned");
         let mut scored: Vec<SearchResult> = records
             .values()
+            .filter(|r| {
+                filters
+                    .iter()
+                    .all(|(k, v)| r.payload.get(k).is_some_and(|pv| pv == v))
+            })
             .map(|r| {
                 let score = r
                     .vector
@@ -302,6 +343,11 @@ mod tests {
     #[test]
     fn in_memory_store_passes_search_orders_by_score_contract() {
         InMemoryVectorStore::new().contract_search_orders_by_score();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_filters_by_metadata_key_contract() {
+        InMemoryVectorStore::new().contract_search_filters_by_metadata_key();
     }
 
     #[test]
