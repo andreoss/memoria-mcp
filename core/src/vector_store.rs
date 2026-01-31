@@ -213,7 +213,59 @@ pub trait VectorStoreContractTests: VectorStore {
         );
     }
 
+    fn contract_search_filters_by_agent_id(&self) {
+        let a1 = VectorRecord::new(
+            "agent-a-1",
+            vec![1.0, 0.0],
+            HashMap::from([("agent_id".to_string(), "agent-a".to_string())]),
+        );
+        let a2 = VectorRecord::new(
+            "agent-b-1",
+            vec![1.0, 0.0],
+            HashMap::from([("agent_id".to_string(), "agent-b".to_string())]),
+        );
+        self.insert(a1).expect("insert should succeed");
+        self.insert(a2).expect("insert should succeed");
+
+        let filters = HashMap::from([("agent_id".to_string(), "agent-a".to_string())]);
+        let results = self
+            .search(&[0.0, 0.0], 10, &filters)
+            .expect("search should succeed");
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["agent-a-1"], "only agent-a's record should match");
+        assert!(
+            !ids.contains(&"agent-b-1"),
+            "agent-b's record must be filtered out"
+        );
+    }
+
+    fn contract_search_filters_by_run_id(&self) {
+        let r1 = VectorRecord::new(
+            "run-1-1",
+            vec![1.0, 0.0],
+            HashMap::from([("run_id".to_string(), "run-1".to_string())]),
+        );
+        let r2 = VectorRecord::new(
+            "run-2-1",
+            vec![1.0, 0.0],
+            HashMap::from([("run_id".to_string(), "run-2".to_string())]),
+        );
+        self.insert(r1).expect("insert should succeed");
+        self.insert(r2).expect("insert should succeed");
+
+        let filters = HashMap::from([("run_id".to_string(), "run-1".to_string())]);
+        let results = self
+            .search(&[0.0, 0.0], 10, &filters)
+            .expect("search should succeed");
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["run-1-1"], "only run-1's record should match");
+        assert!(
+            !ids.contains(&"run-2-1"),
+            "run-2's record must be filtered out"
+        );
+    }
 }
+
 
 impl<T: VectorStore + ?Sized> VectorStoreContractTests for T {}
 
@@ -348,6 +400,16 @@ mod tests {
     #[test]
     fn in_memory_store_passes_search_filters_by_metadata_key_contract() {
         InMemoryVectorStore::new().contract_search_filters_by_metadata_key();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_filters_by_agent_id_contract() {
+        InMemoryVectorStore::new().contract_search_filters_by_agent_id();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_filters_by_run_id_contract() {
+        InMemoryVectorStore::new().contract_search_filters_by_run_id();
     }
 
     #[test]
