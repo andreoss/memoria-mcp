@@ -63,7 +63,11 @@ pub trait LlmContractTests: LlmProvider {
     fn contract_happy_path(&self) {
         let messages = [Message::new(Role::User, "hello")];
         let result = self.complete(&messages);
-        assert!(result.is_ok(), "expected a successful completion");
+        let completion = result.expect("expected a successful completion");
+        assert!(
+            !completion.content.is_empty(),
+            "completion content must not be empty"
+        );
     }
 
     fn contract_rejects_empty_messages(&self) {
@@ -71,6 +75,15 @@ pub trait LlmContractTests: LlmProvider {
         assert!(
             matches!(result, Err(LlmError::EmptyMessages)),
             "expected empty messages to be rejected"
+        );
+    }
+
+    fn contract_rejects_backend_error(&self) {
+        let messages = [Message::new(Role::User, "hello")];
+        let result = self.complete(&messages);
+        assert!(
+            matches!(result, Err(LlmError::Backend(_))),
+            "expected a backend error"
         );
     }
 }
@@ -81,24 +94,67 @@ impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
 mod tests {
     use super::{Completion, LlmContractTests, LlmError, LlmProvider, Message};
 
-    struct FakeLlmProvider;
+    struct FakeLlmProvider {
+        fail_with_backend: bool,
+    }
+
+    impl FakeLlmProvider {
+        #[must_use]
+        fn new() -> Self {
+            Self {
+                fail_with_backend: false,
+            }
+        }
+
+        #[must_use]
+        fn failing() -> Self {
+            Self {
+                fail_with_backend: true,
+            }
+        }
+    }
 
     impl LlmProvider for FakeLlmProvider {
         fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+            if self.fail_with_backend {
+                return Err(LlmError::Backend("fake backend failure".to_string()));
+            }
             if messages.is_empty() {
                 return Err(LlmError::EmptyMessages);
             }
-            Ok(Completion::new("fake response"))
+            let content: String = messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(Completion::new(content))
         }
     }
 
     #[test]
+    fn empty_messages_display_is_sensible() {
+        let err = LlmError::EmptyMessages;
+        assert_eq!(err.to_string(), "no messages provided");
+    }
+
+    #[test]
+    fn backend_display_is_sensible() {
+        let err = LlmError::Backend("boom".to_string());
+        assert_eq!(err.to_string(), "backend error: boom");
+    }
+
+    #[test]
     fn fake_provider_passes_happy_path_contract() {
-        FakeLlmProvider.contract_happy_path();
+        FakeLlmProvider::new().contract_happy_path();
     }
 
     #[test]
     fn fake_provider_passes_error_contract() {
-        FakeLlmProvider.contract_rejects_empty_messages();
+        FakeLlmProvider::new().contract_rejects_empty_messages();
+    }
+
+    #[test]
+    fn fake_provider_passes_backend_error_contract() {
+        FakeLlmProvider::failing().contract_rejects_backend_error();
     }
 }
