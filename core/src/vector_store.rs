@@ -66,7 +66,7 @@ pub trait VectorStore {
     fn delete(&self, id: &str) -> Result<(), VectorStoreError>;
 
     #[allow(clippy::missing_errors_doc)]
-    fn list(&self) -> Result<Vec<String>, VectorStoreError>;
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError>;
 
     #[allow(clippy::missing_errors_doc)]
     fn reset(&self) -> Result<(), VectorStoreError>;
@@ -92,7 +92,7 @@ pub trait VectorStoreContractTests: VectorStore {
         let record = VectorRecord::new("c", vec![5.0, 6.0], HashMap::new());
         self.insert(record).expect("insert should succeed");
         self.reset().expect("reset should succeed");
-        let listed = self.list().expect("list should succeed");
+        let listed = self.list(0, usize::MAX).expect("list should succeed");
         assert!(listed.is_empty(), "reset should clear all records");
     }
 
@@ -154,7 +154,7 @@ pub trait VectorStoreContractTests: VectorStore {
         for record in records {
             self.insert(record).expect("insert should succeed");
         }
-        let listed = self.list().expect("list should succeed");
+        let listed = self.list(0, usize::MAX).expect("list should succeed");
         let mut listed = listed;
         listed.sort();
         assert_eq!(
@@ -165,10 +165,39 @@ pub trait VectorStoreContractTests: VectorStore {
     }
 
     fn contract_list_on_empty_store_returns_empty(&self) {
-        let listed = self.list().expect("list should succeed on empty store");
+        let listed = self.list(0, usize::MAX).expect("list should succeed on empty store");
         assert!(
             listed.is_empty(),
             "list on an empty store should return an empty Vec, not an error"
+        );
+    }
+
+    fn contract_list_pagination_respects_offset_and_limit(&self) {
+        let records = [
+            VectorRecord::new("a", vec![1.0, 0.0], HashMap::new()),
+            VectorRecord::new("b", vec![0.0, 1.0], HashMap::new()),
+            VectorRecord::new("c", vec![1.0, 1.0], HashMap::new()),
+            VectorRecord::new("d", vec![2.0, 0.0], HashMap::new()),
+            VectorRecord::new("e", vec![3.0, 0.0], HashMap::new()),
+        ];
+        for record in records {
+            self.insert(record).expect("insert should succeed");
+        }
+        let first_page = self.list(0, 2).expect("list should succeed");
+        assert_eq!(
+            first_page.len(),
+            2,
+            "list with a small limit should return at most that many ids"
+        );
+        let second_page = self.list(2, 2).expect("list should succeed");
+        assert_eq!(
+            second_page.len(),
+            2,
+            "list with an offset should skip the first page"
+        );
+        assert!(
+            first_page.iter().all(|id| !second_page.contains(id)),
+            "offset results must differ from the first page"
         );
     }
 
@@ -352,12 +381,14 @@ impl VectorStore for InMemoryVectorStore {
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<String>, VectorStoreError> {
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
         Ok(self
             .records
             .lock()
             .expect("lock poisoned")
             .keys()
+            .skip(offset)
+            .take(limit)
             .cloned()
             .collect())
     }
@@ -435,5 +466,10 @@ mod tests {
     #[test]
     fn in_memory_store_passes_list_on_empty_store_returns_empty_contract() {
         InMemoryVectorStore::new().contract_list_on_empty_store_returns_empty();
+    }
+
+    #[test]
+    fn in_memory_store_passes_list_pagination_respects_offset_and_limit_contract() {
+        InMemoryVectorStore::new().contract_list_pagination_respects_offset_and_limit();
     }
 }
