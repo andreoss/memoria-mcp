@@ -30,6 +30,7 @@ pub struct SearchResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VectorStoreError {
     NotFound,
+    DimensionMismatch { expected: usize, actual: usize },
     Backend(String),
 }
 
@@ -37,6 +38,9 @@ impl fmt::Display for VectorStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => write!(f, "record not found"),
+            Self::DimensionMismatch { expected, actual } => {
+                write!(f, "vector dimension mismatch: expected {expected}, got {actual}")
+            }
             Self::Backend(reason) => write!(f, "backend error: {reason}"),
         }
     }
@@ -169,6 +173,21 @@ pub trait VectorStoreContractTests: VectorStore {
         assert!(
             listed.is_empty(),
             "list on an empty store should return an empty Vec, not an error"
+        );
+    }
+
+    fn contract_insert_rejects_mismatched_dimension(&self) {
+        let first = VectorRecord::new("a", vec![1.0, 2.0], HashMap::new());
+        self.insert(first).expect("first insert should establish dimension");
+        let wrong = VectorRecord::new("b", vec![1.0], HashMap::new());
+        let result = self.insert(wrong);
+        assert_eq!(
+            result,
+            Err(VectorStoreError::DimensionMismatch {
+                expected: 2,
+                actual: 1
+            }),
+            "insert with a mismatched vector dimension must be rejected"
         );
     }
 
@@ -319,10 +338,17 @@ impl Default for InMemoryVectorStore {
 
 impl VectorStore for InMemoryVectorStore {
     fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
-        self.records
-            .lock()
-            .expect("lock poisoned")
-            .insert(record.id.clone(), record);
+        let mut records = self.records.lock().expect("lock poisoned");
+        if let Some(existing) = records.values().next() {
+            let expected = existing.vector.len();
+            let actual = record.vector.len();
+            if expected != actual {
+                drop(records);
+                return Err(VectorStoreError::DimensionMismatch { expected, actual });
+            }
+        }
+        records.insert(record.id.clone(), record);
+        drop(records);
         Ok(())
     }
 
@@ -466,6 +492,11 @@ mod tests {
     #[test]
     fn in_memory_store_passes_list_on_empty_store_returns_empty_contract() {
         InMemoryVectorStore::new().contract_list_on_empty_store_returns_empty();
+    }
+
+    #[test]
+    fn in_memory_store_passes_insert_rejects_mismatched_dimension_contract() {
+        InMemoryVectorStore::new().contract_insert_rejects_mismatched_dimension();
     }
 
     #[test]

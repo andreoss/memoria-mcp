@@ -38,6 +38,12 @@ impl From<VectorStoreError> for CoreError {
     fn from(err: VectorStoreError) -> Self {
         match err {
             VectorStoreError::NotFound => Self::NotFound("vector store record".to_string()),
+            other @ VectorStoreError::DimensionMismatch { expected, actual } => Self::Provider {
+                message: format!(
+                    "vector dimension mismatch: expected {expected}, got {actual}"
+                ),
+                source: Box::new(other),
+            },
             other @ VectorStoreError::Backend(_) => Self::Provider {
                 message: other.to_string(),
                 source: Box::new(other),
