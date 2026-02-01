@@ -147,6 +147,15 @@ mod tests {
     }
 
     #[test]
+    fn embedding_timeout_routes_to_provider() {
+        let err: CoreError = EmbeddingError::Timeout.into();
+        match err {
+            CoreError::Provider { .. } => {}
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn llm_malformed_routes_to_provider() {
         let err: CoreError = LlmError::Malformed("bad shape".to_string()).into();
         match err {

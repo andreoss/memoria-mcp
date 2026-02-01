@@ -4,6 +4,7 @@ use std::fmt;
 pub enum EmbeddingError {
     EmptyInput,
     Backend(String),
+    Timeout,
 }
 
 impl fmt::Display for EmbeddingError {
@@ -11,6 +12,7 @@ impl fmt::Display for EmbeddingError {
         match self {
             Self::EmptyInput => write!(f, "no text provided"),
             Self::Backend(reason) => write!(f, "backend error: {reason}"),
+            Self::Timeout => write!(f, "backend timed out before responding"),
         }
     }
 }
@@ -46,6 +48,14 @@ pub trait EmbeddingContractTests: EmbeddingProvider {
         assert!(
             matches!(result, Err(EmbeddingError::Backend(_))),
             "expected a backend error"
+        );
+    }
+
+    fn contract_rejects_timeout(&self) {
+        let result = self.embed("hello");
+        assert!(
+            matches!(result, Err(EmbeddingError::Timeout)),
+            "expected a timeout error"
         );
     }
 
@@ -92,6 +102,7 @@ mod tests {
 
     struct FakeEmbeddingProvider {
         fail_with_backend: bool,
+        fail_with_timeout: bool,
     }
 
     impl FakeEmbeddingProvider {
@@ -99,6 +110,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 fail_with_backend: false,
+                fail_with_timeout: false,
             }
         }
 
@@ -106,6 +118,15 @@ mod tests {
         fn failing() -> Self {
             Self {
                 fail_with_backend: true,
+                fail_with_timeout: false,
+            }
+        }
+
+        #[must_use]
+        fn timing_out() -> Self {
+            Self {
+                fail_with_backend: false,
+                fail_with_timeout: true,
             }
         }
     }
@@ -114,6 +135,9 @@ mod tests {
         fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
             if self.fail_with_backend {
                 return Err(EmbeddingError::Backend("fake backend failure".to_string()));
+            }
+            if self.fail_with_timeout {
+                return Err(EmbeddingError::Timeout);
             }
             if text.is_empty() {
                 return Err(EmbeddingError::EmptyInput);
@@ -139,6 +163,12 @@ mod tests {
     }
 
     #[test]
+    fn timeout_display_is_sensible() {
+        let err = EmbeddingError::Timeout;
+        assert_eq!(err.to_string(), "backend timed out before responding");
+    }
+
+    #[test]
     fn fake_provider_passes_happy_path_contract() {
         FakeEmbeddingProvider::new().contract_happy_path();
     }
@@ -151,6 +181,11 @@ mod tests {
     #[test]
     fn fake_provider_passes_backend_error_contract() {
         FakeEmbeddingProvider::failing().contract_rejects_backend_error();
+    }
+
+    #[test]
+    fn fake_provider_passes_timeout_contract() {
+        FakeEmbeddingProvider::timing_out().contract_rejects_timeout();
     }
 
     #[test]
