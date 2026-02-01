@@ -3,6 +3,7 @@
 pub mod embedding;
 pub mod error;
 pub mod llm;
+pub mod memory;
 pub mod vector_store;
 
 pub use error::CoreError;
