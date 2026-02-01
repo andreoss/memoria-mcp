@@ -43,6 +43,7 @@ pub enum LlmError {
     Backend(String),
     Timeout,
     Malformed(String),
+    AuthFailure,
 }
 
 impl fmt::Display for LlmError {
@@ -52,6 +53,7 @@ impl fmt::Display for LlmError {
             Self::Backend(reason) => write!(f, "backend error: {reason}"),
             Self::Timeout => write!(f, "backend timed out before responding"),
             Self::Malformed(reason) => write!(f, "malformed backend response: {reason}"),
+            Self::AuthFailure => write!(f, "backend rejected credentials"),
         }
     }
 }
@@ -136,6 +138,7 @@ mod tests {
         fail_with_backend: bool,
         fail_with_timeout: bool,
         fail_with_malformed: Option<String>,
+        fail_with_auth: bool,
         raw_response: Option<String>,
     }
 
@@ -146,6 +149,7 @@ mod tests {
                 fail_with_backend: false,
                 fail_with_timeout: false,
                 fail_with_malformed: None,
+                fail_with_auth: false,
                 raw_response: None,
             }
         }
@@ -156,6 +160,7 @@ mod tests {
                 fail_with_backend: true,
                 fail_with_timeout: false,
                 fail_with_malformed: None,
+                fail_with_auth: false,
                 raw_response: None,
             }
         }
@@ -166,6 +171,7 @@ mod tests {
                 fail_with_backend: false,
                 fail_with_timeout: true,
                 fail_with_malformed: None,
+                fail_with_auth: false,
                 raw_response: None,
             }
         }
@@ -176,6 +182,18 @@ mod tests {
                 fail_with_backend: false,
                 fail_with_timeout: false,
                 fail_with_malformed: Some(reason.into()),
+                fail_with_auth: false,
+                raw_response: None,
+            }
+        }
+
+        #[must_use]
+        fn unauthorized() -> Self {
+            Self {
+                fail_with_backend: false,
+                fail_with_timeout: false,
+                fail_with_malformed: None,
+                fail_with_auth: true,
                 raw_response: None,
             }
         }
@@ -186,6 +204,7 @@ mod tests {
                 fail_with_backend: false,
                 fail_with_timeout: false,
                 fail_with_malformed: None,
+                fail_with_auth: false,
                 raw_response: Some(content.into()),
             }
         }
@@ -201,6 +220,9 @@ mod tests {
             }
             if let Some(reason) = &self.fail_with_malformed {
                 return Err(LlmError::Malformed(reason.clone()));
+            }
+            if self.fail_with_auth {
+                return Err(LlmError::AuthFailure);
             }
             if messages.is_empty() {
                 return Err(LlmError::EmptyMessages);
@@ -247,6 +269,12 @@ mod tests {
     }
 
     #[test]
+    fn auth_failure_display_is_sensible() {
+        let err = LlmError::AuthFailure;
+        assert_eq!(err.to_string(), "backend rejected credentials");
+    }
+
+    #[test]
     fn fake_provider_passes_happy_path_contract() {
         FakeLlmProvider::new().contract_happy_path();
     }
@@ -259,6 +287,36 @@ mod tests {
     #[test]
     fn fake_provider_passes_backend_error_contract() {
         FakeLlmProvider::failing().contract_rejects_backend_error();
+    }
+
+    #[test]
+    fn fake_provider_returns_timeout() {
+        let messages = [Message::new(Role::User, "hello")];
+        let result = FakeLlmProvider::timing_out().complete(&messages);
+        assert!(
+            matches!(result, Err(LlmError::Timeout)),
+            "expected a timeout error"
+        );
+    }
+
+    #[test]
+    fn fake_provider_returns_malformed() {
+        let messages = [Message::new(Role::User, "hello")];
+        let result = FakeLlmProvider::returning_malformed("unexpected json shape").complete(&messages);
+        assert!(
+            matches!(result, Err(LlmError::Malformed(_))),
+            "expected a malformed error"
+        );
+    }
+
+    #[test]
+    fn fake_provider_returns_auth_failure() {
+        let messages = [Message::new(Role::User, "hello")];
+        let result = FakeLlmProvider::unauthorized().complete(&messages);
+        assert!(
+            matches!(result, Err(LlmError::AuthFailure)),
+            "expected an auth failure error"
+        );
     }
 
     #[test]
