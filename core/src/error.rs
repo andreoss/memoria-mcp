@@ -54,16 +54,9 @@ impl From<VectorStoreError> for CoreError {
 
 impl From<LlmError> for CoreError {
     fn from(err: LlmError) -> Self {
-        match err {
-            LlmError::Timeout | LlmError::Malformed(_) => Self::Provider {
-                message: err.to_string(),
-                source: Box::new(err),
-            },
-            LlmError::AuthFailure => Self::Config(err.to_string()),
-            other => Self::Provider {
-                message: other.to_string(),
-                source: Box::new(other),
-            },
+        Self::Provider {
+            message: err.to_string(),
+            source: Box::new(err),
         }
     }
 }
@@ -165,13 +158,13 @@ mod tests {
     }
 
     #[test]
-    fn llm_auth_failure_routes_to_config() {
+    fn llm_auth_failure_routes_to_provider() {
         let err: CoreError = LlmError::AuthFailure.into();
         match err {
-            CoreError::Config(message) => {
+            CoreError::Provider { message, .. } => {
                 assert_eq!(message, "backend rejected credentials");
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected Provider, got {other:?}"),
         }
     }
 }
