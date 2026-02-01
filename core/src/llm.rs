@@ -42,6 +42,7 @@ pub enum LlmError {
     EmptyMessages,
     Backend(String),
     Timeout,
+    Malformed(String),
 }
 
 impl fmt::Display for LlmError {
@@ -50,6 +51,7 @@ impl fmt::Display for LlmError {
             Self::EmptyMessages => write!(f, "no messages provided"),
             Self::Backend(reason) => write!(f, "backend error: {reason}"),
             Self::Timeout => write!(f, "backend timed out before responding"),
+            Self::Malformed(reason) => write!(f, "malformed backend response: {reason}"),
         }
     }
 }
@@ -133,6 +135,7 @@ mod tests {
     struct FakeLlmProvider {
         fail_with_backend: bool,
         fail_with_timeout: bool,
+        fail_with_malformed: Option<String>,
         raw_response: Option<String>,
     }
 
@@ -142,6 +145,7 @@ mod tests {
             Self {
                 fail_with_backend: false,
                 fail_with_timeout: false,
+                fail_with_malformed: None,
                 raw_response: None,
             }
         }
@@ -151,6 +155,7 @@ mod tests {
             Self {
                 fail_with_backend: true,
                 fail_with_timeout: false,
+                fail_with_malformed: None,
                 raw_response: None,
             }
         }
@@ -160,6 +165,17 @@ mod tests {
             Self {
                 fail_with_backend: false,
                 fail_with_timeout: true,
+                fail_with_malformed: None,
+                raw_response: None,
+            }
+        }
+
+        #[must_use]
+        fn returning_malformed(reason: impl Into<String>) -> Self {
+            Self {
+                fail_with_backend: false,
+                fail_with_timeout: false,
+                fail_with_malformed: Some(reason.into()),
                 raw_response: None,
             }
         }
@@ -169,6 +185,7 @@ mod tests {
             Self {
                 fail_with_backend: false,
                 fail_with_timeout: false,
+                fail_with_malformed: None,
                 raw_response: Some(content.into()),
             }
         }
@@ -181,6 +198,9 @@ mod tests {
             }
             if self.fail_with_timeout {
                 return Err(LlmError::Timeout);
+            }
+            if let Some(reason) = &self.fail_with_malformed {
+                return Err(LlmError::Malformed(reason.clone()));
             }
             if messages.is_empty() {
                 return Err(LlmError::EmptyMessages);
@@ -215,6 +235,15 @@ mod tests {
     fn timeout_display_is_sensible() {
         let err = LlmError::Timeout;
         assert_eq!(err.to_string(), "backend timed out before responding");
+    }
+
+    #[test]
+    fn malformed_display_is_sensible() {
+        let err = LlmError::Malformed("unexpected json shape".to_string());
+        assert_eq!(
+            err.to_string(),
+            "malformed backend response: unexpected json shape"
+        );
     }
 
     #[test]

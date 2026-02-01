@@ -59,6 +59,10 @@ impl From<LlmError> for CoreError {
                 message: err.to_string(),
                 source: Box::new(err),
             },
+            LlmError::Malformed(_) => Self::Provider {
+                message: err.to_string(),
+                source: Box::new(err),
+            },
             other => Self::Provider {
                 message: other.to_string(),
                 source: Box::new(other),
