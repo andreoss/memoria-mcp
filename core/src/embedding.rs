@@ -20,6 +20,11 @@ impl std::error::Error for EmbeddingError {}
 pub trait EmbeddingProvider {
     #[allow(clippy::missing_errors_doc)]
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
+
+    #[allow(clippy::missing_errors_doc)]
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
 }
 
 pub trait EmbeddingContractTests: EmbeddingProvider {
@@ -50,6 +55,31 @@ pub trait EmbeddingContractTests: EmbeddingProvider {
         assert_eq!(
             first, second,
             "embedding must be deterministic for the same input"
+        );
+    }
+
+    fn contract_embed_batch_matches_individual_calls(&self) {
+        let texts = ["alpha", "beta", "gamma"];
+        let batch = self
+            .embed_batch(&texts)
+            .expect("expected a successful batch embedding");
+        let individual: Vec<Vec<f32>> = texts
+            .iter()
+            .map(|text| self.embed(text).expect("expected a successful embedding"))
+            .collect();
+        assert_eq!(
+            batch, individual,
+            "batch embedding must match individual embed() calls"
+        );
+    }
+
+    fn contract_embed_batch_empty_list_returns_empty(&self) {
+        let batch = self
+            .embed_batch(&[])
+            .expect("expected a successful empty batch embedding");
+        assert!(
+            batch.is_empty(),
+            "embedding an empty batch must return an empty vector"
         );
     }
 }
@@ -126,5 +156,15 @@ mod tests {
     #[test]
     fn fake_provider_passes_deterministic_contract() {
         FakeEmbeddingProvider::new().contract_embed_is_deterministic();
+    }
+
+    #[test]
+    fn fake_provider_passes_batch_matches_individual_contract() {
+        FakeEmbeddingProvider::new().contract_embed_batch_matches_individual_calls();
+    }
+
+    #[test]
+    fn fake_provider_passes_batch_empty_contract() {
+        FakeEmbeddingProvider::new().contract_embed_batch_empty_list_returns_empty();
     }
 }
