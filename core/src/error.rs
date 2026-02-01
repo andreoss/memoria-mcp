@@ -54,9 +54,15 @@ impl From<VectorStoreError> for CoreError {
 
 impl From<LlmError> for CoreError {
     fn from(err: LlmError) -> Self {
-        Self::Provider {
-            message: err.to_string(),
-            source: Box::new(err),
+        match err {
+            LlmError::Timeout => Self::Provider {
+                message: err.to_string(),
+                source: Box::new(err),
+            },
+            other => Self::Provider {
+                message: other.to_string(),
+                source: Box::new(other),
+            },
         }
     }
 }

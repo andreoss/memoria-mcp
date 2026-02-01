@@ -41,6 +41,7 @@ impl Completion {
 pub enum LlmError {
     EmptyMessages,
     Backend(String),
+    Timeout,
 }
 
 impl fmt::Display for LlmError {
@@ -48,6 +49,7 @@ impl fmt::Display for LlmError {
         match self {
             Self::EmptyMessages => write!(f, "no messages provided"),
             Self::Backend(reason) => write!(f, "backend error: {reason}"),
+            Self::Timeout => write!(f, "backend timed out before responding"),
         }
     }
 }
@@ -130,6 +132,7 @@ mod tests {
 
     struct FakeLlmProvider {
         fail_with_backend: bool,
+        fail_with_timeout: bool,
         raw_response: Option<String>,
     }
 
@@ -138,6 +141,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 fail_with_backend: false,
+                fail_with_timeout: false,
                 raw_response: None,
             }
         }
@@ -146,6 +150,16 @@ mod tests {
         fn failing() -> Self {
             Self {
                 fail_with_backend: true,
+                fail_with_timeout: false,
+                raw_response: None,
+            }
+        }
+
+        #[must_use]
+        fn timing_out() -> Self {
+            Self {
+                fail_with_backend: false,
+                fail_with_timeout: true,
                 raw_response: None,
             }
         }
@@ -154,6 +168,7 @@ mod tests {
         fn with_response(content: impl Into<String>) -> Self {
             Self {
                 fail_with_backend: false,
+                fail_with_timeout: false,
                 raw_response: Some(content.into()),
             }
         }
@@ -163,6 +178,9 @@ mod tests {
         fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
             if self.fail_with_backend {
                 return Err(LlmError::Backend("fake backend failure".to_string()));
+            }
+            if self.fail_with_timeout {
+                return Err(LlmError::Timeout);
             }
             if messages.is_empty() {
                 return Err(LlmError::EmptyMessages);
@@ -191,6 +209,12 @@ mod tests {
     fn backend_display_is_sensible() {
         let err = LlmError::Backend("boom".to_string());
         assert_eq!(err.to_string(), "backend error: boom");
+    }
+
+    #[test]
+    fn timeout_display_is_sensible() {
+        let err = LlmError::Timeout;
+        assert_eq!(err.to_string(), "backend timed out before responding");
     }
 
     #[test]
