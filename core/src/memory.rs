@@ -244,6 +244,29 @@ mod tests {
     }
 
     #[test]
+    fn test_add_metadata_is_generic() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("user_id".to_string(), "alice".to_string()), ("source".to_string(), "chat_import".to_string())]);
+        let ids = memory.add(&messages, s).expect("add should succeed");
+        assert!(!ids.is_empty());
+
+        let id = ids.first().expect("expected at least one id");
+        let record = memory
+            .vector_store
+            .get(id)
+            .expect("get should succeed")
+            .expect("record should exist in the store");
+        let payload = record.payload;
+        assert_eq!(payload.get("user_id"), Some(&"alice".to_string()), "user_id should be in payload");
+        assert_eq!(payload.get("source"), Some(&"chat_import".to_string()), "source should be in payload");
+    }
+
+    #[test]
     fn test_add_dedup_same_fact_same_scope() {
         let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
         let embedding = FakeEmbeddingProvider::new();
