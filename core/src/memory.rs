@@ -48,11 +48,19 @@ where
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
         }
         let facts = extract_facts(&self.llm, messages)?;
-        let mut ids = Vec::with_capacity(facts.len());
+        let mut ids = Vec::new();
         for fact in &facts {
             let vector = self.embedding.embed(fact)?;
+            if let Ok(results) = self.vector_store.search(&vector, 100, &scope) {
+                if results.iter().any(|r| r.payload.get("content") == Some(fact)) {
+                    continue;
+                }
+            }
             let id = next_record_id();
-            let payload = scope.clone();
+            let mut payload = scope.clone();
+            if !payload.contains_key("content") {
+                payload.insert("content".to_string(), fact.clone());
+            }
             let record = VectorRecord::new(id.clone(), vector, payload);
             self.vector_store.insert(record)?;
             ids.push(id);
@@ -233,5 +241,39 @@ mod tests {
         let s = HashMap::from([("source".to_string(), "x".to_string()), ("user_id".to_string(), "alice".to_string())]);
         let ids = memory.add(&messages, s).expect("add should succeed");
         assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_add_dedup_same_fact_same_scope() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = scope();
+        let ids1 = memory.add(&messages, s.clone()).expect("add should succeed");
+        let ids2 = memory.add(&messages, s).expect("add should succeed");
+        assert!(ids2.is_empty(), "second add should return empty ids for duplicate");
+        let record = memory.vector_store.get(&ids1[0]).expect("get should succeed").expect("record should exist");
+        let payload = record.payload;
+        assert_eq!(payload.get("content"), Some(&"Alice is an engineer.".to_string()), "content should be stored in payload");
+    }
+
+    #[test]
+    fn test_add_dedup_same_fact_different_scope() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s1 = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let s2 = HashMap::from([("user_id".to_string(), "bob".to_string())]);
+        let ids1 = memory.add(&messages, s1).expect("add should succeed");
+        let ids2 = memory.add(&messages, s2).expect("add should succeed");
+        assert!(!ids2.is_empty(), "second add should return an id for different scope");
+        let unique_ids: std::collections::HashSet<String> = ids1.into_iter().chain(ids2).collect();
+        assert_eq!(unique_ids.len(), 2, "same fact in different scopes should result in two records");
     }
 }
