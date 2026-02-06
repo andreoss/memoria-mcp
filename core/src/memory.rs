@@ -37,6 +37,16 @@ where
         }
     }
 
+    pub fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        scope: &HashMap<String, String>,
+    ) -> Result<Vec<crate::vector_store::SearchResult>, crate::CoreError> {
+        let vector = self.embedding.embed(query)?;
+        self.vector_store.search(&vector, top_k, scope).map_err(From::from)
+    }
+
     #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
     pub fn add(
         &self,
@@ -333,5 +343,103 @@ mod tests {
         ];
         let ids = memory.add(&messages, scope()).expect("add should succeed");
         assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_search_returns_matching_memories() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let _ = memory.add(&messages, scope()).expect("add should succeed");
+
+        let query = "Alice engineer";
+        let results = memory.search(query, 10, &scope()).expect("search should succeed");
+        assert!(
+            !results.is_empty(),
+            "search should return matching memories"
+        );
+        let contents: Vec<&str> = results
+            .iter()
+            .map(|r| r.payload.get("content").map(|s| s.as_str()).unwrap_or(""))
+            .collect();
+        assert!(
+            contents.iter().any(|&c| c == "Alice is an engineer."),
+            "search results should contain the added fact"
+        );
+    }
+
+    #[test]
+    fn test_search_respects_top_k() {
+        let llm = FakeLlmProvider::with_facts("Fact one.\nFact two.\nFact three.\nFact four.\nFact five.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Five facts.")];
+        let _ = memory.add(&messages, scope()).expect("add should succeed");
+
+        for i in 1..=5 {
+            let fact = format!("Fact {i}.");
+            let s = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+            memory.add(&[Message::new(Role::User, &fact)], s).expect("add should succeed");
+        }
+
+        let query = "fact";
+        let results = memory.search(query, 3, &scope()).expect("search should succeed");
+        assert!(
+            results.len() <= 3,
+            "search should return at most top_k results, got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn test_search_scoped_to_user() {
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(FakeLlmProvider::new(), embedding.clone(), store.clone());
+
+        let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
+
+        let alice_vector = embedding.embed("Alice is an engineer.").expect("embed should succeed");
+        let bob_vector = embedding.embed("Bob is a designer.").expect("embed should succeed");
+
+        let mut alice_payload = alice_scope.clone();
+        alice_payload.insert("content".to_string(), "Alice is an engineer.".to_string());
+        let alice_record = VectorRecord::new("rec-1".to_string(), alice_vector, alice_payload);
+        memory.vector_store.insert(alice_record).expect("insert should succeed");
+
+        let mut bob_payload = bob_scope.clone();
+        bob_payload.insert("content".to_string(), "Bob is a designer.".to_string());
+        let bob_record = VectorRecord::new("rec-2".to_string(), bob_vector, bob_payload);
+        memory.vector_store.insert(bob_record).expect("insert should succeed");
+
+        let results = memory.search("engineer", 10, &alice_scope).expect("search should succeed");
+        assert_eq!(
+            results.len(),
+            1,
+            "should only return alice's records when scoped to alice"
+        );
+        assert_eq!(
+            results[0].payload.get("content"),
+            Some(&"Alice is an engineer.".to_string()),
+            "returned record should be alice's"
+        );
+
+        let results = memory.search("designer", 10, &bob_scope).expect("search should succeed");
+        assert_eq!(
+            results.len(),
+            1,
+            "should only return bob's records when scoped to bob"
+        );
+        assert_eq!(
+            results[0].payload.get("content"),
+            Some(&"Bob is a designer.".to_string()),
+            "returned record should be bob's"
+        );
     }
 }
