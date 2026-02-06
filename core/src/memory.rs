@@ -43,6 +43,10 @@ where
         messages: &[Message],
         scope: HashMap<String, String>,
     ) -> Result<Vec<String>, crate::CoreError> {
+        let has_scope_id = scope.keys().any(|k| *k == "user_id" || *k == "agent_id" || *k == "run_id");
+        if !has_scope_id {
+            return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
+        }
         let facts = extract_facts(&self.llm, messages)?;
         let mut ids = Vec::with_capacity(facts.len());
         for fact in &facts {
@@ -151,5 +155,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_add_scope_with_user_id() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let ids = memory.add(&messages, s).expect("add should succeed");
+        assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_add_scope_with_agent_id() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("agent_id".to_string(), "bot1".to_string())]);
+        let ids = memory.add(&messages, s).expect("add should succeed");
+        assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_add_scope_with_run_id() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("run_id".to_string(), "run-123".to_string())]);
+        let ids = memory.add(&messages, s).expect("add should succeed");
+        assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_add_empty_scope_is_rejected() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::new();
+        let result = memory.add(&messages, s);
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_add_scope_with_non_scope_key_is_rejected() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("source".to_string(), "x".to_string())]);
+        let result = memory.add(&messages, s);
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_add_scope_with_multiple_keys_one_is_scope_id() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("source".to_string(), "x".to_string()), ("user_id".to_string(), "alice".to_string())]);
+        let ids = memory.add(&messages, s).expect("add should succeed");
+        assert!(!ids.is_empty());
     }
 }
