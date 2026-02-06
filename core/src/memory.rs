@@ -441,4 +441,15 @@ mod tests {
             "returned record should be bob's"
         );
     }
+
+    #[test]
+    fn test_search_no_matches_returns_empty_ok() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 10, &scope());
+        assert!(matches!(result, Ok(vec) if vec.is_empty()));
+    }
 }
