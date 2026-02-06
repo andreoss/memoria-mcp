@@ -60,61 +60,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{Completion, LlmError, Role};
+    use crate::llm::Role;
+    use crate::test_support::{FakeEmbeddingProvider, FakeLlmProvider};
     use crate::vector_store::InMemoryVectorStore;
-
-    struct FakeLlmProvider {
-        response: String,
-    }
-
-    impl FakeLlmProvider {
-        #[must_use]
-        fn with_facts(response: impl Into<String>) -> Self {
-            Self {
-                response: response.into(),
-            }
-        }
-    }
-
-    impl LlmProvider for FakeLlmProvider {
-        fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
-            if messages.is_empty() {
-                return Err(LlmError::EmptyMessages);
-            }
-            Ok(Completion::new(self.response.clone()))
-        }
-    }
-
-    struct FakeEmbeddingProvider;
-
-    impl FakeEmbeddingProvider {
-        #[must_use]
-        fn new() -> Self {
-            Self
-        }
-    }
-
-    impl EmbeddingProvider for FakeEmbeddingProvider {
-        fn embed(&self, text: &str) -> Result<Vec<f32>, crate::embedding::EmbeddingError> {
-            if text.is_empty() {
-                return Err(crate::embedding::EmbeddingError::EmptyInput);
-            }
-            let bytes = text.as_bytes();
-            let dim: u8 = 4;
-            let mut vector = Vec::with_capacity(usize::from(dim));
-            for d in 0u8..dim {
-                let mut acc = f32::from(d);
-                let mut idx: u8 = 0;
-                for &b in bytes {
-                    let w = f32::from(idx % dim) + 1.0;
-                    acc = acc.mul_add(f32::from(b), w);
-                    idx = idx.wrapping_add(1);
-                }
-                vector.push(acc);
-            }
-            Ok(vector)
-        }
-    }
 
     fn scope() -> HashMap<String, String> {
         HashMap::from([("user_id".to_string(), "alice".to_string())])

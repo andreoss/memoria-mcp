@@ -8,6 +8,9 @@ pub mod vector_store;
 
 pub use error::CoreError;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[must_use]
 pub const fn placeholder() -> bool {
     true

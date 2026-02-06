@@ -98,57 +98,8 @@ impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddingContractTests, EmbeddingError, EmbeddingProvider};
-
-    struct FakeEmbeddingProvider {
-        fail_with_backend: bool,
-        fail_with_timeout: bool,
-    }
-
-    impl FakeEmbeddingProvider {
-        #[must_use]
-        fn new() -> Self {
-            Self {
-                fail_with_backend: false,
-                fail_with_timeout: false,
-            }
-        }
-
-        #[must_use]
-        fn failing() -> Self {
-            Self {
-                fail_with_backend: true,
-                fail_with_timeout: false,
-            }
-        }
-
-        #[must_use]
-        fn timing_out() -> Self {
-            Self {
-                fail_with_backend: false,
-                fail_with_timeout: true,
-            }
-        }
-    }
-
-    impl EmbeddingProvider for FakeEmbeddingProvider {
-        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-            if self.fail_with_backend {
-                return Err(EmbeddingError::Backend("fake backend failure".to_string()));
-            }
-            if self.fail_with_timeout {
-                return Err(EmbeddingError::Timeout);
-            }
-            if text.is_empty() {
-                return Err(EmbeddingError::EmptyInput);
-            }
-            let digest: f32 = text
-                .bytes()
-                .fold(0.0, |acc, b| acc.mul_add(31.0, f32::from(b)));
-            let dim = text.len().max(1);
-            Ok(vec![digest; dim])
-        }
-    }
+    use super::{EmbeddingContractTests, EmbeddingError};
+    use crate::test_support::FakeEmbeddingProvider;
 
     #[test]
     fn empty_input_display_is_sensible() {
