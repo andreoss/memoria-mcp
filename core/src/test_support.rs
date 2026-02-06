@@ -113,6 +113,7 @@ impl LlmProvider for FakeLlmProvider {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeEmbeddingProvider {
     fail_with_backend: bool,
     fail_with_timeout: bool,

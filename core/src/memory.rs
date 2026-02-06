@@ -37,6 +37,7 @@ where
         }
     }
 
+    #[allow(clippy::missing_errors_doc)]
     pub fn search(
         &self,
         query: &str,
@@ -361,12 +362,10 @@ mod tests {
             !results.is_empty(),
             "search should return matching memories"
         );
-        let contents: Vec<&str> = results
-            .iter()
-            .map(|r| r.payload.get("content").map(|s| s.as_str()).unwrap_or(""))
-            .collect();
         assert!(
-            contents.iter().any(|&c| c == "Alice is an engineer."),
+            results
+                .iter()
+                .any(|r| r.payload.get("content").map(String::as_str) == Some("Alice is an engineer.")),
             "search results should contain the added fact"
         );
     }
@@ -400,7 +399,7 @@ mod tests {
     fn test_search_scoped_to_user() {
         let embedding = FakeEmbeddingProvider::new();
         let store = InMemoryVectorStore::new();
-        let memory = Memory::new(FakeLlmProvider::new(), embedding.clone(), store.clone());
+        let memory = Memory::new(FakeLlmProvider::new(), embedding.clone(), store);
 
         let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
         let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
