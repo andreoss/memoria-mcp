@@ -47,6 +47,11 @@ where
         if !has_scope_id {
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
         }
+        for message in messages {
+            if message.content.is_empty() {
+                return Err(crate::CoreError::Validation("message content must not be empty".to_string()));
+            }
+        }
         let facts = extract_facts(&self.llm, messages)?;
         let mut ids = Vec::new();
         for fact in &facts {
@@ -298,5 +303,35 @@ mod tests {
         assert!(!ids2.is_empty(), "second add should return an id for different scope");
         let unique_ids: std::collections::HashSet<String> = ids1.into_iter().chain(ids2).collect();
         assert_eq!(unique_ids.len(), 2, "same fact in different scopes should result in two records");
+    }
+
+    #[test]
+    fn test_add_rejects_empty_message_content() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [
+            Message::new(Role::User, "Alice is an engineer."),
+            Message::new(Role::User, ""),
+        ];
+        let result = memory.add(&messages, scope());
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_add_all_messages_have_content_still_works() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [
+            Message::new(Role::User, "Alice is an engineer."),
+            Message::new(Role::User, "Bob lives in Berlin."),
+        ];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        assert!(!ids.is_empty());
     }
 }
