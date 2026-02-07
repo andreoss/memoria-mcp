@@ -82,6 +82,21 @@ where
         self.vector_store.delete(id).map_err(From::from)
     }
 
+    #[allow(clippy::missing_errors_doc)]
+    pub fn reset(&self, scope: &HashMap<String, String>) -> Result<(), crate::CoreError> {
+        let ids = self.vector_store.list(0, usize::MAX)?;
+        for id in ids {
+            let Some(record) = self.vector_store.get(&id)? else {
+                continue;
+            };
+            let matches = scope.iter().all(|(k, v)| record.payload.get(k) == Some(v));
+            if matches {
+                self.vector_store.delete(&id)?;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
     pub fn add(
         &self,
@@ -661,5 +676,64 @@ mod tests {
 
         let result = memory.delete("never-inserted");
         assert!(result.is_ok(), "deleting an id that was never inserted must not error");
+    }
+
+    #[test]
+    fn test_reset_clears_all_memories_for_scope() {
+        let llm = FakeLlmProvider::with_facts("Fact one.\nFact two.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Two facts.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        assert!(ids.len() >= 2, "expected at least two records for this test to be meaningful");
+
+        memory.reset(&scope()).expect("reset should succeed");
+
+        for id in &ids {
+            let record = memory.vector_store.get(id).expect("get should succeed");
+            assert_eq!(record, None, "reset should have deleted every record in scope");
+        }
+    }
+
+    #[test]
+    fn test_reset_leaves_other_scopes_untouched() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
+
+        let alice_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], alice_scope.clone()).expect("add should succeed");
+        let bob_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], bob_scope).expect("add should succeed");
+
+        memory.reset(&alice_scope).expect("reset should succeed");
+
+        for id in &alice_ids {
+            assert_eq!(memory.vector_store.get(id).expect("get should succeed"), None, "alice's records should be gone");
+        }
+        for id in &bob_ids {
+            assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "bob's records should be untouched");
+        }
+    }
+
+    #[test]
+    fn test_reset_with_no_matching_scope_is_noop() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+
+        let other_scope = HashMap::from([("user_id".to_string(), "nobody-here".to_string())]);
+        memory.reset(&other_scope).expect("reset with no matches should not error");
+
+        for id in &ids {
+            assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "unrelated scope's records should be untouched");
+        }
     }
 }
