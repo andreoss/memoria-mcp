@@ -77,6 +77,11 @@ where
         Ok(())
     }
 
+    #[allow(clippy::missing_errors_doc)]
+    pub fn delete(&self, id: &str) -> Result<(), crate::CoreError> {
+        self.vector_store.delete(id).map_err(From::from)
+    }
+
     #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
     pub fn add(
         &self,
@@ -612,5 +617,22 @@ mod tests {
 
         let result = memory.update(id, None, Some(HashMap::from([("agent_id".to_string(), "other-bot".to_string())])));
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_delete_removes_record() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        memory.delete(id).expect("delete should succeed");
+
+        let record = memory.vector_store.get(id).expect("get should succeed");
+        assert_eq!(record, None, "deleted record should no longer be found");
     }
 }
