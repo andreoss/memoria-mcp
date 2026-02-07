@@ -44,6 +44,9 @@ where
         top_k: usize,
         scope: &HashMap<String, String>,
     ) -> Result<Vec<crate::vector_store::SearchResult>, crate::CoreError> {
+        if top_k == 0 {
+            return Err(crate::CoreError::Validation("top_k must be greater than zero".to_string()));
+        }
         let vector = self.embedding.embed(query)?;
         self.vector_store.search(&vector, top_k, scope).map_err(From::from)
     }
@@ -451,5 +454,27 @@ mod tests {
 
         let result = memory.search("anything", 10, &scope());
         assert!(matches!(result, Ok(vec) if vec.is_empty()));
+    }
+
+    #[test]
+    fn test_search_rejects_zero_top_k() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 0, &scope());
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+#[test]
+    fn test_search_accepts_positive_top_k() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 1, &scope());
+        assert!(result.is_ok());
     }
 }
