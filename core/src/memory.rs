@@ -58,6 +58,9 @@ where
         content: Option<&str>,
         metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Result<(), crate::CoreError> {
+        if metadata.as_ref().is_some_and(|m| m.keys().any(|k| k == "user_id" || k == "agent_id" || k == "run_id")) {
+            return Err(crate::CoreError::Validation("metadata update must not change scope fields (user_id, agent_id, run_id)".to_string()));
+        }
         let Some(mut record) = self.vector_store.get(id)? else {
             return Err(crate::CoreError::NotFound(format!("record {id} not found")));
         };
@@ -536,7 +539,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let result = memory.update("does-not-exist", None, None);
-assert!(matches!(result, Err(crate::CoreError::NotFound(_))));
+        assert!(matches!(result, Err(crate::CoreError::NotFound(_))));
     }
 
     #[test]
@@ -566,16 +569,48 @@ assert!(matches!(result, Err(crate::CoreError::NotFound(_))));
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory
+            .add(&messages, HashMap::from([("user_id".to_string(), "alice".to_string()), ("source".to_string(), "chat_import".to_string())]))
+            .expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         let original_content = memory.vector_store.get(id).expect("get should succeed").expect("record should exist").payload.get("content").cloned();
 
-        memory.update(id, None, Some(HashMap::from([("user_id".to_string(), "bob".to_string())]))).expect("update should succeed");
+        memory.update(id, None, Some(HashMap::from([("source".to_string(), "manual_edit".to_string())]))).expect("update should succeed");
 
         let record = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
         let payload = record.payload;
-        assert_eq!(payload.get("user_id"), Some(&"bob".to_string()), "user_id should be overwritten to bob");
+        assert_eq!(payload.get("source"), Some(&"manual_edit".to_string()), "source should be overwritten to manual_edit");
         assert_eq!(payload.get("content"), original_content.as_ref(), "content should remain unchanged");
+    }
+
+    #[test]
+    fn test_update_rejects_changing_user_id() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        let result = memory.update(id, None, Some(HashMap::from([("user_id".to_string(), "mallory".to_string())])));
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_update_rejects_changing_agent_id_or_run_id() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        let result = memory.update(id, None, Some(HashMap::from([("agent_id".to_string(), "other-bot".to_string())])));
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 }
