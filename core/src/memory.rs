@@ -635,4 +635,31 @@ mod tests {
         let record = memory.vector_store.get(id).expect("get should succeed");
         assert_eq!(record, None, "deleted record should no longer be found");
     }
+
+    #[test]
+    fn test_delete_is_idempotent_when_called_twice() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        memory.delete(id).expect("first delete should succeed");
+        let second = memory.delete(id);
+        assert!(second.is_ok(), "deleting an already-deleted id must not error");
+    }
+
+    #[test]
+    fn test_delete_nonexistent_id_is_idempotent() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.delete("never-inserted");
+        assert!(result.is_ok(), "deleting an id that was never inserted must not error");
+    }
 }
