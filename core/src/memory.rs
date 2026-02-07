@@ -51,6 +51,29 @@ where
         self.vector_store.search(&vector, top_k, scope).map_err(From::from)
     }
 
+    #[allow(clippy::missing_errors_doc)]
+    pub fn update(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<(), crate::CoreError> {
+        let Some(mut record) = self.vector_store.get(id)? else {
+            return Err(crate::CoreError::NotFound(format!("record {id} not found")));
+        };
+        if let Some(content) = content {
+            record.vector = self.embedding.embed(content)?;
+            record.payload.insert("content".to_string(), content.to_string());
+        }
+        if let Some(metadata_map) = metadata {
+            for (key, value) in metadata_map {
+                record.payload.insert(key, value);
+            }
+        }
+        self.vector_store.update(record)?;
+        Ok(())
+    }
+
     #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
     pub fn add(
         &self,
@@ -476,5 +499,43 @@ mod tests {
 
         let result = memory.search("anything", 1, &scope());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_update_content_changes_stored_content() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        memory
+            .update(id, Some("Alice is a senior engineer."), None)
+            .expect("update should succeed");
+
+        let record = memory
+            .vector_store
+            .get(id)
+            .expect("get should succeed")
+            .expect("record should exist in the store");
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"Alice is a senior engineer.".to_string()),
+            "content should be updated to new value"
+        );
+    }
+
+    #[test]
+    fn test_update_missing_id_returns_not_found() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.update("does-not-exist", None, None);
+        assert!(matches!(result, Err(crate::CoreError::NotFound(_))));
     }
 }
