@@ -467,7 +467,7 @@ mod tests {
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
-#[test]
+    #[test]
     fn test_search_accepts_positive_top_k() {
         let llm = FakeLlmProvider::new();
         let embedding = FakeEmbeddingProvider::new();
