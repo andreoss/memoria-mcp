@@ -536,6 +536,46 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let result = memory.update("does-not-exist", None, None);
-        assert!(matches!(result, Err(crate::CoreError::NotFound(_))));
+assert!(matches!(result, Err(crate::CoreError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_update_metadata_merges_new_key() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        memory.update(id, None, Some(HashMap::from([("source".to_string(), "chat_import".to_string())]))).expect("update should succeed");
+
+        let record = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+        let payload = record.payload;
+        assert_eq!(payload.get("user_id"), Some(&"alice".to_string()), "user_id should still be present");
+        assert_eq!(payload.get("source"), Some(&"chat_import".to_string()), "source should be merged");
+    }
+
+    #[test]
+    fn test_update_metadata_overwrites_existing_key() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        let original_content = memory.vector_store.get(id).expect("get should succeed").expect("record should exist").payload.get("content").cloned();
+
+        memory.update(id, None, Some(HashMap::from([("user_id".to_string(), "bob".to_string())]))).expect("update should succeed");
+
+        let record = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+        let payload = record.payload;
+        assert_eq!(payload.get("user_id"), Some(&"bob".to_string()), "user_id should be overwritten to bob");
+        assert_eq!(payload.get("content"), original_content.as_ref(), "content should remain unchanged");
     }
 }
