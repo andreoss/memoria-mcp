@@ -1,6 +1,6 @@
-use crate::embedding::EmbeddingProvider;
-use crate::llm::{extract_facts, LlmProvider, Message};
-use crate::vector_store::{VectorRecord, VectorStore};
+use crate::embedding::{EmbeddingConfig, EmbeddingProvider};
+use crate::llm::{extract_facts, LlmConfig, LlmProvider, Message};
+use crate::vector_store::{VectorRecord, VectorStore, VectorStoreConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -22,6 +22,23 @@ pub enum HistoryEvent {
 pub struct HistoryEntry {
     pub event: HistoryEvent,
     pub content: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryConfig {
+    pub llm: LlmConfig,
+    pub embedding: EmbeddingConfig,
+    pub vector_store: VectorStoreConfig,
+}
+
+impl MemoryConfig {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        self.llm.validate()?;
+        self.embedding.validate()?;
+        self.vector_store.validate()?;
+        Ok(())
+    }
 }
 
 pub struct Memory<L, E, V>
@@ -169,9 +186,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Role;
+    use crate::embedding::EmbeddingConfig;
+    use crate::llm::{LlmConfig, Role};
     use crate::test_support::{FakeEmbeddingProvider, FakeLlmProvider};
-    use crate::vector_store::InMemoryVectorStore;
+    use crate::vector_store::{InMemoryVectorStore, VectorStoreConfig};
 
     fn scope() -> HashMap<String, String> {
         HashMap::from([("user_id".to_string(), "alice".to_string())])
@@ -906,5 +924,45 @@ mod tests {
             matches!(update_result, Ok(()) | Err(crate::CoreError::NotFound(_))),
             "update racing a delete on the same id must resolve to one of two well-defined outcomes, never a corrupt state: got {update_result:?}"
         );
+    }
+
+    #[test]
+    fn memory_config_with_all_valid_sub_configs_passes_validation() {
+        let config = MemoryConfig {
+            llm: LlmConfig { model: "llama3".to_string(), base_url: None, api_key: None, temperature: None },
+            embedding: EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: None, api_key: None, dimensions: None },
+            vector_store: VectorStoreConfig { collection_name: "memories".to_string(), url: None, api_key: None, dimension: None },
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn memory_config_with_invalid_llm_sub_config_is_rejected() {
+        let config = MemoryConfig {
+            llm: LlmConfig { model: String::new(), base_url: None, api_key: None, temperature: None },
+            embedding: EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: None, api_key: None, dimensions: None },
+            vector_store: VectorStoreConfig { collection_name: "memories".to_string(), url: None, api_key: None, dimension: None },
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn memory_config_with_invalid_embedding_sub_config_is_rejected() {
+        let config = MemoryConfig {
+            llm: LlmConfig { model: "llama3".to_string(), base_url: None, api_key: None, temperature: None },
+            embedding: EmbeddingConfig { model: String::new(), base_url: None, api_key: None, dimensions: None },
+            vector_store: VectorStoreConfig { collection_name: "memories".to_string(), url: None, api_key: None, dimension: None },
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn memory_config_with_invalid_vector_store_sub_config_is_rejected() {
+        let config = MemoryConfig {
+            llm: LlmConfig { model: "llama3".to_string(), base_url: None, api_key: None, temperature: None },
+            embedding: EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: None, api_key: None, dimensions: None },
+            vector_store: VectorStoreConfig { collection_name: String::new(), url: None, api_key: None, dimension: None },
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
     }
 }

@@ -48,6 +48,27 @@ impl fmt::Display for VectorStoreError {
 
 impl std::error::Error for VectorStoreError {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorStoreConfig {
+    pub collection_name: String,
+    pub url: Option<String>,
+    pub api_key: Option<String>,
+    pub dimension: Option<usize>,
+}
+
+impl VectorStoreConfig {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.collection_name.trim().is_empty() {
+            return Err(crate::CoreError::Config("collection_name must not be empty".to_string()));
+        }
+        if self.dimension == Some(0) {
+            return Err(crate::CoreError::Config("dimension must be greater than zero".to_string()));
+        }
+        Ok(())
+    }
+}
+
 pub trait VectorStore {
     #[allow(clippy::missing_errors_doc)]
     fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError>;
@@ -427,7 +448,7 @@ impl VectorStore for InMemoryVectorStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{InMemoryVectorStore, VectorStoreContractTests};
+    use super::{InMemoryVectorStore, VectorStoreConfig, VectorStoreContractTests};
 
     #[test]
     fn in_memory_store_passes_insert_then_get_contract() {
@@ -502,5 +523,60 @@ mod tests {
     #[test]
     fn in_memory_store_passes_list_pagination_respects_offset_and_limit_contract() {
         InMemoryVectorStore::new().contract_list_pagination_respects_offset_and_limit();
+    }
+
+    #[test]
+    fn config_with_valid_collection_name_passes_validation() {
+        let config = VectorStoreConfig {
+            collection_name: "memories".to_string(),
+            url: None,
+            api_key: None,
+            dimension: None,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_empty_collection_name_is_rejected() {
+        let config = VectorStoreConfig {
+            collection_name: String::new(),
+            url: None,
+            api_key: None,
+            dimension: None,
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_whitespace_only_collection_name_is_rejected() {
+        let config = VectorStoreConfig {
+            collection_name: "   ".to_string(),
+            url: None,
+            api_key: None,
+            dimension: None,
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_positive_dimension_passes_validation() {
+        let config = VectorStoreConfig {
+            collection_name: "memories".to_string(),
+            url: None,
+            api_key: None,
+            dimension: Some(768),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_zero_dimension_is_rejected() {
+        let config = VectorStoreConfig {
+            collection_name: "memories".to_string(),
+            url: None,
+            api_key: None,
+            dimension: Some(0),
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
     }
 }
