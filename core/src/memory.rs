@@ -15,6 +15,7 @@ fn next_record_id() -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryEvent {
     Added,
+    Deleted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,9 +92,17 @@ where
         Ok(())
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
     pub fn delete(&self, id: &str) -> Result<(), crate::CoreError> {
-        self.vector_store.delete(id).map_err(From::from)
+        let content = self.vector_store.get(id)?.and_then(|r| r.payload.get("content").cloned());
+        self.vector_store.delete(id)?;
+        if let Some(content) = content {
+            self.history.lock().expect("lock poisoned").entry(id.to_string()).or_default().push(HistoryEntry {
+                event: HistoryEvent::Deleted,
+                content,
+            });
+        }
+        Ok(())
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -785,5 +794,37 @@ mod tests {
 
         let entries = memory.history("never-added").expect("history should succeed");
         assert!(entries.is_empty(), "history for an id that was never added should be empty, not an error");
+    }
+
+    #[test]
+    fn test_history_retains_deleted_entry_after_delete() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        memory.delete(id).expect("delete should succeed");
+
+        let entries = memory.history(id).expect("history should succeed");
+        assert_eq!(entries.len(), 2, "expected an Added entry followed by a Deleted entry");
+        assert_eq!(entries[0].event, HistoryEvent::Added);
+        assert_eq!(entries[1].event, HistoryEvent::Deleted);
+        assert_eq!(entries[1].content, "Alice is an engineer.");
+    }
+
+    #[test]
+    fn test_deleting_nonexistent_id_adds_no_history_entry() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        memory.delete("never-added").expect("delete should succeed");
+
+        let entries = memory.history("never-added").expect("history should succeed");
+        assert!(entries.is_empty(), "deleting an id that was never added should not create a history entry");
     }
 }
