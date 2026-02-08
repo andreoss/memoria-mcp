@@ -3,12 +3,24 @@ use crate::llm::{extract_facts, LlmProvider, Message};
 use crate::vector_store::{VectorRecord, VectorStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(0);
 
 fn next_record_id() -> String {
     let n = NEXT_RECORD_ID.fetch_add(1, Ordering::Relaxed);
     format!("rec-{n}")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryEvent {
+    Added,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub event: HistoryEvent,
+    pub content: String,
 }
 
 pub struct Memory<L, E, V>
@@ -20,6 +32,7 @@ where
     llm: L,
     embedding: E,
     vector_store: V,
+    history: Mutex<HashMap<String, Vec<HistoryEntry>>>,
 }
 
 impl<L, E, V> Memory<L, E, V>
@@ -29,11 +42,12 @@ where
     V: VectorStore,
 {
     #[must_use]
-    pub const fn new(llm: L, embedding: E, vector_store: V) -> Self {
+    pub fn new(llm: L, embedding: E, vector_store: V) -> Self {
         Self {
             llm,
             embedding,
             vector_store,
+            history: Mutex::new(HashMap::new()),
         }
     }
 
@@ -97,7 +111,12 @@ where
         Ok(())
     }
 
-    #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
+    #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+    pub fn history(&self, id: &str) -> Result<Vec<HistoryEntry>, crate::CoreError> {
+        Ok(self.history.lock().expect("lock poisoned").get(id).cloned().unwrap_or_default())
+    }
+
+    #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value, clippy::missing_panics_doc)]
     pub fn add(
         &self,
         messages: &[Message],
@@ -128,6 +147,10 @@ where
             }
             let record = VectorRecord::new(id.clone(), vector, payload);
             self.vector_store.insert(record)?;
+            self.history.lock().expect("lock poisoned").entry(id.clone()).or_default().push(HistoryEntry {
+                event: HistoryEvent::Added,
+                content: fact.clone(),
+            });
             ids.push(id);
         }
         Ok(ids)
@@ -735,5 +758,32 @@ mod tests {
         for id in &ids {
             assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "unrelated scope's records should be untouched");
         }
+    }
+
+    #[test]
+    fn test_history_returns_entry_after_add() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        let entries = memory.history(id).expect("history should succeed");
+        assert_eq!(entries.len(), 1, "expected exactly one history entry after a single add");
+        assert_eq!(entries[0].event, HistoryEvent::Added);
+        assert_eq!(entries[0].content, "Alice is an engineer.");
+    }
+
+    #[test]
+    fn test_history_for_unknown_id_returns_empty() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let entries = memory.history("never-added").expect("history should succeed");
+        assert!(entries.is_empty(), "history for an id that was never added should be empty, not an error");
     }
 }
