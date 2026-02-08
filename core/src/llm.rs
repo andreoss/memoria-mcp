@@ -28,6 +28,31 @@ pub struct Completion {
     pub content: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LlmConfig {
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub temperature: Option<f32>,
+}
+
+impl LlmConfig {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.model.trim().is_empty() {
+            return Err(crate::CoreError::Config("model must not be empty".to_string()));
+        }
+        if let Some(temperature) = self.temperature {
+            if !(0.0..=2.0).contains(&temperature) {
+                return Err(crate::CoreError::Config(format!(
+                    "temperature must be between 0.0 and 2.0, got {temperature}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Completion {
     #[must_use]
     pub fn new(content: impl Into<String>) -> Self {
@@ -132,7 +157,7 @@ impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_facts, LlmContractTests, LlmError, LlmProvider, Message, Role};
+    use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, Message, Role};
     use crate::test_support::FakeLlmProvider;
 
     #[test]
@@ -256,5 +281,71 @@ mod tests {
         let conversation = [Message::new(Role::User, "anything")];
         let facts = extract_facts(&provider, &conversation).expect("expected facts");
         assert_eq!(facts, vec!["Fact one.".to_string(), "Fact two.".to_string()]);
+    }
+
+    #[test]
+    fn config_with_valid_model_passes_validation() {
+        let config = LlmConfig {
+            model: "llama3".to_string(),
+            base_url: None,
+            api_key: None,
+            temperature: None,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_empty_model_is_rejected() {
+        let config = LlmConfig {
+            model: String::new(),
+            base_url: None,
+            api_key: None,
+            temperature: None,
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_whitespace_only_model_is_rejected() {
+        let config = LlmConfig {
+            model: "   ".to_string(),
+            base_url: None,
+            api_key: None,
+            temperature: None,
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_temperature_in_range_passes_validation() {
+        let config = LlmConfig {
+            model: "llama3".to_string(),
+            base_url: None,
+            api_key: None,
+            temperature: Some(0.7),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_temperature_out_of_range_is_rejected() {
+        let config = LlmConfig {
+            model: "llama3".to_string(),
+            base_url: None,
+            api_key: None,
+            temperature: Some(2.5),
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_negative_temperature_is_rejected() {
+        let config = LlmConfig {
+            model: "llama3".to_string(),
+            base_url: None,
+            api_key: None,
+            temperature: Some(-0.1),
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
     }
 }

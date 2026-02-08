@@ -29,6 +29,27 @@ pub trait EmbeddingProvider {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingConfig {
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub dimensions: Option<usize>,
+}
+
+impl EmbeddingConfig {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.model.trim().is_empty() {
+            return Err(crate::CoreError::Config("model must not be empty".to_string()));
+        }
+        if self.dimensions == Some(0) {
+            return Err(crate::CoreError::Config("dimensions must be greater than zero".to_string()));
+        }
+        Ok(())
+    }
+}
+
 pub trait EmbeddingContractTests: EmbeddingProvider {
     fn contract_happy_path(&self) {
         let result = self.embed("hello");
@@ -98,7 +119,7 @@ impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddingContractTests, EmbeddingError};
+    use super::{EmbeddingConfig, EmbeddingContractTests, EmbeddingError};
     use crate::test_support::FakeEmbeddingProvider;
 
     #[test]
@@ -152,5 +173,60 @@ mod tests {
     #[test]
     fn fake_provider_passes_batch_empty_contract() {
         FakeEmbeddingProvider::new().contract_embed_batch_empty_list_returns_empty();
+    }
+
+    #[test]
+    fn config_with_valid_model_passes_validation() {
+        let config = EmbeddingConfig {
+            model: "nomic-embed-text".to_string(),
+            base_url: None,
+            api_key: None,
+            dimensions: None,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_empty_model_is_rejected() {
+        let config = EmbeddingConfig {
+            model: String::new(),
+            base_url: None,
+            api_key: None,
+            dimensions: None,
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_whitespace_only_model_is_rejected() {
+        let config = EmbeddingConfig {
+            model: "   ".to_string(),
+            base_url: None,
+            api_key: None,
+            dimensions: None,
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn config_with_positive_dimensions_passes_validation() {
+        let config = EmbeddingConfig {
+            model: "nomic-embed-text".to_string(),
+            base_url: None,
+            api_key: None,
+            dimensions: Some(768),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_zero_dimensions_is_rejected() {
+        let config = EmbeddingConfig {
+            model: "nomic-embed-text".to_string(),
+            base_url: None,
+            api_key: None,
+            dimensions: Some(0),
+        };
+        assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
     }
 }
