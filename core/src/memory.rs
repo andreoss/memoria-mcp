@@ -965,4 +965,30 @@ mod tests {
         };
         assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
     }
+
+    #[test]
+    fn test_end_to_end_multi_user_isolation() {
+        let llm = FakeLlmProvider::with_facts("I am an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
+
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], alice_scope.clone()).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], bob_scope.clone()).expect("add should succeed");
+
+        let alice_results = memory.search("engineer", 10, &alice_scope).expect("search should succeed");
+        let bob_results = memory.search("engineer", 10, &bob_scope).expect("search should succeed");
+
+        assert_eq!(alice_results.len(), 1, "alice should see exactly her own memory, even though bob added identical content");
+        assert_eq!(bob_results.len(), 1, "bob should see exactly his own memory, even though alice added identical content");
+        assert_eq!(alice_results[0].payload.get("user_id"), Some(&"alice".to_string()));
+        assert_eq!(bob_results[0].payload.get("user_id"), Some(&"bob".to_string()));
+        assert_ne!(
+            alice_results[0].id, bob_results[0].id,
+            "alice and bob must end up with distinct records despite adding identical content"
+        );
+    }
 }
