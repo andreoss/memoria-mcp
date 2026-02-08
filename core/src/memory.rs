@@ -878,4 +878,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_concurrent_update_and_delete_resolve_deterministically() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id").clone();
+
+        let update_result = std::thread::scope(|s| {
+            let memory_ref = &memory;
+            let id_ref = &id;
+            let handle = s.spawn(move || memory_ref.update(id_ref, Some("Alice is a senior engineer."), None));
+            memory.delete(&id).expect("delete should succeed");
+            handle.join().expect("update thread should not panic")
+        });
+
+        assert_eq!(
+            memory.vector_store.get(&id).expect("get should succeed"),
+            None,
+            "record should be gone regardless of which operation the scheduler ran first"
+        );
+        assert!(
+            matches!(update_result, Ok(()) | Err(crate::CoreError::NotFound(_))),
+            "update racing a delete on the same id must resolve to one of two well-defined outcomes, never a corrupt state: got {update_result:?}"
+        );
+    }
 }

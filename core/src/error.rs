@@ -10,7 +10,7 @@ pub enum CoreError {
     Config(String),
     Provider {
         message: String,
-        source: Box<dyn std::error::Error>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
