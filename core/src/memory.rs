@@ -827,4 +827,55 @@ mod tests {
         let entries = memory.history("never-added").expect("history should succeed");
         assert!(entries.is_empty(), "deleting an id that was never added should not create a history entry");
     }
+
+    #[test]
+    fn test_concurrent_add_operations_across_scopes_do_not_corrupt_state() {
+        const THREAD_COUNT: usize = 8;
+
+        let llm = FakeLlmProvider::with_facts("Fact one.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        std::thread::scope(|s| {
+            for i in 0..THREAD_COUNT {
+                let memory_ref = &memory;
+                s.spawn(move || {
+                    let thread_scope = HashMap::from([("user_id".to_string(), format!("user-{i}"))]);
+                    memory_ref.add(&[Message::new(Role::User, "Fact one.")], thread_scope).expect("add should succeed");
+                });
+            }
+        });
+
+        let ids = memory.vector_store.list(0, usize::MAX).expect("list should succeed");
+        assert_eq!(ids.len(), THREAD_COUNT, "each thread's distinct scope should have produced exactly one record, none lost or duplicated");
+    }
+
+    #[test]
+    fn test_concurrent_delete_operations_do_not_lose_deletes() {
+        let llm = FakeLlmProvider::with_facts("Fact one.\nFact two.\nFact three.\nFact four.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Four facts.")], scope()).expect("add should succeed");
+        assert!(ids.len() >= 4, "expected at least four records for this test to be meaningful");
+
+        std::thread::scope(|s| {
+            for id in &ids {
+                let memory_ref = &memory;
+                s.spawn(move || {
+                    memory_ref.delete(id).expect("delete should succeed");
+                });
+            }
+        });
+
+        for id in &ids {
+            assert_eq!(
+                memory.vector_store.get(id).expect("get should succeed"),
+                None,
+                "every concurrently-deleted record should be gone, none left behind"
+            );
+        }
+    }
 }
