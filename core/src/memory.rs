@@ -12,6 +12,10 @@ fn next_record_id() -> String {
     format!("rec-{n}")
 }
 
+fn has_scope_id(scope: &HashMap<String, String>) -> bool {
+    scope.keys().any(|k| k == "user_id" || k == "agent_id" || k == "run_id")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryEvent {
     Added,
@@ -87,6 +91,9 @@ where
         if top_k == 0 {
             return Err(crate::CoreError::Validation("top_k must be greater than zero".to_string()));
         }
+        if !has_scope_id(scope) {
+            return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
+        }
         let vector = self.embedding.embed(query)?;
         self.vector_store.search(&vector, top_k, scope).map_err(From::from)
     }
@@ -157,8 +164,7 @@ where
         messages: &[Message],
         scope: HashMap<String, String>,
     ) -> Result<Vec<String>, crate::CoreError> {
-        let has_scope_id = scope.keys().any(|k| *k == "user_id" || *k == "agent_id" || *k == "run_id");
-        if !has_scope_id {
+        if !has_scope_id(&scope) {
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
         }
         if let Some(max_bytes) = self.max_metadata_bytes {
@@ -1198,5 +1204,71 @@ mod tests {
             ids.len(), 2,
             "the LLM returned the same fact twice within one call; only two distinct records should be created"
         );
+    }
+
+    #[test]
+    fn test_search_rejects_empty_scope() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 10, &HashMap::new());
+        assert!(
+            matches!(result, Err(crate::CoreError::Validation(_))),
+            "search with no scope-identifying key must be rejected, not silently return every scope's records"
+        );
+    }
+
+    #[test]
+    fn test_search_rejects_scope_with_no_scope_id_key() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let non_scope_filter = HashMap::from([("source".to_string(), "chat_import".to_string())]);
+        let result = memory.search("anything", 10, &non_scope_filter);
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_update_with_no_fields_provided_is_a_noop_not_an_error() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+        let before = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+
+        let result = memory.update(id, None, None);
+        assert!(result.is_ok(), "update with no fields provided should be a no-op, not an error");
+
+        let after = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(before, after, "update with nothing to change should leave the record byte-for-byte identical");
+    }
+
+    #[test]
+    fn test_delete_requires_exact_id_match_not_a_prefix_match() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.\nBob lives in Berlin.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer and Bob lives in Berlin.")], scope()).expect("add should succeed");
+        assert!(ids.len() >= 2, "expected at least two records for this test to be meaningful");
+        let first_id = &ids[0];
+        let common_prefix = &first_id[..first_id.len() - 1];
+
+        memory.delete(common_prefix).expect("deleting a nonexistent id should be idempotent, not an error");
+
+        for id in &ids {
+            assert!(
+                memory.vector_store.get(id).expect("get should succeed").is_some(),
+                "deleting by a prefix of one id must not remove any record, including the one it's a prefix of"
+            );
+        }
     }
 }
