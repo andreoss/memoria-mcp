@@ -991,4 +991,70 @@ mod tests {
             "alice and bob must end up with distinct records despite adding identical content"
         );
     }
+
+    #[test]
+    fn test_end_to_end_multi_agent_isolation() {
+        let llm = FakeLlmProvider::with_facts("I am an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let scheduler_scope = HashMap::from([("agent_id".to_string(), "scheduler-bot".to_string())]);
+        let support_scope = HashMap::from([("agent_id".to_string(), "support-bot".to_string())]);
+
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], scheduler_scope.clone()).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], support_scope.clone()).expect("add should succeed");
+
+        let scheduler_results = memory.search("engineer", 10, &scheduler_scope).expect("search should succeed");
+        let support_results = memory.search("engineer", 10, &support_scope).expect("search should succeed");
+
+        assert_eq!(scheduler_results.len(), 1, "scheduler-bot should see exactly its own memory");
+        assert_eq!(support_results.len(), 1, "support-bot should see exactly its own memory");
+        assert_eq!(scheduler_results[0].payload.get("agent_id"), Some(&"scheduler-bot".to_string()));
+        assert_eq!(support_results[0].payload.get("agent_id"), Some(&"support-bot".to_string()));
+        assert_ne!(
+            scheduler_results[0].id, support_results[0].id,
+            "agent scoping must isolate the same way user scoping does"
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_reset_then_search_returns_nothing() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let before = memory.search("engineer", 10, &scope()).expect("search should succeed");
+        assert!(!before.is_empty(), "expected a result before reset for this test to be meaningful");
+
+        memory.reset(&scope()).expect("reset should succeed");
+
+        let after = memory.search("engineer", 10, &scope()).expect("search should succeed");
+        assert!(after.is_empty(), "search after reset should return nothing");
+    }
+
+    #[test]
+    fn test_end_to_end_update_then_search_reflects_the_update() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        memory.update(id, Some("Alice is a senior engineer."), None).expect("update should succeed");
+
+        let results = memory.search("senior engineer", 10, &scope()).expect("search should succeed");
+        assert!(
+            results.iter().any(|r| r.payload.get("content") == Some(&"Alice is a senior engineer.".to_string())),
+            "search after update should reflect the new content"
+        );
+        assert!(
+            !results.iter().any(|r| r.payload.get("content") == Some(&"Alice is an engineer.".to_string())),
+            "search should not return the pre-update content"
+        );
+    }
 }
