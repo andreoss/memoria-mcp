@@ -1171,4 +1171,32 @@ mod tests {
             "a dimension mismatch from the vector store must surface through Memory::add as CoreError::Provider, not panic or a different variant"
         );
     }
+
+    #[test]
+    fn test_add_with_zero_facts_extracted_succeeds_with_no_ids() {
+        let llm = FakeLlmProvider::with_response("");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Just saying hello, nothing memorable.")];
+        let ids = memory.add(&messages, scope()).expect("zero extracted facts should not be an error");
+        assert!(ids.is_empty(), "no facts extracted should mean no records inserted, not an error");
+    }
+
+    #[test]
+    fn test_add_deduplicates_duplicate_facts_within_one_call() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.\nAlice is an engineer.\nBob lives in Berlin.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer, and again, Alice is an engineer. Bob lives in Berlin.")];
+        let ids = memory.add(&messages, scope()).expect("add should succeed");
+
+        assert_eq!(
+            ids.len(), 2,
+            "the LLM returned the same fact twice within one call; only two distinct records should be created"
+        );
+    }
 }
