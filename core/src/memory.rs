@@ -138,8 +138,9 @@ where
     }
 
     #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
-    pub fn history(&self, id: &str) -> Result<Vec<HistoryEntry>, crate::CoreError> {
-        Ok(self.history.lock().expect("lock poisoned").get(id).cloned().unwrap_or_default())
+    pub fn history(&self, id: &str, offset: usize, limit: usize) -> Result<Vec<HistoryEntry>, crate::CoreError> {
+        let entries = self.history.lock().expect("lock poisoned").get(id).cloned().unwrap_or_default();
+        Ok(entries.into_iter().skip(offset).take(limit).collect())
     }
 
     #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value, clippy::missing_panics_doc)]
@@ -797,7 +798,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
-        let entries = memory.history(id).expect("history should succeed");
+        let entries = memory.history(id, 0, usize::MAX).expect("history should succeed");
         assert_eq!(entries.len(), 1, "expected exactly one history entry after a single add");
         assert_eq!(entries[0].event, HistoryEvent::Added);
         assert_eq!(entries[0].content, "Alice is an engineer.");
@@ -810,7 +811,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let entries = memory.history("never-added").expect("history should succeed");
+        let entries = memory.history("never-added", 0, usize::MAX).expect("history should succeed");
         assert!(entries.is_empty(), "history for an id that was never added should be empty, not an error");
     }
 
@@ -826,7 +827,7 @@ mod tests {
 
         memory.delete(id).expect("delete should succeed");
 
-        let entries = memory.history(id).expect("history should succeed");
+        let entries = memory.history(id, 0, usize::MAX).expect("history should succeed");
         assert_eq!(entries.len(), 2, "expected an Added entry followed by a Deleted entry");
         assert_eq!(entries[0].event, HistoryEvent::Added);
         assert_eq!(entries[1].event, HistoryEvent::Deleted);
@@ -842,8 +843,45 @@ mod tests {
 
         memory.delete("never-added").expect("delete should succeed");
 
-        let entries = memory.history("never-added").expect("history should succeed");
+        let entries = memory.history("never-added", 0, usize::MAX).expect("history should succeed");
         assert!(entries.is_empty(), "deleting an id that was never added should not create a history entry");
+    }
+
+    #[test]
+    fn test_history_pagination_respects_offset_and_limit() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+        memory.delete(id).expect("delete should succeed");
+
+        let first_page = memory.history(id, 0, 1).expect("history should succeed");
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].event, HistoryEvent::Added);
+
+        let second_page = memory.history(id, 1, 1).expect("history should succeed");
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].event, HistoryEvent::Deleted);
+
+        let whole_log = memory.history(id, 0, 100).expect("history should succeed");
+        assert_eq!(whole_log.len(), 2, "a limit larger than the log should return everything, not error");
+    }
+
+    #[test]
+    fn test_history_pagination_offset_beyond_log_returns_empty() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        let page = memory.history(id, 10, 5).expect("history should succeed");
+        assert!(page.is_empty(), "an offset past the end of the log should return empty, not error");
     }
 
     #[test]
