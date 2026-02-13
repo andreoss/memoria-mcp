@@ -176,4 +176,16 @@ mod tests {
             other => panic!("expected Provider, got {other:?}"),
         }
     }
+
+    #[test]
+    fn vector_store_dimension_mismatch_routes_to_provider() {
+        let err: CoreError = VectorStoreError::DimensionMismatch { expected: 8, actual: 3 }.into();
+        match err {
+            CoreError::Provider { message, .. } => {
+                assert!(message.contains('8'));
+                assert!(message.contains('3'));
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
 }

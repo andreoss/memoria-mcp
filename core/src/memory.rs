@@ -51,6 +51,7 @@ where
     embedding: E,
     vector_store: V,
     history: Mutex<HashMap<String, Vec<HistoryEntry>>>,
+    max_metadata_bytes: Option<usize>,
 }
 
 impl<L, E, V> Memory<L, E, V>
@@ -66,7 +67,14 @@ where
             embedding,
             vector_store,
             history: Mutex::new(HashMap::new()),
+            max_metadata_bytes: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_max_metadata_bytes(mut self, limit: usize) -> Self {
+        self.max_metadata_bytes = Some(limit);
+        self
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -152,6 +160,14 @@ where
         let has_scope_id = scope.keys().any(|k| *k == "user_id" || *k == "agent_id" || *k == "run_id");
         if !has_scope_id {
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
+        }
+        if let Some(max_bytes) = self.max_metadata_bytes {
+            let total_bytes: usize = scope.iter().map(|(k, v)| k.len() + v.len()).sum();
+            if total_bytes > max_bytes {
+                return Err(crate::CoreError::Validation(format!(
+                    "metadata payload of {total_bytes} bytes exceeds the configured limit of {max_bytes} bytes"
+                )));
+            }
         }
         for message in messages {
             if message.content.is_empty() {
@@ -1093,6 +1109,66 @@ mod tests {
         assert!(
             !results.iter().any(|r| r.payload.get("content") == Some(&"Alice is an engineer.".to_string())),
             "search should not return the pre-update content"
+        );
+    }
+
+    #[test]
+    fn test_add_rejects_metadata_over_configured_size_limit() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store).with_max_metadata_bytes(10);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let result = memory.add(&messages, scope());
+        assert!(
+            matches!(result, Err(crate::CoreError::Validation(_))),
+            "scope() alone (\"user_id\" + \"alice\") is well over 10 bytes and should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_add_accepts_metadata_within_configured_size_limit() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store).with_max_metadata_bytes(1000);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let result = memory.add(&messages, scope());
+        assert!(result.is_ok(), "scope() is well under 1000 bytes and should be accepted");
+    }
+
+    #[test]
+    fn test_add_with_no_configured_limit_accepts_any_size() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let large_value = "x".repeat(10_000);
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let s = HashMap::from([("user_id".to_string(), "alice".to_string()), ("notes".to_string(), large_value)]);
+        let result = memory.add(&messages, s);
+        assert!(result.is_ok(), "with no configured limit, metadata size should never be rejected");
+    }
+
+    #[test]
+    fn test_add_wraps_dimension_mismatch_as_provider_error() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        store
+            .insert(VectorRecord::new("seed".to_string(), vec![1.0, 2.0, 3.0], HashMap::new()))
+            .expect("seed insert should succeed");
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let result = memory.add(&messages, scope());
+
+        assert!(
+            matches!(result, Err(crate::CoreError::Provider { .. })),
+            "a dimension mismatch from the vector store must surface through Memory::add as CoreError::Provider, not panic or a different variant"
         );
     }
 }
