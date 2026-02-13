@@ -1,5 +1,8 @@
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::llm::{Completion, LlmError, LlmProvider, Message};
+use crate::vector_store::{SearchResult, VectorRecord, VectorStore, VectorStoreError};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 pub struct FakeLlmProvider {
     fail_with_backend: bool,
@@ -170,5 +173,77 @@ impl EmbeddingProvider for FakeEmbeddingProvider {
             vector.push(acc);
         }
         Ok(vector)
+    }
+}
+
+pub struct VecVectorStore {
+    records: Mutex<Vec<VectorRecord>>,
+}
+
+impl VecVectorStore {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            records: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl VectorStore for VecVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        let mut records = self.records.lock().expect("lock poisoned");
+        if let Some(existing) = records.first() {
+            let expected = existing.vector.len();
+            let actual = record.vector.len();
+            if expected != actual {
+                return Err(VectorStoreError::DimensionMismatch { expected, actual });
+            }
+        }
+        records.push(record);
+        drop(records);
+        Ok(())
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let mut scored: Vec<SearchResult> = self
+            .records
+            .lock()
+            .expect("lock poisoned")
+            .iter()
+            .filter(|r| filters.iter().all(|(k, v)| r.payload.get(k).is_some_and(|pv| pv == v)))
+            .map(|r| {
+                let score = r.vector.iter().zip(vector.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, |acc, d| acc + d);
+                SearchResult { id: r.id.clone(), score, payload: r.payload.clone() }
+            })
+            .collect();
+        scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        Ok(self.records.lock().expect("lock poisoned").iter().find(|r| r.id == id).cloned())
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        let mut records = self.records.lock().expect("lock poisoned");
+        records.iter_mut().find(|r| r.id == record.id).map_or(Err(VectorStoreError::NotFound), |existing| {
+            *existing = record;
+            Ok(())
+        })
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        self.records.lock().expect("lock poisoned").retain(|r| r.id != id);
+        Ok(())
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        Ok(self.records.lock().expect("lock poisoned").iter().map(|r| r.id.clone()).skip(offset).take(limit).collect())
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.records.lock().expect("lock poisoned").clear();
+        Ok(())
     }
 }

@@ -449,10 +449,61 @@ impl VectorStore for InMemoryVectorStore {
 #[cfg(test)]
 mod tests {
     use super::{InMemoryVectorStore, VectorStoreConfig, VectorStoreContractTests};
+    use crate::test_support::VecVectorStore;
 
     #[test]
     fn in_memory_store_passes_insert_then_get_contract() {
         InMemoryVectorStore::new().contract_insert_then_get_round_trips();
+    }
+
+    #[test]
+    fn vec_store_passes_insert_then_get_contract() {
+        VecVectorStore::new().contract_insert_then_get_round_trips();
+    }
+
+    #[test]
+    fn vec_store_passes_delete_then_get_contract() {
+        VecVectorStore::new().contract_delete_then_get_returns_none();
+    }
+
+    #[test]
+    fn vec_store_passes_reset_contract() {
+        VecVectorStore::new().contract_reset_clears_everything();
+    }
+
+    #[test]
+    fn vec_store_passes_search_respects_top_k_contract() {
+        VecVectorStore::new().contract_search_respects_top_k();
+    }
+
+    #[test]
+    fn vec_store_passes_search_orders_by_score_contract() {
+        VecVectorStore::new().contract_search_orders_by_score();
+    }
+
+    #[test]
+    fn vec_store_passes_search_filters_by_agent_id_contract() {
+        VecVectorStore::new().contract_search_filters_by_agent_id();
+    }
+
+    #[test]
+    fn vec_store_passes_update_nonexistent_contract() {
+        VecVectorStore::new().contract_update_nonexistent_returns_not_found();
+    }
+
+    #[test]
+    fn vec_store_passes_delete_nonexistent_is_idempotent_contract() {
+        VecVectorStore::new().contract_delete_nonexistent_is_idempotent();
+    }
+
+    #[test]
+    fn vec_store_passes_insert_rejects_mismatched_dimension_contract() {
+        VecVectorStore::new().contract_insert_rejects_mismatched_dimension();
+    }
+
+    #[test]
+    fn vec_store_passes_list_pagination_respects_offset_and_limit_contract() {
+        VecVectorStore::new().contract_list_pagination_respects_offset_and_limit();
     }
 
     #[test]

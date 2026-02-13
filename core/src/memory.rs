@@ -57,6 +57,7 @@ where
     history: Mutex<HashMap<String, Vec<HistoryEntry>>>,
     max_metadata_bytes: Option<usize>,
     max_content_length: Option<usize>,
+    max_top_k: Option<usize>,
 }
 
 impl<L, E, V> Memory<L, E, V>
@@ -74,7 +75,14 @@ where
             history: Mutex::new(HashMap::new()),
             max_metadata_bytes: None,
             max_content_length: None,
+            max_top_k: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_max_top_k(mut self, limit: usize) -> Self {
+        self.max_top_k = Some(limit);
+        self
     }
 
     #[must_use]
@@ -98,6 +106,13 @@ where
     ) -> Result<Vec<crate::vector_store::SearchResult>, crate::CoreError> {
         if top_k == 0 {
             return Err(crate::CoreError::Validation("top_k must be greater than zero".to_string()));
+        }
+        if let Some(max_top_k) = self.max_top_k {
+            if top_k > max_top_k {
+                return Err(crate::CoreError::Validation(format!(
+                    "top_k of {top_k} exceeds the configured ceiling of {max_top_k}"
+                )));
+            }
         }
         if !has_scope_id(scope) {
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
@@ -227,7 +242,7 @@ mod tests {
     use super::*;
     use crate::embedding::EmbeddingConfig;
     use crate::llm::{LlmConfig, Role};
-    use crate::test_support::{FakeEmbeddingProvider, FakeLlmProvider};
+    use crate::test_support::{FakeEmbeddingProvider, FakeLlmProvider, VecVectorStore};
     use crate::vector_store::{InMemoryVectorStore, VectorStoreConfig};
 
     fn scope() -> HashMap<String, String> {
@@ -1370,5 +1385,57 @@ mod tests {
 
         let result = memory.search("anything", 10, &scope());
         assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
+    }
+
+    #[test]
+    fn test_search_rejects_top_k_over_configured_ceiling() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store).with_max_top_k(50);
+
+        let result = memory.search("anything", 51, &scope());
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_search_accepts_top_k_at_configured_ceiling() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store).with_max_top_k(50);
+
+        let result = memory.search("anything", 50, &scope());
+        assert!(result.is_ok(), "top_k exactly at the configured ceiling should be accepted");
+    }
+
+    #[test]
+    fn test_search_with_no_configured_ceiling_accepts_any_top_k() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 1_000_000, &scope());
+        assert!(result.is_ok(), "with no configured ceiling, top_k should never be rejected for being too large");
+    }
+
+    #[test]
+    fn test_memory_works_unchanged_with_a_structurally_different_vector_store() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = VecVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        assert!(!ids.is_empty());
+
+        let results = memory.search("engineer", 10, &scope()).expect("search should succeed");
+        assert!(results.iter().any(|r| r.payload.get("content") == Some(&"Alice is an engineer.".to_string())));
+
+        let id = ids.first().expect("expected at least one id");
+        memory.update(id, Some("Alice is a senior engineer."), None).expect("update should succeed");
+        memory.delete(id).expect("delete should succeed");
+        assert_eq!(memory.vector_store.get(id).expect("get should succeed"), None);
     }
 }
