@@ -116,6 +116,25 @@ impl LlmProvider for FakeLlmProvider {
     }
 }
 
+pub struct EchoLlmProvider;
+
+impl EchoLlmProvider {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+impl LlmProvider for EchoLlmProvider {
+    fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+        if messages.is_empty() {
+            return Err(LlmError::EmptyMessages);
+        }
+        let content = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+        Ok(Completion::new(content))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeEmbeddingProvider {
     fail_with_backend: bool,

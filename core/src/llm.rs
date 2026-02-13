@@ -158,7 +158,7 @@ impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
 #[cfg(test)]
 mod tests {
     use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, Message, Role};
-    use crate::test_support::FakeLlmProvider;
+    use crate::test_support::{EchoLlmProvider, FakeLlmProvider};
 
     #[test]
     fn empty_messages_display_is_sensible() {
@@ -196,6 +196,16 @@ mod tests {
     #[test]
     fn fake_provider_passes_happy_path_contract() {
         FakeLlmProvider::new().contract_happy_path();
+    }
+
+    #[test]
+    fn echo_provider_passes_happy_path_contract() {
+        EchoLlmProvider::new().contract_happy_path();
+    }
+
+    #[test]
+    fn echo_provider_passes_rejects_empty_messages_contract() {
+        EchoLlmProvider::new().contract_rejects_empty_messages();
     }
 
     #[test]

@@ -175,6 +175,14 @@ where
         Ok(())
     }
 
+    #[allow(clippy::missing_errors_doc)]
+    pub fn health_check(&self) -> Result<(), crate::CoreError> {
+        self.llm.complete(&[Message::new(crate::llm::Role::User, "health check")])?;
+        self.embedding.embed("health check")?;
+        self.vector_store.list(0, 0)?;
+        Ok(())
+    }
+
     #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
     pub fn history(&self, id: &str, offset: usize, limit: usize) -> Result<Vec<HistoryEntry>, crate::CoreError> {
         let entries = self.history.lock().expect("lock poisoned").get(id).cloned().unwrap_or_default();
@@ -242,7 +250,7 @@ mod tests {
     use super::*;
     use crate::embedding::EmbeddingConfig;
     use crate::llm::{LlmConfig, Role};
-    use crate::test_support::{FakeEmbeddingProvider, FakeLlmProvider, VecVectorStore};
+    use crate::test_support::{EchoLlmProvider, FakeEmbeddingProvider, FakeLlmProvider, VecVectorStore};
     use crate::vector_store::{InMemoryVectorStore, VectorStoreConfig};
 
     fn scope() -> HashMap<String, String> {
@@ -1437,5 +1445,49 @@ mod tests {
         memory.update(id, Some("Alice is a senior engineer."), None).expect("update should succeed");
         memory.delete(id).expect("delete should succeed");
         assert_eq!(memory.vector_store.get(id).expect("get should succeed"), None);
+    }
+
+    #[test]
+    fn test_memory_works_unchanged_with_a_structurally_different_llm_provider() {
+        let llm = EchoLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        assert!(!ids.is_empty(), "EchoLlmProvider should still produce at least one fact (extract_facts wraps the conversation before echoing it)");
+
+        let results = memory.search("Alice", 10, &scope()).expect("search should succeed");
+        assert!(!results.is_empty(), "search should find something after adding via a different LLM provider");
+    }
+
+    #[test]
+    fn test_health_check_succeeds_with_healthy_providers() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        assert!(memory.health_check().is_ok());
+    }
+
+    #[test]
+    fn test_health_check_reports_llm_failure() {
+        let llm = FakeLlmProvider::failing();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        assert!(matches!(memory.health_check(), Err(crate::CoreError::Provider { .. })));
+    }
+
+    #[test]
+    fn test_health_check_reports_embedding_failure() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::failing();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        assert!(matches!(memory.health_check(), Err(crate::CoreError::Provider { .. })));
     }
 }
