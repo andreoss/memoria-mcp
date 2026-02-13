@@ -56,6 +56,7 @@ where
     vector_store: V,
     history: Mutex<HashMap<String, Vec<HistoryEntry>>>,
     max_metadata_bytes: Option<usize>,
+    max_content_length: Option<usize>,
 }
 
 impl<L, E, V> Memory<L, E, V>
@@ -72,7 +73,14 @@ where
             vector_store,
             history: Mutex::new(HashMap::new()),
             max_metadata_bytes: None,
+            max_content_length: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_max_content_length(mut self, limit: usize) -> Self {
+        self.max_content_length = Some(limit);
+        self
     }
 
     #[must_use]
@@ -178,6 +186,14 @@ where
         for message in messages {
             if message.content.is_empty() {
                 return Err(crate::CoreError::Validation("message content must not be empty".to_string()));
+            }
+            if let Some(max_len) = self.max_content_length {
+                if message.content.len() > max_len {
+                    return Err(crate::CoreError::Validation(format!(
+                        "message content of {} bytes exceeds the configured limit of {max_len} bytes",
+                        message.content.len()
+                    )));
+                }
             }
         }
         let facts = extract_facts(&self.llm, messages)?;
@@ -1270,5 +1286,89 @@ mod tests {
                 "deleting by a prefix of one id must not remove any record, including the one it's a prefix of"
             );
         }
+    }
+
+    #[test]
+    fn test_add_rejects_content_over_configured_length_limit() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store).with_max_content_length(10);
+
+        let messages = [Message::new(Role::User, "This message is way longer than ten characters.")];
+        let result = memory.add(&messages, scope());
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_add_accepts_content_within_configured_length_limit() {
+        let llm = FakeLlmProvider::with_facts("Short fact.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store).with_max_content_length(1000);
+
+        let messages = [Message::new(Role::User, "Short.")];
+        let result = memory.add(&messages, scope());
+        assert!(result.is_ok(), "content well under the configured limit should be accepted");
+    }
+
+    #[test]
+    fn test_add_with_no_configured_length_limit_accepts_any_length() {
+        let llm = FakeLlmProvider::with_facts("A fact.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let long_message = "x".repeat(10_000);
+        let messages = [Message::new(Role::User, long_message)];
+        let result = memory.add(&messages, scope());
+        assert!(result.is_ok(), "with no configured limit, message length should never be rejected");
+    }
+
+    #[test]
+    fn test_add_wraps_llm_backend_failure_as_provider_error() {
+        let llm = FakeLlmProvider::failing();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let result = memory.add(&messages, scope());
+        assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
+    }
+
+    #[test]
+    fn test_add_wraps_llm_timeout_as_provider_error() {
+        let llm = FakeLlmProvider::timing_out();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let result = memory.add(&messages, scope());
+        assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
+    }
+
+    #[test]
+    fn test_add_wraps_embedding_backend_failure_as_provider_error() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::failing();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let result = memory.add(&messages, scope());
+        assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
+    }
+
+    #[test]
+    fn test_search_wraps_embedding_timeout_as_provider_error() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::timing_out();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 10, &scope());
+        assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
     }
 }
