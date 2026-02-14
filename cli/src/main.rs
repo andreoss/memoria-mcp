@@ -10,9 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "memoria")]
+#[command(name = "memoria", about = "A local-first memory layer for AI agents")]
 struct Cli {
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Override the local store's file path")]
     store_path: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -20,47 +20,61 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Extract facts from a message and store them under a scope")]
     Add {
+        #[arg(help = "The message to extract facts from")]
         content: String,
-        #[arg(long)]
+        #[arg(long, help = "Scope this memory to a user")]
         user_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Scope this memory to an agent")]
         agent_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Scope this memory to a run")]
         run_id: Option<String>,
     },
+    #[command(about = "Search stored memories within a scope")]
     Search {
+        #[arg(help = "The search query")]
         query: String,
-        #[arg(long)]
+        #[arg(long, help = "Search within a user's scope")]
         user_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Search within an agent's scope")]
         agent_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Search within a run's scope")]
         run_id: Option<String>,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10, help = "Maximum number of results")]
         top_k: usize,
     },
+    #[command(about = "Fetch a single memory by id")]
     Get {
+        #[arg(help = "The memory's id")]
         id: String,
     },
+    #[command(about = "List stored memory ids")]
     List {
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, help = "Number of ids to skip")]
         offset: usize,
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 100, help = "Maximum number of ids to return")]
         limit: usize,
     },
+    #[command(about = "Update a memory's content and/or metadata")]
     Update {
+        #[arg(help = "The memory's id")]
         id: String,
-        #[arg(long)]
+        #[arg(long, help = "Replace the memory's content")]
         content: Option<String>,
-        #[arg(long = "set", value_parser = parse_key_value)]
+        #[arg(long = "set", value_parser = parse_key_value, help = "Set a metadata KEY=VALUE pair (repeatable)")]
         set: Vec<(String, String)>,
     },
+    #[command(about = "Delete a memory by id (idempotent)")]
     Delete {
+        #[arg(help = "The memory's id")]
         id: String,
     },
+    #[command(about = "Create the local store file if it doesn't exist yet")]
     Init,
+    #[command(about = "Show the active store path and providers")]
     Whoami,
+    #[command(about = "Check that every provider is reachable")]
     Status,
 }
 
