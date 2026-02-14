@@ -10,10 +10,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "memoria", about = "A local-first memory layer for AI agents")]
+#[command(name = "memoria", version = env!("CARGO_PKG_VERSION"), about = "A local-first memory layer for AI agents")]
 struct Cli {
     #[arg(long, global = true, help = "Override the local store's file path")]
     store_path: Option<String>,
+    #[arg(long, global = true, help = "Print output as JSON instead of plain text")]
+    json: bool,
+    #[arg(long, global = true, help = "Suppress normal output; errors still print to stderr")]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -156,8 +160,56 @@ fn build_scope(user_id: Option<String>, agent_id: Option<String>, run_id: Option
     scope
 }
 
+fn print_ids(ids: &[String], json: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if json {
+        println!("{}", serde_json::to_string(ids).unwrap_or_default());
+    } else {
+        for id in ids {
+            println!("{id}");
+        }
+    }
+}
+
+fn print_search_results(results: &[core::vector_store::SearchResult], json: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if json {
+        println!("{}", serde_json::to_string(results).unwrap_or_default());
+    } else {
+        for result in results {
+            let content = result.payload.get("content").map_or("", String::as_str);
+            println!("{}\t{}\t{content}", result.id, result.score);
+        }
+    }
+}
+
+fn print_record(record: &VectorRecord, json: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if json {
+        println!("{}", serde_json::to_string(record).unwrap_or_default());
+    } else {
+        let content = record.payload.get("content").map_or("", String::as_str);
+        println!("{}\t{content}", record.id);
+    }
+}
+
+#[derive(serde::Serialize)]
+struct WhoamiInfo {
+    store: String,
+    llm_provider: &'static str,
+    embedding_provider: &'static str,
+}
+
 fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
+    let quiet = cli.quiet;
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let env_override = std::env::var("MEMORIA_STORE_PATH").ok();
     let file_config = read_config_file(&config_file_path(&home));
@@ -165,15 +217,22 @@ fn main() {
     let store = load_store(&path);
     let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), store);
 
-    match cli.command {
+    run(cli.command, &memory, &path, json, quiet);
+}
+
+fn run<L, E, V>(command: Command, memory: &Memory<L, E, V>, path: &Path, json: bool, quiet: bool)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    match command {
         Command::Add { content, user_id, agent_id, run_id } => {
             let scope = build_scope(user_id, agent_id, run_id);
             match memory.add(&[Message::new(Role::User, content)], scope) {
                 Ok(ids) => {
-                    for id in &ids {
-                        println!("{id}");
-                    }
-                    save_store(&memory, &path);
+                    print_ids(&ids, json, quiet);
+                    save_store(memory, path);
                 }
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -184,12 +243,7 @@ fn main() {
         Command::Search { query, user_id, agent_id, run_id, top_k } => {
             let scope = build_scope(user_id, agent_id, run_id);
             match memory.search(&query, top_k, &scope) {
-                Ok(results) => {
-                    for result in results {
-                        let content = result.payload.get("content").map_or("", String::as_str);
-                        println!("{}\t{}\t{content}", result.id, result.score);
-                    }
-                }
+                Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");
                     std::process::exit(1);
@@ -197,10 +251,7 @@ fn main() {
             }
         }
         Command::Get { id } => match memory.get(&id) {
-            Ok(Some(record)) => {
-                let content = record.payload.get("content").map_or("", String::as_str);
-                println!("{}\t{content}", record.id);
-            }
+            Ok(Some(record)) => print_record(&record, json, quiet),
             Ok(None) => {
                 eprintln!("not found: {id}");
                 std::process::exit(1);
@@ -211,11 +262,7 @@ fn main() {
             }
         },
         Command::List { offset, limit } => match memory.list(offset, limit) {
-            Ok(ids) => {
-                for id in ids {
-                    println!("{id}");
-                }
-            }
+            Ok(ids) => print_ids(&ids, json, quiet),
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(1);
@@ -224,7 +271,7 @@ fn main() {
         Command::Update { id, content, set } => {
             let metadata = if set.is_empty() { None } else { Some(set.into_iter().collect::<HashMap<_, _>>()) };
             match memory.update(&id, content.as_deref(), metadata) {
-                Ok(()) => save_store(&memory, &path),
+                Ok(()) => save_store(memory, path),
                 Err(err) => {
                     eprintln!("error: {err}");
                     std::process::exit(1);
@@ -232,23 +279,40 @@ fn main() {
             }
         }
         Command::Delete { id } => match memory.delete(&id) {
-            Ok(()) => save_store(&memory, &path),
+            Ok(()) => save_store(memory, path),
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }
         },
         Command::Init => {
-            save_store(&memory, &path);
-            println!("initialized local store at {}", path.display());
+            save_store(memory, path);
+            if !quiet {
+                println!("initialized local store at {}", path.display());
+            }
         }
         Command::Whoami => {
-            println!("store: {}", path.display());
-            println!("llm provider: LocalSentenceLlmProvider (local, non-AI; see ADR-12)");
-            println!("embedding provider: LocalHashEmbeddingProvider (local, non-AI; see ADR-12)");
+            if !quiet {
+                let info = WhoamiInfo {
+                    store: path.display().to_string(),
+                    llm_provider: "LocalSentenceLlmProvider (local, non-AI; see ADR-12)",
+                    embedding_provider: "LocalHashEmbeddingProvider (local, non-AI; see ADR-12)",
+                };
+                if json {
+                    println!("{}", serde_json::to_string(&info).unwrap_or_default());
+                } else {
+                    println!("store: {}", info.store);
+                    println!("llm provider: {}", info.llm_provider);
+                    println!("embedding provider: {}", info.embedding_provider);
+                }
+            }
         }
         Command::Status => match memory.health_check() {
-            Ok(()) => println!("ok"),
+            Ok(()) => {
+                if !quiet {
+                    println!("ok");
+                }
+            }
             Err(err) => {
                 eprintln!("unhealthy: {err}");
                 std::process::exit(1);

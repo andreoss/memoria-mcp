@@ -9,7 +9,11 @@ static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(0);
 
 fn next_record_id() -> String {
     let n = NEXT_RECORD_ID.fetch_add(1, Ordering::Relaxed);
-    format!("rec-{n}")
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let pid = std::process::id();
+    format!("rec-{nanos}-{pid}-{n}")
 }
 
 fn has_scope_id(scope: &HashMap<String, String>) -> bool {
@@ -1550,5 +1554,16 @@ mod tests {
 
         let listed = memory.list(0, 0).expect("list should succeed");
         assert!(listed.is_empty(), "a zero limit should return nothing, not error");
+    }
+
+    #[test]
+    fn test_next_record_id_differs_across_a_counter_reset() {
+        let before = next_record_id();
+        NEXT_RECORD_ID.store(0, Ordering::Relaxed);
+        let after = next_record_id();
+        assert_ne!(
+            before, after,
+            "an id generated after the in-process counter resets to 0 (simulating a fresh process loading a persisted store) must not collide with one generated before the reset"
+        );
     }
 }
