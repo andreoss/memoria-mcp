@@ -47,6 +47,18 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    Update {
+        id: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long = "set", value_parser = parse_key_value)]
+        set: Vec<(String, String)>,
+    },
+    Delete {
+        id: String,
+    },
+    Init,
+    Whoami,
 }
 
 fn store_path() -> PathBuf {
@@ -83,6 +95,12 @@ where
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, data);
+}
+
+fn parse_key_value(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .ok_or_else(|| format!("expected KEY=VALUE, got {s:?}"))
 }
 
 fn build_scope(user_id: Option<String>, agent_id: Option<String>, run_id: Option<String>) -> HashMap<String, String> {
@@ -161,6 +179,32 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Command::Update { id, content, set } => {
+            let metadata = if set.is_empty() { None } else { Some(set.into_iter().collect::<HashMap<_, _>>()) };
+            match memory.update(&id, content.as_deref(), metadata) {
+                Ok(()) => save_store(&memory, &path),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Delete { id } => match memory.delete(&id) {
+            Ok(()) => save_store(&memory, &path),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Command::Init => {
+            save_store(&memory, &path);
+            println!("initialized local store at {}", path.display());
+        }
+        Command::Whoami => {
+            println!("store: {}", path.display());
+            println!("llm provider: LocalSentenceLlmProvider (local, non-AI; see ADR-12)");
+            println!("embedding provider: LocalHashEmbeddingProvider (local, non-AI; see ADR-12)");
+        }
     }
 }
 
@@ -210,5 +254,20 @@ mod tests {
         let loaded = load_store(&path);
         let ids = loaded.list(0, usize::MAX).expect("list should succeed");
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn parse_key_value_splits_on_first_equals() {
+        assert_eq!(parse_key_value("source=chat"), Ok(("source".to_string(), "chat".to_string())));
+    }
+
+    #[test]
+    fn parse_key_value_rejects_missing_equals() {
+        assert!(parse_key_value("no-equals-here").is_err());
+    }
+
+    #[test]
+    fn parse_key_value_keeps_everything_after_first_equals() {
+        assert_eq!(parse_key_value("url=http://x=y"), Ok(("url".to_string(), "http://x=y".to_string())));
     }
 }
