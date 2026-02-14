@@ -59,6 +59,7 @@ enum Command {
     },
     Init,
     Whoami,
+    Status,
 }
 
 fn store_path() -> PathBuf {
@@ -205,6 +206,13 @@ fn main() {
             println!("llm provider: LocalSentenceLlmProvider (local, non-AI; see ADR-12)");
             println!("embedding provider: LocalHashEmbeddingProvider (local, non-AI; see ADR-12)");
         }
+        Command::Status => match memory.health_check() {
+            Ok(()) => println!("ok"),
+            Err(err) => {
+                eprintln!("unhealthy: {err}");
+                std::process::exit(1);
+            }
+        },
     }
 }
 
