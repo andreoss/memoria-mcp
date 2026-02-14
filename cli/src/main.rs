@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(name = "memoria")]
 struct Cli {
+    #[arg(long, global = true)]
+    store_path: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -62,9 +64,31 @@ enum Command {
     Status,
 }
 
-fn store_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".memoria").join("store.json")
+#[derive(serde::Deserialize)]
+struct FileConfig {
+    store_path: Option<String>,
+}
+
+fn config_file_path(home: &str) -> PathBuf {
+    Path::new(home).join(".memoria").join("config.json")
+}
+
+fn read_config_file(path: &Path) -> Option<FileConfig> {
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn resolve_store_path(cli_override: Option<&str>, env_override: Option<&str>, file_config: Option<FileConfig>, home: &str) -> PathBuf {
+    if let Some(p) = cli_override {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = env_override {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = file_config.and_then(|c| c.store_path) {
+        return PathBuf::from(p);
+    }
+    Path::new(home).join(".memoria").join("store.json")
 }
 
 fn load_store(path: &Path) -> InMemoryVectorStore {
@@ -120,7 +144,10 @@ fn build_scope(user_id: Option<String>, agent_id: Option<String>, run_id: Option
 
 fn main() {
     let cli = Cli::parse();
-    let path = store_path();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let env_override = std::env::var("MEMORIA_STORE_PATH").ok();
+    let file_config = read_config_file(&config_file_path(&home));
+    let path = resolve_store_path(cli.store_path.as_deref(), env_override.as_deref(), file_config, &home);
     let store = load_store(&path);
     let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), store);
 
@@ -277,5 +304,55 @@ mod tests {
     #[test]
     fn parse_key_value_keeps_everything_after_first_equals() {
         assert_eq!(parse_key_value("url=http://x=y"), Ok(("url".to_string(), "http://x=y".to_string())));
+    }
+
+    #[test]
+    fn resolve_store_path_cli_flag_wins_over_everything() {
+        let path = resolve_store_path(Some("/from/cli"), Some("/from/env"), Some(FileConfig { store_path: Some("/from/config".to_string()) }), "/home");
+        assert_eq!(path, PathBuf::from("/from/cli"));
+    }
+
+    #[test]
+    fn resolve_store_path_env_wins_over_config_file() {
+        let path = resolve_store_path(None, Some("/from/env"), Some(FileConfig { store_path: Some("/from/config".to_string()) }), "/home");
+        assert_eq!(path, PathBuf::from("/from/env"));
+    }
+
+    #[test]
+    fn resolve_store_path_config_file_wins_over_default() {
+        let path = resolve_store_path(None, None, Some(FileConfig { store_path: Some("/from/config".to_string()) }), "/home");
+        assert_eq!(path, PathBuf::from("/from/config"));
+    }
+
+    #[test]
+    fn resolve_store_path_falls_back_to_default() {
+        let path = resolve_store_path(None, None, None, "/home");
+        assert_eq!(path, PathBuf::from("/home/.memoria/store.json"));
+    }
+
+    #[test]
+    fn resolve_store_path_falls_back_to_default_when_config_file_has_no_store_path() {
+        let path = resolve_store_path(None, None, Some(FileConfig { store_path: None }), "/home");
+        assert_eq!(path, PathBuf::from("/home/.memoria/store.json"));
+    }
+
+    #[test]
+    fn read_config_file_with_no_file_present_returns_none() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-test-noconfig-{}", std::process::id()));
+        let path = dir.join("config.json");
+        assert!(read_config_file(&path).is_none());
+    }
+
+    #[test]
+    fn read_config_file_reads_store_path_field() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-test-config-{}", std::process::id()));
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).expect("create_dir_all should succeed");
+        fs::write(&path, r#"{"store_path": "/custom/store.json"}"#).expect("write should succeed");
+
+        let config = read_config_file(&path).expect("config should be read");
+        assert_eq!(config.store_path, Some("/custom/store.json".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
