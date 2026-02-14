@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorRecord {
     pub id: String,
     pub vector: Vec<f32>,

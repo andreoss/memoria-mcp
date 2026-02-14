@@ -147,6 +147,16 @@ where
         Ok(())
     }
 
+    #[allow(clippy::missing_errors_doc)]
+    pub fn get(&self, id: &str) -> Result<Option<VectorRecord>, crate::CoreError> {
+        self.vector_store.get(id).map_err(From::from)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, crate::CoreError> {
+        self.vector_store.list(offset, limit).map_err(From::from)
+    }
+
     #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
     pub fn delete(&self, id: &str) -> Result<(), crate::CoreError> {
         let content = self.vector_store.get(id)?.and_then(|r| r.payload.get("content").cloned());
@@ -1489,5 +1499,56 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         assert!(matches!(memory.health_check(), Err(crate::CoreError::Provider { .. })));
+    }
+
+    #[test]
+    fn test_get_returns_the_record_after_add() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(&record.id, id);
+        assert_eq!(record.payload.get("content"), Some(&"Alice is an engineer.".to_string()));
+    }
+
+    #[test]
+    fn test_get_returns_none_for_unknown_id() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        assert_eq!(memory.get("never-added").expect("get should succeed"), None);
+    }
+
+    #[test]
+    fn test_list_returns_all_ids_after_add() {
+        let llm = FakeLlmProvider::with_facts("Fact one.\nFact two.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Two facts.")], scope()).expect("add should succeed");
+
+        let listed = memory.list(0, usize::MAX).expect("list should succeed");
+        for id in &ids {
+            assert!(listed.contains(id), "list should include every id add returned");
+        }
+    }
+
+    #[test]
+    fn test_list_respects_offset_and_limit() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let listed = memory.list(0, 0).expect("list should succeed");
+        assert!(listed.is_empty(), "a zero limit should return nothing, not error");
     }
 }

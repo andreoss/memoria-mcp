@@ -29,6 +29,45 @@ pub trait EmbeddingProvider {
     }
 }
 
+pub struct LocalHashEmbeddingProvider;
+
+impl LocalHashEmbeddingProvider {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for LocalHashEmbeddingProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmbeddingProvider for LocalHashEmbeddingProvider {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        const DIM: u8 = 8;
+        const MODULUS: u32 = 1_000_003;
+        if text.is_empty() {
+            return Err(EmbeddingError::EmptyInput);
+        }
+        let bytes = text.as_bytes();
+        let mut vector = Vec::with_capacity(usize::from(DIM));
+        for d in 0..DIM {
+            let mut acc = u32::from(d);
+            let mut idx: u8 = 0;
+            for &b in bytes {
+                let weight = u32::from(idx % DIM) + 1;
+                acc = acc.wrapping_mul(u32::from(b) + 1).wrapping_add(weight) % MODULUS;
+                idx = idx.wrapping_add(1);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            vector.push(acc as f32);
+        }
+        Ok(vector)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddingConfig {
     pub model: String,
@@ -119,7 +158,7 @@ impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddingConfig, EmbeddingContractTests, EmbeddingError};
+    use super::{EmbeddingConfig, EmbeddingContractTests, EmbeddingError, EmbeddingProvider, LocalHashEmbeddingProvider};
     use crate::test_support::FakeEmbeddingProvider;
 
     #[test]
@@ -148,6 +187,38 @@ mod tests {
     #[test]
     fn fake_provider_passes_error_contract() {
         FakeEmbeddingProvider::new().contract_rejects_empty_string();
+    }
+
+    #[test]
+    fn local_hash_provider_passes_happy_path_contract() {
+        LocalHashEmbeddingProvider::new().contract_happy_path();
+    }
+
+    #[test]
+    fn local_hash_provider_passes_error_contract() {
+        LocalHashEmbeddingProvider::new().contract_rejects_empty_string();
+    }
+
+    #[test]
+    fn local_hash_provider_passes_deterministic_contract() {
+        LocalHashEmbeddingProvider::new().contract_embed_is_deterministic();
+    }
+
+    #[test]
+    fn local_hash_provider_passes_batch_matches_individual_contract() {
+        LocalHashEmbeddingProvider::new().contract_embed_batch_matches_individual_calls();
+    }
+
+    #[test]
+    fn local_hash_provider_never_produces_non_finite_components() {
+        let provider = LocalHashEmbeddingProvider::new();
+        for text in ["Alice is an engineer.", "Bob lives in Berlin.", "a", &"x".repeat(500)] {
+            let vector = provider.embed(text).expect("embed should succeed");
+            assert!(
+                vector.iter().all(|component| component.is_finite()),
+                "embedding for {text:?} contained a non-finite component: {vector:?}"
+            );
+        }
     }
 
     #[test]

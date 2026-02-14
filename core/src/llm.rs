@@ -124,6 +124,46 @@ fn parse_facts(response: &str) -> Vec<String> {
         .collect()
 }
 
+pub struct LocalSentenceLlmProvider;
+
+impl LocalSentenceLlmProvider {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for LocalSentenceLlmProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LlmProvider for LocalSentenceLlmProvider {
+    fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+        if messages.is_empty() {
+            return Err(LlmError::EmptyMessages);
+        }
+        let conversation_text = messages.last().map_or("", |m| m.content.as_str());
+        let content_lines: Vec<&str> = conversation_text
+            .lines()
+            .filter_map(|line| line.split_once(": ").map(|(_, content)| content))
+            .collect();
+        let combined = if content_lines.is_empty() {
+            conversation_text.to_string()
+        } else {
+            content_lines.join(" ")
+        };
+        let sentences: Vec<String> = combined
+            .split(['.', '!', '?'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{s}."))
+            .collect();
+        Ok(Completion::new(sentences.join("\n")))
+    }
+}
+
 pub trait LlmContractTests: LlmProvider {
     fn contract_happy_path(&self) {
         let messages = [Message::new(Role::User, "hello")];
@@ -157,7 +197,7 @@ impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, Message, Role};
+    use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, LocalSentenceLlmProvider, Message, Role};
     use crate::test_support::{EchoLlmProvider, FakeLlmProvider};
 
     #[test]
@@ -357,5 +397,42 @@ mod tests {
             temperature: Some(-0.1),
         };
         assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[test]
+    fn local_sentence_provider_splits_conversation_into_one_fact_per_sentence() {
+        let provider = LocalSentenceLlmProvider::new();
+        let wrapped = [
+            Message::new(Role::System, "Extract discrete factual statements from the conversation."),
+            Message::new(Role::User, "Conversation:\nUser: Alice is an engineer. Bob lives in Berlin."),
+        ];
+        let completion = provider.complete(&wrapped).expect("expected a successful completion");
+        let facts: Vec<&str> = completion.content.lines().collect();
+        assert_eq!(facts, vec!["Alice is an engineer.", "Bob lives in Berlin."]);
+    }
+
+    #[test]
+    fn local_sentence_provider_rejects_empty_messages() {
+        let provider = LocalSentenceLlmProvider::new();
+        let result = provider.complete(&[]);
+        assert!(matches!(result, Err(LlmError::EmptyMessages)));
+    }
+
+    #[test]
+    fn local_sentence_provider_passes_happy_path_contract() {
+        LocalSentenceLlmProvider::new().contract_happy_path();
+    }
+
+    #[test]
+    fn local_sentence_provider_passes_rejects_empty_messages_contract() {
+        LocalSentenceLlmProvider::new().contract_rejects_empty_messages();
+    }
+
+    #[test]
+    fn local_sentence_provider_end_to_end_through_extract_facts() {
+        let provider = LocalSentenceLlmProvider::new();
+        let conversation = [Message::new(Role::User, "Alice is an engineer. Bob lives in Berlin.")];
+        let facts = extract_facts(&provider, &conversation).expect("expected facts");
+        assert_eq!(facts, vec!["Alice is an engineer.".to_string(), "Bob lives in Berlin.".to_string()]);
     }
 }

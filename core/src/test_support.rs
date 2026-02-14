@@ -169,29 +169,13 @@ impl FakeEmbeddingProvider {
 
 impl EmbeddingProvider for FakeEmbeddingProvider {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        const DIM: u8 = 8;
         if self.fail_with_backend {
             return Err(EmbeddingError::Backend("fake backend failure".to_string()));
         }
         if self.fail_with_timeout {
             return Err(EmbeddingError::Timeout);
         }
-        if text.is_empty() {
-            return Err(EmbeddingError::EmptyInput);
-        }
-        let bytes = text.as_bytes();
-        let mut vector = Vec::with_capacity(usize::from(DIM));
-        for d in 0..DIM {
-            let mut acc = f32::from(d);
-            let mut idx: u8 = 0;
-            for &b in bytes {
-                let weight = f32::from(idx % DIM) + 1.0;
-                acc = acc.mul_add(f32::from(b), weight);
-                idx = idx.wrapping_add(1);
-            }
-            vector.push(acc);
-        }
-        Ok(vector)
+        crate::embedding::LocalHashEmbeddingProvider::new().embed(text)
     }
 }
 
