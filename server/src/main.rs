@@ -173,18 +173,62 @@ where
     }
 }
 
+fn handle_delete_memory<L, E, V>(memory: &Memory<L, E, V>, id: &str) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    match memory.delete(id) {
+        Ok(()) => (200, Vec::new()),
+        Err(err) => error_response(&err),
+    }
+}
+
+fn parse_query(query: &str) -> HashMap<String, String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ListMemoryResponse {
+    ids: Vec<String>,
+}
+
+fn handle_list_memory<L, E, V>(memory: &Memory<L, E, V>, query: &str) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let params = parse_query(query);
+    let offset = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100);
+
+    match memory.list(offset, limit) {
+        Ok(ids) => (200, serde_json::to_vec(&ListMemoryResponse { ids }).unwrap_or_default()),
+        Err(err) => error_response(&err),
+    }
+}
+
 fn route<L, E, V>(memory: &Memory<L, E, V>, req: &ParsedRequest) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
+    let (path_only, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
     match (req.method.as_str(), segments.as_slice()) {
         ("POST", ["memories"]) => handle_create_memory(memory, &req.body),
         ("POST", ["memories", "search"]) => handle_search_memory(memory, &req.body),
+        ("GET", ["memories"]) => handle_list_memory(memory, query),
         ("GET", ["memories", id]) => handle_get_memory(memory, id),
         ("PUT", ["memories", id]) => handle_update_memory(memory, id, &req.body),
+        ("DELETE", ["memories", id]) => handle_delete_memory(memory, id),
         _ => (404, error_body("not found")),
     }
 }
@@ -415,6 +459,90 @@ mod tests {
         };
         let (status, _) = route(&memory, &req);
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn handle_delete_memory_is_idempotent() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected at least one id");
+
+        let (status, _) = handle_delete_memory(&memory, id);
+        assert_eq!(status, 200);
+        let (status_second, _) = handle_delete_memory(&memory, id);
+        assert_eq!(status_second, 200, "deleting an already-deleted id must still succeed");
+
+        let (get_status, _) = handle_get_memory(&memory, id);
+        assert_eq!(get_status, 404);
+    }
+
+    #[test]
+    fn handle_delete_memory_on_never_existing_id_still_succeeds() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, _) = handle_delete_memory(&memory, "never-existed");
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn parse_query_extracts_key_value_pairs() {
+        let params = parse_query("offset=5&limit=10");
+        assert_eq!(params.get("offset"), Some(&"5".to_string()));
+        assert_eq!(params.get("limit"), Some(&"10".to_string()));
+    }
+
+    #[test]
+    fn parse_query_with_empty_string_is_empty() {
+        assert!(parse_query("").is_empty());
+    }
+
+    #[test]
+    fn handle_list_memory_returns_ids_after_create() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+
+        let (status, body) = handle_list_memory(&memory, "");
+        assert_eq!(status, 200);
+        let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        for id in &created.ids {
+            assert!(response.ids.contains(id));
+        }
+    }
+
+    #[test]
+    fn handle_list_memory_respects_limit_query_param() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_list_memory(&memory, "limit=0");
+        assert_eq!(status, 200);
+        let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.ids.is_empty(), "limit=0 should return nothing, not error");
+    }
+
+    #[test]
+    fn route_dispatches_delete_memories_id() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected at least one id").clone();
+
+        let req = ParsedRequest { method: "DELETE".to_string(), path: format!("/memories/{id}"), body: Vec::new() };
+        let (status, _) = route(&memory, &req);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn route_dispatches_get_memories_with_query_string() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let req = ParsedRequest { method: "GET".to_string(), path: "/memories?offset=0&limit=10".to_string(), body: Vec::new() };
+        let (status, body) = route(&memory, &req);
+        assert_eq!(status, 200);
+        let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(!response.ids.is_empty());
     }
 
     #[test]
