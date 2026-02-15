@@ -53,7 +53,17 @@ struct ParsedRequest {
     body: Vec<u8>,
 }
 
-fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
+const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
+
+struct ParsedHeaders {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    header_len: usize,
+    content_length: usize,
+}
+
+fn parse_headers(buf: &[u8]) -> Option<ParsedHeaders> {
     let mut raw_headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut raw_headers);
     let httparse::Status::Complete(header_len) = req.parse(buf).ok()? else {
@@ -71,12 +81,25 @@ fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
-    let available = buf.len().saturating_sub(header_len);
-    if available < content_length {
+    Some(ParsedHeaders { method, path, headers, header_len, content_length })
+}
+
+fn check_body_size(content_length: usize) -> Option<(u16, Vec<u8>)> {
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        Some((413, error_body("request body too large")))
+    } else {
+        None
+    }
+}
+
+fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
+    let parsed = parse_headers(buf)?;
+    let available = buf.len().saturating_sub(parsed.header_len);
+    if available < parsed.content_length {
         return None;
     }
-    let body = buf[header_len..header_len + content_length].to_vec();
-    Some(ParsedRequest { method, path, headers, body })
+    let body = buf[parsed.header_len..parsed.header_len + parsed.content_length].to_vec();
+    Some(ParsedRequest { method: parsed.method, path: parsed.path, headers: parsed.headers, body })
 }
 
 #[derive(serde::Deserialize)]
@@ -307,23 +330,51 @@ where
 const fn reason_phrase(status: u16) -> &'static str {
     match status {
         201 => "Created",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "OK",
     }
 }
 
+fn resolve_cors_origin(env: Option<String>) -> Option<String> {
+    env.filter(|origin| !origin.is_empty())
+}
+
+fn cors_allow_origin_header(configured: Option<&str>, request_origin: Option<&str>) -> Option<(String, String)> {
+    let configured = configured?;
+    let request_origin = request_origin?;
+    if configured == request_origin {
+        Some(("Access-Control-Allow-Origin".to_string(), configured.to_string()))
+    } else {
+        None
+    }
+}
+
 fn build_response(status: u16, body: &[u8]) -> Vec<u8> {
+    build_response_with_headers(status, body, &[])
+}
+
+fn build_response_with_headers(status: u16, body: &[u8], extra_headers: &[(String, String)]) -> Vec<u8> {
     let mut response = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         reason_phrase(status),
         body.len()
-    )
-    .into_bytes();
+    );
+    for (name, value) in extra_headers {
+        let _ = std::fmt::Write::write_fmt(&mut response, format_args!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    let mut response = response.into_bytes();
     response.extend_from_slice(body);
     response
+}
+
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
 async fn handle_connection<L, E, V>(
@@ -331,6 +382,7 @@ async fn handle_connection<L, E, V>(
     memory: Arc<Memory<L, E, V>>,
     token: Arc<Option<String>>,
     rate_limiter: Arc<RateLimiter>,
+    cors_origin: Arc<Option<String>>,
     peer_ip: IpAddr,
 ) where
     L: core::llm::LlmProvider + Send + Sync + 'static,
@@ -347,7 +399,26 @@ async fn handle_connection<L, E, V>(
             return;
         }
         buf.extend_from_slice(&chunk[..n]);
+        if let Some(headers) = parse_headers(&buf) {
+            if let Some((status, body)) = check_body_size(headers.content_length) {
+                let response = build_response(status, &body);
+                let _ = stream.write_all(&response).await;
+                return;
+            }
+        }
         if let Some(req) = parse_request(&buf) {
+            let request_origin = find_header(&req.headers, "origin");
+            let cors_header = cors_allow_origin_header(cors_origin.as_deref(), request_origin);
+
+            if req.method == "OPTIONS" && request_origin.is_some() {
+                let mut headers: Vec<(String, String)> = cors_header.into_iter().collect();
+                headers.push(("Access-Control-Allow-Methods".to_string(), "GET, POST, PUT, DELETE".to_string()));
+                headers.push(("Access-Control-Allow-Headers".to_string(), "Content-Type, Authorization".to_string()));
+                let response = build_response_with_headers(204, b"", &headers);
+                let _ = stream.write_all(&response).await;
+                return;
+            }
+
             let (status, body) = if !rate_limiter.check_and_consume(peer_ip) {
                 (429, error_body("rate limit exceeded"))
             } else if is_authorized(token.as_deref(), &req.headers) {
@@ -355,15 +426,20 @@ async fn handle_connection<L, E, V>(
             } else {
                 (401, error_body("unauthorized"))
             };
-            let response = build_response(status, &body);
+            let response = build_response_with_headers(status, &body, &cors_header.into_iter().collect::<Vec<_>>());
             let _ = stream.write_all(&response).await;
             return;
         }
     }
 }
 
-async fn serve<L, E, V>(listener: TcpListener, memory: Arc<Memory<L, E, V>>, token: Arc<Option<String>>, rate_limiter: Arc<RateLimiter>)
-where
+async fn serve<L, E, V>(
+    listener: TcpListener,
+    memory: Arc<Memory<L, E, V>>,
+    token: Arc<Option<String>>,
+    rate_limiter: Arc<RateLimiter>,
+    cors_origin: Arc<Option<String>>,
+) where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
     V: core::vector_store::VectorStore + Send + Sync + 'static,
@@ -375,7 +451,8 @@ where
         let memory = Arc::clone(&memory);
         let token = Arc::clone(&token);
         let rate_limiter = Arc::clone(&rate_limiter);
-        tokio::spawn(handle_connection(stream, memory, token, rate_limiter, peer_addr.ip()));
+        let cors_origin = Arc::clone(&cors_origin);
+        tokio::spawn(handle_connection(stream, memory, token, rate_limiter, cors_origin, peer_addr.ip()));
     }
 }
 
@@ -389,6 +466,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let cors_origin = Arc::new(resolve_cors_origin(std::env::var("MEMORIA_CORS_ORIGIN").ok()));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
@@ -399,7 +477,7 @@ fn main() {
         ));
         let rate_limiter = Arc::new(RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC));
         let listener = TcpListener::bind("127.0.0.1:8080").await.expect("failed to bind to 127.0.0.1:8080");
-        serve(listener, memory, token, rate_limiter).await;
+        serve(listener, memory, token, rate_limiter, cors_origin).await;
     });
 }
 
@@ -448,6 +526,64 @@ mod tests {
         assert!(!limiter.check_and_consume(ip));
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(limiter.check_and_consume(ip));
+    }
+
+    #[test]
+    fn resolve_cors_origin_with_configured_origin_resolves_to_that_origin() {
+        assert_eq!(resolve_cors_origin(Some("https://example.com".to_string())), Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn resolve_cors_origin_with_unset_or_empty_resolves_to_none() {
+        assert_eq!(resolve_cors_origin(None), None);
+        assert_eq!(resolve_cors_origin(Some(String::new())), None);
+    }
+
+    #[test]
+    fn cors_allow_origin_header_matches_the_configured_origin() {
+        let header = cors_allow_origin_header(Some("https://example.com"), Some("https://example.com"));
+        assert_eq!(header, Some(("Access-Control-Allow-Origin".to_string(), "https://example.com".to_string())));
+    }
+
+    #[test]
+    fn cors_allow_origin_header_rejects_a_mismatched_origin() {
+        assert_eq!(cors_allow_origin_header(Some("https://example.com"), Some("https://evil.example")), None);
+    }
+
+    #[test]
+    fn cors_allow_origin_header_is_absent_when_cors_is_not_configured() {
+        assert_eq!(cors_allow_origin_header(None, Some("https://example.com")), None);
+    }
+
+    #[test]
+    fn build_response_with_headers_includes_the_extra_headers() {
+        let response = build_response_with_headers(200, b"{}", &[("Access-Control-Allow-Origin".to_string(), "https://example.com".to_string())]);
+        let text = String::from_utf8(response).expect("response should be valid utf8");
+        assert!(text.contains("Access-Control-Allow-Origin: https://example.com\r\n"), "got: {text}");
+    }
+
+    #[test]
+    fn parse_headers_extracts_content_length_before_the_body_arrives() {
+        let raw = b"POST /memories HTTP/1.1\r\nContent-Length: 999999\r\n\r\n";
+        let parsed = parse_headers(raw).expect("expected parsed headers");
+        assert_eq!(parsed.content_length, 999_999);
+    }
+
+    #[test]
+    fn parse_headers_returns_none_when_headers_incomplete() {
+        let raw = b"POST /memories HTTP/1.1\r\nContent-Le";
+        assert!(parse_headers(raw).is_none());
+    }
+
+    #[test]
+    fn check_body_size_allows_a_body_within_the_limit() {
+        assert!(check_body_size(1024).is_none());
+    }
+
+    #[test]
+    fn check_body_size_rejects_a_body_over_the_limit() {
+        let (status, _body) = check_body_size(MAX_REQUEST_BODY_BYTES + 1).expect("expected a rejection");
+        assert_eq!(status, 413);
     }
 
     #[test]
@@ -802,7 +938,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0))));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None)));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -829,7 +965,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0))));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None)));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -849,7 +985,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0))));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None)));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -872,7 +1008,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0))));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None)));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -898,7 +1034,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(2.0, 0.0))));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(2.0, 0.0)), Arc::new(None)));
 
             let mut last_response_text = String::new();
             for _ in 0..3 {
@@ -920,7 +1056,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1.0, 1000.0))));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1.0, 1000.0)), Arc::new(None)));
 
             let mut first_stream = TcpStream::connect(addr).await.expect("connect should succeed");
             first_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -937,6 +1073,97 @@ mod tests {
             second_stream.read_to_end(&mut second_response).await.expect("read should succeed");
             let second_text = String::from_utf8(second_response).expect("response should be valid utf8");
             assert!(second_text.starts_with("HTTP/1.1 404"), "got: {second_text}");
+        });
+    }
+
+    #[test]
+    fn server_rejects_an_oversized_body_without_waiting_for_all_of_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None)));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let declared_length = MAX_REQUEST_BODY_BYTES + 1;
+            let request = format!("POST /memories HTTP/1.1\r\nContent-Length: {declared_length}\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+            stream.write_all(b"only a few bytes, never the full declared body").await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.starts_with("HTTP/1.1 413"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_echoes_the_configured_origin_when_it_matches() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            let cors_origin = Arc::new(Some("https://example.com".to_string()));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.contains("Access-Control-Allow-Origin: https://example.com\r\n"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_omits_the_cors_header_for_a_mismatched_origin() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            let cors_origin = Arc::new(Some("https://example.com".to_string()));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n";
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(!response_text.contains("Access-Control-Allow-Origin"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_answers_an_options_preflight_request_directly() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            let cors_origin = Arc::new(Some("https://example.com".to_string()));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let request = "OPTIONS /memories HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.starts_with("HTTP/1.1 204"), "got: {response_text}");
+            assert!(response_text.contains("Access-Control-Allow-Methods: GET, POST, PUT, DELETE\r\n"), "got: {response_text}");
+            assert!(response_text.contains("Access-Control-Allow-Headers: Content-Type, Authorization\r\n"), "got: {response_text}");
         });
     }
 }
