@@ -5,9 +5,46 @@ use core::llm::{LocalSentenceLlmProvider, Message, Role};
 use core::memory::Memory;
 use core::vector_store::InMemoryVectorStore;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+const RATE_LIMIT_CAPACITY: f64 = 20.0;
+const RATE_LIMIT_REFILL_PER_SEC: f64 = 5.0;
+
+struct RateLimitBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+struct RateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    buckets: Mutex<HashMap<IpAddr, RateLimitBucket>>,
+}
+
+impl RateLimiter {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self { capacity, refill_per_sec, buckets: Mutex::new(HashMap::new()) }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn check_and_consume(&self, key: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().expect("rate limiter lock poisoned");
+        let bucket = buckets.entry(key).or_insert_with(|| RateLimitBucket { tokens: self.capacity, last_refill: now });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = elapsed.mul_add(self.refill_per_sec, bucket.tokens).min(self.capacity);
+        bucket.last_refill = now;
+        let allowed = bucket.tokens >= 1.0;
+        if allowed {
+            bucket.tokens -= 1.0;
+        }
+        allowed
+    }
+}
 
 struct ParsedRequest {
     method: String,
@@ -272,6 +309,7 @@ const fn reason_phrase(status: u16) -> &'static str {
         201 => "Created",
         400 => "Bad Request",
         404 => "Not Found",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -288,8 +326,13 @@ fn build_response(status: u16, body: &[u8]) -> Vec<u8> {
     response
 }
 
-async fn handle_connection<L, E, V>(mut stream: TcpStream, memory: Arc<Memory<L, E, V>>, token: Arc<Option<String>>)
-where
+async fn handle_connection<L, E, V>(
+    mut stream: TcpStream,
+    memory: Arc<Memory<L, E, V>>,
+    token: Arc<Option<String>>,
+    rate_limiter: Arc<RateLimiter>,
+    peer_ip: IpAddr,
+) where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
     V: core::vector_store::VectorStore + Send + Sync + 'static,
@@ -305,7 +348,9 @@ where
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(req) = parse_request(&buf) {
-            let (status, body) = if is_authorized(token.as_deref(), &req.headers) {
+            let (status, body) = if !rate_limiter.check_and_consume(peer_ip) {
+                (429, error_body("rate limit exceeded"))
+            } else if is_authorized(token.as_deref(), &req.headers) {
                 route(&memory, &req)
             } else {
                 (401, error_body("unauthorized"))
@@ -317,19 +362,20 @@ where
     }
 }
 
-async fn serve<L, E, V>(listener: TcpListener, memory: Arc<Memory<L, E, V>>, token: Arc<Option<String>>)
+async fn serve<L, E, V>(listener: TcpListener, memory: Arc<Memory<L, E, V>>, token: Arc<Option<String>>, rate_limiter: Arc<RateLimiter>)
 where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
     V: core::vector_store::VectorStore + Send + Sync + 'static,
 {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok((stream, peer_addr)) = listener.accept().await else {
             continue;
         };
         let memory = Arc::clone(&memory);
         let token = Arc::clone(&token);
-        tokio::spawn(handle_connection(stream, memory, token));
+        let rate_limiter = Arc::clone(&rate_limiter);
+        tokio::spawn(handle_connection(stream, memory, token, rate_limiter, peer_addr.ip()));
     }
 }
 
@@ -351,14 +397,58 @@ fn main() {
             LocalHashEmbeddingProvider::new(),
             InMemoryVectorStore::new(),
         ));
+        let rate_limiter = Arc::new(RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC));
         let listener = TcpListener::bind("127.0.0.1:8080").await.expect("failed to bind to 127.0.0.1:8080");
-        serve(listener, memory, token).await;
+        serve(listener, memory, token, rate_limiter).await;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_ip(last_octet: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, last_octet))
+    }
+
+    #[test]
+    fn rate_limiter_allows_requests_up_to_capacity() {
+        let limiter = RateLimiter::new(3.0, 0.0);
+        let ip = test_ip(1);
+        assert!(limiter.check_and_consume(ip));
+        assert!(limiter.check_and_consume(ip));
+        assert!(limiter.check_and_consume(ip));
+    }
+
+    #[test]
+    fn rate_limiter_rejects_the_request_after_capacity_is_exhausted() {
+        let limiter = RateLimiter::new(2.0, 0.0);
+        let ip = test_ip(2);
+        assert!(limiter.check_and_consume(ip));
+        assert!(limiter.check_and_consume(ip));
+        assert!(!limiter.check_and_consume(ip));
+    }
+
+    #[test]
+    fn rate_limiter_tracks_separate_ips_independently() {
+        let limiter = RateLimiter::new(1.0, 0.0);
+        let first = test_ip(3);
+        let second = test_ip(4);
+        assert!(limiter.check_and_consume(first));
+        assert!(!limiter.check_and_consume(first));
+        assert!(limiter.check_and_consume(second));
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time_for_sustained_traffic() {
+        let limiter = RateLimiter::new(1.0, 1000.0);
+        let ip = test_ip(5);
+        assert!(limiter.check_and_consume(ip));
+        assert!(!limiter.check_and_consume(ip));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(limiter.check_and_consume(ip));
+    }
 
     #[test]
     fn parse_request_extracts_method_path_and_body() {
@@ -712,7 +802,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None)));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0))));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -739,7 +829,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None)));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0))));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -759,7 +849,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string()))));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0))));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -782,7 +872,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string()))));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0))));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -798,6 +888,55 @@ mod tests {
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_returns_429_over_tcp_after_the_bucket_is_exhausted() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(2.0, 0.0))));
+
+            let mut last_response_text = String::new();
+            for _ in 0..3 {
+                let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+                stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.expect("read should succeed");
+                last_response_text = String::from_utf8(response).expect("response should be valid utf8");
+            }
+
+            assert!(last_response_text.starts_with("HTTP/1.1 429"), "got: {last_response_text}");
+        });
+    }
+
+    #[test]
+    fn server_allows_traffic_again_after_the_bucket_refills() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1.0, 1000.0))));
+
+            let mut first_stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            first_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
+            let mut first_response = Vec::new();
+            first_stream.read_to_end(&mut first_response).await.expect("read should succeed");
+            let first_text = String::from_utf8(first_response).expect("response should be valid utf8");
+            assert!(first_text.starts_with("HTTP/1.1 404"), "got: {first_text}");
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            let mut second_stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            second_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
+            let mut second_response = Vec::new();
+            second_stream.read_to_end(&mut second_response).await.expect("read should succeed");
+            let second_text = String::from_utf8(second_response).expect("response should be valid utf8");
+            assert!(second_text.starts_with("HTTP/1.1 404"), "got: {second_text}");
         });
     }
 }
