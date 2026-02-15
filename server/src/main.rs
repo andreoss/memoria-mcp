@@ -185,6 +185,14 @@ where
     }
 }
 
+fn resolve_auth_config(api_key_env: Option<String>, allow_no_auth_env: Option<String>) -> Result<Option<String>, String> {
+    match (api_key_env, allow_no_auth_env) {
+        (Some(key), _) if !key.is_empty() => Ok(Some(key)),
+        (_, Some(flag)) if flag == "1" => Ok(None),
+        _ => Err("refusing to start: no MEMORIA_API_KEY configured and MEMORIA_ALLOW_NO_AUTH=1 not set (ADR-14)".to_string()),
+    }
+}
+
 fn parse_query(query: &str) -> HashMap<String, String> {
     query
         .split('&')
@@ -295,6 +303,13 @@ where
 }
 
 fn main() {
+    let api_key_env = std::env::var("MEMORIA_API_KEY").ok();
+    let allow_no_auth_env = std::env::var("MEMORIA_ALLOW_NO_AUTH").ok();
+    if let Err(message) = resolve_auth_config(api_key_env, allow_no_auth_env) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
         let memory = Arc::new(Memory::new(
@@ -482,6 +497,12 @@ mod tests {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         let (status, _) = handle_delete_memory(&memory, "never-existed");
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn resolve_auth_config_with_configured_key_resolves_to_that_key() {
+        let result = resolve_auth_config(Some("secret-token".to_string()), None);
+        assert_eq!(result, Ok(Some("secret-token".to_string())));
     }
 
     #[test]
