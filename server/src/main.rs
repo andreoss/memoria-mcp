@@ -1087,9 +1087,9 @@ mod tests {
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let declared_length = MAX_REQUEST_BODY_BYTES + 1;
-            let request = format!("POST /memories HTTP/1.1\r\nContent-Length: {declared_length}\r\n\r\n");
-            stream.write_all(request.as_bytes()).await.expect("write should succeed");
-            stream.write_all(b"only a few bytes, never the full declared body").await.expect("write should succeed");
+            let mut request = format!("POST /memories HTTP/1.1\r\nContent-Length: {declared_length}\r\n\r\n").into_bytes();
+            request.extend_from_slice(b"only a few bytes, never the full declared body");
+            stream.write_all(&request).await.expect("write should succeed");
 
             let mut response = Vec::new();
             stream.read_to_end(&mut response).await.expect("read should succeed");
