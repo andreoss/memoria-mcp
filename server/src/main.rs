@@ -60,6 +60,28 @@ fn error_body(message: impl Into<String>) -> Vec<u8> {
     serde_json::to_vec(&ErrorResponse { error: message.into() }).unwrap_or_default()
 }
 
+fn scope_from_optional(user_id: Option<String>, agent_id: Option<String>, run_id: Option<String>) -> HashMap<String, String> {
+    let mut scope = HashMap::new();
+    if let Some(v) = user_id {
+        scope.insert("user_id".to_string(), v);
+    }
+    if let Some(v) = agent_id {
+        scope.insert("agent_id".to_string(), v);
+    }
+    if let Some(v) = run_id {
+        scope.insert("run_id".to_string(), v);
+    }
+    scope
+}
+
+fn error_response(err: &core::CoreError) -> (u16, Vec<u8>) {
+    match err {
+        core::CoreError::Validation(msg) => (400, error_body(msg.clone())),
+        core::CoreError::NotFound(msg) => (404, error_body(msg.clone())),
+        other => (500, error_body(other.to_string())),
+    }
+}
+
 fn handle_create_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
@@ -70,22 +92,84 @@ where
         Ok(request) => request,
         Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
     };
-
-    let mut scope = HashMap::new();
-    if let Some(v) = request.user_id {
-        scope.insert("user_id".to_string(), v);
-    }
-    if let Some(v) = request.agent_id {
-        scope.insert("agent_id".to_string(), v);
-    }
-    if let Some(v) = request.run_id {
-        scope.insert("run_id".to_string(), v);
-    }
+    let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
 
     match memory.add(&[Message::new(Role::User, request.content)], scope) {
         Ok(ids) => (201, serde_json::to_vec(&CreateMemoryResponse { ids }).unwrap_or_default()),
-        Err(core::CoreError::Validation(msg)) => (400, error_body(msg)),
-        Err(err) => (500, error_body(err.to_string())),
+        Err(err) => error_response(&err),
+    }
+}
+
+fn handle_get_memory<L, E, V>(memory: &Memory<L, E, V>, id: &str) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    match memory.get(id) {
+        Ok(Some(record)) => (200, serde_json::to_vec(&record).unwrap_or_default()),
+        Ok(None) => (404, error_body(format!("not found: {id}"))),
+        Err(err) => error_response(&err),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SearchMemoryRequest {
+    query: String,
+    user_id: Option<String>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    #[serde(default = "default_top_k")]
+    top_k: usize,
+}
+
+const fn default_top_k() -> usize {
+    10
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchMemoryResponse {
+    results: Vec<core::vector_store::SearchResult>,
+}
+
+fn handle_search_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let request: SearchMemoryRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+
+    match memory.search(&request.query, request.top_k, &scope) {
+        Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
+        Err(err) => error_response(&err),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateMemoryRequest {
+    content: Option<String>,
+    metadata: Option<HashMap<String, String>>,
+}
+
+fn handle_update_memory<L, E, V>(memory: &Memory<L, E, V>, id: &str, body: &[u8]) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let request: UpdateMemoryRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+
+    match memory.update(id, request.content.as_deref(), request.metadata) {
+        Ok(()) => (200, Vec::new()),
+        Err(err) => error_response(&err),
     }
 }
 
@@ -95,8 +179,12 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    match (req.method.as_str(), req.path.as_str()) {
-        ("POST", "/memories") => handle_create_memory(memory, &req.body),
+    let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
+    match (req.method.as_str(), segments.as_slice()) {
+        ("POST", ["memories"]) => handle_create_memory(memory, &req.body),
+        ("POST", ["memories", "search"]) => handle_search_memory(memory, &req.body),
+        ("GET", ["memories", id]) => handle_get_memory(memory, id),
+        ("PUT", ["memories", id]) => handle_update_memory(memory, id, &req.body),
         _ => (404, error_body("not found")),
     }
 }
@@ -225,6 +313,108 @@ mod tests {
         assert_eq!(status, 400);
         let response: ErrorResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
         assert!(response.error.contains("user_id"));
+    }
+
+    #[test]
+    fn handle_get_memory_returns_the_record_after_create() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected at least one id");
+
+        let (status, body) = handle_get_memory(&memory, id);
+        assert_eq!(status, 200);
+        let record: core::vector_store::VectorRecord = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(&record.id, id);
+    }
+
+    #[test]
+    fn handle_get_memory_returns_404_for_unknown_id() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, _) = handle_get_memory(&memory, "never-existed");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn handle_search_memory_happy_path_returns_200_with_results() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice"}"#);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(!response.results.is_empty());
+    }
+
+    #[test]
+    fn handle_search_memory_rejects_missing_scope() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, _) = handle_search_memory(&memory, br#"{"query":"anything"}"#);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_update_memory_happy_path_returns_200() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected at least one id");
+
+        let (status, _) = handle_update_memory(&memory, id, br#"{"content":"Alice is a senior engineer."}"#);
+        assert_eq!(status, 200);
+
+        let (_, get_body) = handle_get_memory(&memory, id);
+        let record: core::vector_store::VectorRecord = serde_json::from_slice(&get_body).expect("expected valid JSON");
+        assert_eq!(record.payload.get("content"), Some(&"Alice is a senior engineer.".to_string()));
+    }
+
+    #[test]
+    fn handle_update_memory_returns_404_for_unknown_id() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, _) = handle_update_memory(&memory, "never-existed", br#"{"content":"anything"}"#);
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn route_dispatches_get_memories_id() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected at least one id").clone();
+
+        let req = ParsedRequest { method: "GET".to_string(), path: format!("/memories/{id}"), body: Vec::new() };
+        let (status, _) = route(&memory, &req);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn route_dispatches_post_memories_search() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let req = ParsedRequest {
+            method: "POST".to_string(),
+            path: "/memories/search".to_string(),
+            body: br#"{"query":"engineer","user_id":"alice"}"#.to_vec(),
+        };
+        let (status, _) = route(&memory, &req);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn route_dispatches_put_memories_id() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected at least one id").clone();
+
+        let req = ParsedRequest {
+            method: "PUT".to_string(),
+            path: format!("/memories/{id}"),
+            body: br#"{"content":"updated"}"#.to_vec(),
+        };
+        let (status, _) = route(&memory, &req);
+        assert_eq!(status, 200);
     }
 
     #[test]
