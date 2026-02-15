@@ -12,30 +12,34 @@ use tokio::net::{TcpListener, TcpStream};
 struct ParsedRequest {
     method: String,
     path: String,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
 fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut req = httparse::Request::new(&mut headers);
+    let mut raw_headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut raw_headers);
     let httparse::Status::Complete(header_len) = req.parse(buf).ok()? else {
         return None;
     };
     let method = req.method?.to_string();
     let path = req.path?.to_string();
-    let content_length = req
+    let headers: Vec<(String, String)> = req
         .headers
         .iter()
-        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-        .and_then(|h| std::str::from_utf8(h.value).ok())
-        .and_then(|v| v.parse::<usize>().ok())
+        .filter_map(|h| std::str::from_utf8(h.value).ok().map(|v| (h.name.to_string(), v.to_string())))
+        .collect();
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
     let available = buf.len().saturating_sub(header_len);
     if available < content_length {
         return None;
     }
     let body = buf[header_len..header_len + content_length].to_vec();
-    Some(ParsedRequest { method, path, body })
+    Some(ParsedRequest { method, path, headers, body })
 }
 
 #[derive(serde::Deserialize)]
@@ -193,6 +197,28 @@ fn resolve_auth_config(api_key_env: Option<String>, allow_no_auth_env: Option<St
     }
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn is_authorized(configured_token: Option<&str>, headers: &[(String, String)]) -> bool {
+    let Some(expected) = configured_token else {
+        return true;
+    };
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, value)| value.strip_prefix("Bearer "))
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
 fn parse_query(query: &str) -> HashMap<String, String> {
     query
         .split('&')
@@ -262,7 +288,7 @@ fn build_response(status: u16, body: &[u8]) -> Vec<u8> {
     response
 }
 
-async fn handle_connection<L, E, V>(mut stream: TcpStream, memory: Arc<Memory<L, E, V>>)
+async fn handle_connection<L, E, V>(mut stream: TcpStream, memory: Arc<Memory<L, E, V>>, token: Arc<Option<String>>)
 where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
@@ -279,7 +305,11 @@ where
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(req) = parse_request(&buf) {
-            let (status, body) = route(&memory, &req);
+            let (status, body) = if is_authorized(token.as_deref(), &req.headers) {
+                route(&memory, &req)
+            } else {
+                (401, error_body("unauthorized"))
+            };
             let response = build_response(status, &body);
             let _ = stream.write_all(&response).await;
             return;
@@ -287,7 +317,7 @@ where
     }
 }
 
-async fn serve<L, E, V>(listener: TcpListener, memory: Arc<Memory<L, E, V>>)
+async fn serve<L, E, V>(listener: TcpListener, memory: Arc<Memory<L, E, V>>, token: Arc<Option<String>>)
 where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
@@ -298,17 +328,21 @@ where
             continue;
         };
         let memory = Arc::clone(&memory);
-        tokio::spawn(handle_connection(stream, memory));
+        let token = Arc::clone(&token);
+        tokio::spawn(handle_connection(stream, memory, token));
     }
 }
 
 fn main() {
     let api_key_env = std::env::var("MEMORIA_API_KEY").ok();
     let allow_no_auth_env = std::env::var("MEMORIA_ALLOW_NO_AUTH").ok();
-    if let Err(message) = resolve_auth_config(api_key_env, allow_no_auth_env) {
-        eprintln!("{message}");
-        std::process::exit(1);
-    }
+    let token = match resolve_auth_config(api_key_env, allow_no_auth_env) {
+        Ok(token) => Arc::new(token),
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
@@ -318,7 +352,7 @@ fn main() {
             InMemoryVectorStore::new(),
         ));
         let listener = TcpListener::bind("127.0.0.1:8080").await.expect("failed to bind to 127.0.0.1:8080");
-        serve(listener, memory).await;
+        serve(listener, memory, token).await;
     });
 }
 
@@ -441,7 +475,7 @@ mod tests {
         let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
         let id = created.ids.first().expect("expected at least one id").clone();
 
-        let req = ParsedRequest { method: "GET".to_string(), path: format!("/memories/{id}"), body: Vec::new() };
+        let req = ParsedRequest { method: "GET".to_string(), path: format!("/memories/{id}"), headers: Vec::new(), body: Vec::new() };
         let (status, _) = route(&memory, &req);
         assert_eq!(status, 200);
     }
@@ -454,6 +488,7 @@ mod tests {
         let req = ParsedRequest {
             method: "POST".to_string(),
             path: "/memories/search".to_string(),
+            headers: Vec::new(),
             body: br#"{"query":"engineer","user_id":"alice"}"#.to_vec(),
         };
         let (status, _) = route(&memory, &req);
@@ -470,6 +505,7 @@ mod tests {
         let req = ParsedRequest {
             method: "PUT".to_string(),
             path: format!("/memories/{id}"),
+            headers: Vec::new(),
             body: br#"{"content":"updated"}"#.to_vec(),
         };
         let (status, _) = route(&memory, &req);
@@ -503,6 +539,79 @@ mod tests {
     fn resolve_auth_config_with_configured_key_resolves_to_that_key() {
         let result = resolve_auth_config(Some("secret-token".to_string()), None);
         assert_eq!(result, Ok(Some("secret-token".to_string())));
+    }
+
+    #[test]
+    fn resolve_auth_config_with_explicit_override_resolves_to_no_auth() {
+        let result = resolve_auth_config(None, Some("1".to_string()));
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn resolve_auth_config_with_nothing_set_fails_closed() {
+        let result = resolve_auth_config(None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_auth_config_with_empty_key_and_no_override_fails_closed() {
+        let result = resolve_auth_config(Some(String::new()), None);
+        assert!(result.is_err(), "an empty MEMORIA_API_KEY must not be treated as configured");
+    }
+
+    #[test]
+    fn resolve_auth_config_rejects_a_non_one_override_value() {
+        let result = resolve_auth_config(None, Some("true".to_string()));
+        assert!(result.is_err(), "MEMORIA_ALLOW_NO_AUTH must be exactly \"1\", not any truthy-looking string");
+    }
+
+    #[test]
+    fn resolve_auth_config_prefers_a_real_key_over_the_override_if_both_are_set() {
+        let result = resolve_auth_config(Some("secret".to_string()), Some("1".to_string()));
+        assert_eq!(result, Ok(Some("secret".to_string())));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_identical_bytes() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_bytes() {
+        assert!(!constant_time_eq(b"secret", b"wrong-token"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a-much-longer-value"));
+    }
+
+    #[test]
+    fn is_authorized_with_no_configured_token_allows_anything() {
+        assert!(is_authorized(None, &[]));
+    }
+
+    #[test]
+    fn is_authorized_with_correct_bearer_token_succeeds() {
+        let headers = vec![("Authorization".to_string(), "Bearer secret".to_string())];
+        assert!(is_authorized(Some("secret"), &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_wrong_bearer_token_fails() {
+        let headers = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
+        assert!(!is_authorized(Some("secret"), &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_missing_header_fails() {
+        assert!(!is_authorized(Some("secret"), &[]));
+    }
+
+    #[test]
+    fn is_authorized_with_header_missing_bearer_prefix_fails() {
+        let headers = vec![("Authorization".to_string(), "secret".to_string())];
+        assert!(!is_authorized(Some("secret"), &headers));
     }
 
     #[test]
@@ -549,7 +658,7 @@ mod tests {
         let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
         let id = created.ids.first().expect("expected at least one id").clone();
 
-        let req = ParsedRequest { method: "DELETE".to_string(), path: format!("/memories/{id}"), body: Vec::new() };
+        let req = ParsedRequest { method: "DELETE".to_string(), path: format!("/memories/{id}"), headers: Vec::new(), body: Vec::new() };
         let (status, _) = route(&memory, &req);
         assert_eq!(status, 200);
     }
@@ -559,7 +668,7 @@ mod tests {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
 
-        let req = ParsedRequest { method: "GET".to_string(), path: "/memories?offset=0&limit=10".to_string(), body: Vec::new() };
+        let req = ParsedRequest { method: "GET".to_string(), path: "/memories?offset=0&limit=10".to_string(), headers: Vec::new(), body: Vec::new() };
         let (status, body) = route(&memory, &req);
         assert_eq!(status, 200);
         let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
@@ -572,6 +681,7 @@ mod tests {
         let req = ParsedRequest {
             method: "POST".to_string(),
             path: "/memories".to_string(),
+            headers: Vec::new(),
             body: br#"{"content":"Alice is an engineer.","user_id":"alice"}"#.to_vec(),
         };
         let (status, _) = route(&memory, &req);
@@ -581,7 +691,7 @@ mod tests {
     #[test]
     fn route_returns_404_for_unknown_path() {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let req = ParsedRequest { method: "GET".to_string(), path: "/nonexistent".to_string(), body: Vec::new() };
+        let req = ParsedRequest { method: "GET".to_string(), path: "/nonexistent".to_string(), headers: Vec::new(), body: Vec::new() };
         let (status, _) = route(&memory, &req);
         assert_eq!(status, 404);
     }
@@ -602,7 +712,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory));
+            tokio::spawn(serve(listener, memory, Arc::new(None)));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -629,7 +739,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory));
+            tokio::spawn(serve(listener, memory, Arc::new(None)));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -639,6 +749,55 @@ mod tests {
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_rejects_a_request_with_no_token_when_auth_is_configured() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string()))));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
+            let request = format!("POST /memories HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+            stream.write_all(body).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.starts_with("HTTP/1.1 401"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_accepts_a_request_with_the_correct_token_when_auth_is_configured() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string()))));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
+            let request = format!(
+                "POST /memories HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+            stream.write_all(body).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
         });
     }
 }
