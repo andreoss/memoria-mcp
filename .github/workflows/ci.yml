@@ -20,6 +20,9 @@ jobs:
       - name: Run Docs Check
         run: bash scripts/check-docs.sh "${GITHUB_BASE_REF:-origin/master}" "${GITHUB_HEAD_REF:-HEAD}"
 
+      - name: Run Changelog Check
+        run: bash scripts/check-changelog.sh "${GITHUB_BASE_REF:-origin/master}" "${GITHUB_HEAD_REF:-HEAD}"
+
   build-clippy-test:
     name: Build, Clippy, and Test (Workspace)
     runs-on: ubuntu-latest
