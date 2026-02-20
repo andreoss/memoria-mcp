@@ -195,6 +195,88 @@ pub trait LlmContractTests: LlmProvider {
 
 impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
 
+#[cfg(feature = "ollama")]
+pub struct OllamaLlmProvider {
+    client: reqwest::blocking::Client,
+    base_url: String,
+    model: String,
+}
+
+#[cfg(feature = "ollama")]
+impl OllamaLlmProvider {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn from_config(config: LlmConfig) -> Result<Self, crate::CoreError> {
+        config.validate()?;
+        Ok(Self {
+            client: reqwest::blocking::Client::new(),
+            base_url: config.base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            model: config.model,
+        })
+    }
+}
+
+#[cfg(feature = "ollama")]
+const fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+#[cfg(feature = "ollama")]
+fn build_chat_request(model: &str, messages: &[Message]) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": messages.iter().map(|m| serde_json::json!({
+            "role": role_str(m.role),
+            "content": m.content,
+        })).collect::<Vec<_>>(),
+        "stream": false,
+    })
+}
+
+#[cfg(feature = "ollama")]
+fn parse_chat_response(json: &serde_json::Value) -> Result<Completion, LlmError> {
+    json.get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(Completion::new)
+        .ok_or_else(|| LlmError::Malformed("missing message.content field".to_string()))
+}
+
+#[cfg(feature = "ollama")]
+impl LlmProvider for OllamaLlmProvider {
+    fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+        if messages.is_empty() {
+            return Err(LlmError::EmptyMessages);
+        }
+        let request = build_chat_request(&self.model, messages);
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&request)
+            .send()
+            .map_err(|err| {
+                if err.is_timeout() {
+                    LlmError::Timeout
+                } else {
+                    LlmError::Backend(err.to_string())
+                }
+            })?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(LlmError::AuthFailure);
+        }
+        if !response.status().is_success() {
+            return Err(LlmError::Backend(format!("HTTP {}", response.status())));
+        }
+
+        let json: serde_json::Value = response.json().map_err(|err| LlmError::Malformed(err.to_string()))?;
+        parse_chat_response(&json)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, LocalSentenceLlmProvider, Message, Role};
@@ -434,5 +516,80 @@ mod tests {
         let conversation = [Message::new(Role::User, "Alice is an engineer. Bob lives in Berlin.")];
         let facts = extract_facts(&provider, &conversation).expect("expected facts");
         assert_eq!(facts, vec!["Alice is an engineer.".to_string(), "Bob lives in Berlin.".to_string()]);
+    }
+
+    #[cfg(feature = "ollama")]
+    mod ollama_tests {
+        use super::super::{build_chat_request, parse_chat_response, OllamaLlmProvider};
+        use super::*;
+
+        #[test]
+        fn build_chat_request_has_the_expected_shape() {
+            let messages = [Message::new(Role::System, "be terse"), Message::new(Role::User, "hello")];
+            let request = build_chat_request("qwen2.5:0.5b", &messages);
+            assert_eq!(request["model"], "qwen2.5:0.5b");
+            assert_eq!(request["stream"], false);
+            assert_eq!(request["messages"][0]["role"], "system");
+            assert_eq!(request["messages"][0]["content"], "be terse");
+            assert_eq!(request["messages"][1]["role"], "user");
+            assert_eq!(request["messages"][1]["content"], "hello");
+        }
+
+        #[test]
+        fn parse_chat_response_extracts_message_content() {
+            let json = serde_json::json!({"message": {"role": "assistant", "content": "hi there"}});
+            let completion = parse_chat_response(&json).expect("expected a completion");
+            assert_eq!(completion.content, "hi there");
+        }
+
+        #[test]
+        fn parse_chat_response_rejects_a_missing_content_field() {
+            let json = serde_json::json!({"message": {"role": "assistant"}});
+            assert!(matches!(parse_chat_response(&json), Err(LlmError::Malformed(_))));
+        }
+
+        #[test]
+        fn from_config_rejects_an_invalid_config_before_building_the_client() {
+            let config = LlmConfig { model: String::new(), base_url: None, api_key: None, temperature: None };
+            assert!(matches!(OllamaLlmProvider::from_config(config), Err(crate::CoreError::Config(_))));
+        }
+
+        #[test]
+        fn contract_rejects_backend_error_against_an_unreachable_host() {
+            let config = LlmConfig {
+                model: "qwen2.5:0.5b".to_string(),
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                api_key: None,
+                temperature: None,
+            };
+            let provider = OllamaLlmProvider::from_config(config).expect("valid config should construct");
+            provider.contract_rejects_backend_error();
+        }
+
+        #[test]
+        fn rejects_empty_messages_without_a_network_call() {
+            let config = LlmConfig {
+                model: "qwen2.5:0.5b".to_string(),
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                api_key: None,
+                temperature: None,
+            };
+            let provider = OllamaLlmProvider::from_config(config).expect("valid config should construct");
+            assert!(matches!(provider.complete(&[]), Err(LlmError::EmptyMessages)));
+        }
+
+        #[test]
+        #[ignore = "requires a real Ollama instance reachable at MEMORIA_TEST_OLLAMA_URL"]
+        fn real_ollama_extracts_a_sensible_completion() {
+            let base_url = std::env::var("MEMORIA_TEST_OLLAMA_URL").unwrap_or_else(|_| "http://192.0.2.1:11434".to_string());
+            let config = LlmConfig {
+                model: "qwen2.5:0.5b".to_string(),
+                base_url: Some(base_url),
+                api_key: None,
+                temperature: None,
+            };
+            let provider = OllamaLlmProvider::from_config(config).expect("valid config should construct");
+            provider.contract_happy_path();
+        }
     }
 }

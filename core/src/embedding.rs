@@ -156,6 +156,69 @@ pub trait EmbeddingContractTests: EmbeddingProvider {
 
 impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
 
+#[cfg(feature = "ollama")]
+pub struct OllamaEmbeddingProvider {
+    client: reqwest::blocking::Client,
+    base_url: String,
+    model: String,
+}
+
+#[cfg(feature = "ollama")]
+impl OllamaEmbeddingProvider {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn from_config(config: EmbeddingConfig) -> Result<Self, crate::CoreError> {
+        config.validate()?;
+        Ok(Self {
+            client: reqwest::blocking::Client::new(),
+            base_url: config.base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            model: config.model,
+        })
+    }
+}
+
+#[cfg(feature = "ollama")]
+fn build_embeddings_request(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({"model": model, "prompt": prompt})
+}
+
+#[cfg(feature = "ollama")]
+#[allow(clippy::cast_possible_truncation)]
+fn parse_embeddings_response(json: &serde_json::Value) -> Result<Vec<f32>, EmbeddingError> {
+    json.get("embedding")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| values.iter().filter_map(serde_json::Value::as_f64).map(|v| v as f32).collect())
+        .ok_or_else(|| EmbeddingError::Backend("missing embedding field in response".to_string()))
+}
+
+#[cfg(feature = "ollama")]
+impl EmbeddingProvider for OllamaEmbeddingProvider {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if text.is_empty() {
+            return Err(EmbeddingError::EmptyInput);
+        }
+        let request = build_embeddings_request(&self.model, text);
+        let response = self
+            .client
+            .post(format!("{}/api/embeddings", self.base_url))
+            .json(&request)
+            .send()
+            .map_err(|err| {
+                if err.is_timeout() {
+                    EmbeddingError::Timeout
+                } else {
+                    EmbeddingError::Backend(err.to_string())
+                }
+            })?;
+
+        if !response.status().is_success() {
+            return Err(EmbeddingError::Backend(format!("HTTP {}", response.status())));
+        }
+
+        let json: serde_json::Value = response.json().map_err(|err| EmbeddingError::Backend(err.to_string()))?;
+        parse_embeddings_response(&json)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EmbeddingConfig, EmbeddingContractTests, EmbeddingError, EmbeddingProvider, LocalHashEmbeddingProvider};
@@ -299,5 +362,90 @@ mod tests {
             dimensions: Some(0),
         };
         assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[cfg(feature = "ollama")]
+    mod ollama_tests {
+        use super::super::{build_embeddings_request, parse_embeddings_response, OllamaEmbeddingProvider};
+        use super::*;
+
+        #[test]
+        fn build_embeddings_request_has_the_expected_shape() {
+            let request = build_embeddings_request("nomic-embed-text", "hello world");
+            assert_eq!(request["model"], "nomic-embed-text");
+            assert_eq!(request["prompt"], "hello world");
+        }
+
+        #[test]
+        fn parse_embeddings_response_extracts_the_vector() {
+            let json = serde_json::json!({"embedding": [0.1, 0.2, 0.3]});
+            let vector = parse_embeddings_response(&json).expect("expected a vector");
+            assert_eq!(vector.len(), 3);
+        }
+
+        #[test]
+        fn parse_embeddings_response_rejects_a_missing_embedding_field() {
+            let json = serde_json::json!({"not_embedding": []});
+            assert!(matches!(parse_embeddings_response(&json), Err(EmbeddingError::Backend(_))));
+        }
+
+        #[test]
+        fn from_config_rejects_an_invalid_config_before_building_the_client() {
+            let config = EmbeddingConfig { model: String::new(), base_url: None, api_key: None, dimensions: None };
+            assert!(matches!(OllamaEmbeddingProvider::from_config(config), Err(crate::CoreError::Config(_))));
+        }
+
+        #[test]
+        fn contract_rejects_backend_error_against_an_unreachable_host() {
+            let config = EmbeddingConfig {
+                model: "nomic-embed-text".to_string(),
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                api_key: None,
+                dimensions: None,
+            };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("valid config should construct");
+            provider.contract_rejects_backend_error();
+        }
+
+        #[test]
+        fn rejects_empty_input_without_a_network_call() {
+            let config = EmbeddingConfig {
+                model: "nomic-embed-text".to_string(),
+                base_url: Some("http://127.0.0.1:1".to_string()),
+                api_key: None,
+                dimensions: None,
+            };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("valid config should construct");
+            assert!(matches!(provider.embed(""), Err(EmbeddingError::EmptyInput)));
+        }
+
+        #[test]
+        #[ignore = "requires a real Ollama instance reachable at MEMORIA_TEST_OLLAMA_URL"]
+        fn real_ollama_produces_a_real_semantic_embedding() {
+            let base_url = std::env::var("MEMORIA_TEST_OLLAMA_URL").unwrap_or_else(|_| "http://192.0.2.1:11434".to_string());
+            let config = EmbeddingConfig {
+                model: "nomic-embed-text".to_string(),
+                base_url: Some(base_url),
+                api_key: None,
+                dimensions: None,
+            };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("valid config should construct");
+            provider.contract_happy_path();
+
+            let related_a = provider.embed("Alice works as a nurse at the downtown hospital.").expect("embed should succeed");
+            let related_b = provider.embed("Alice recently started a new nursing position at the hospital.").expect("embed should succeed");
+            let unrelated = provider.embed("The weather in Paris was cold and rainy yesterday.").expect("embed should succeed");
+
+            let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+            let norm = |a: &[f32]| -> f32 { a.iter().map(|x| x * x).sum::<f32>().sqrt() };
+            let cosine = |a: &[f32], b: &[f32]| dot(a, b) / (norm(a) * norm(b));
+
+            let related_similarity = cosine(&related_a, &related_b);
+            let unrelated_similarity = cosine(&related_a, &unrelated);
+            assert!(
+                related_similarity > unrelated_similarity,
+                "related sentences ({related_similarity}) should be more similar than unrelated ones ({unrelated_similarity})"
+            );
+        }
     }
 }
