@@ -4,6 +4,13 @@ set -uo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Refusing to run: working tree is not clean. This script makes temporary" >&2
+  echo "commits and hard-resets them away, which would discard your uncommitted" >&2
+  echo "changes as collateral damage. Commit or stash first." >&2
+  exit 1
+fi
+
 base_branch="$(git rev-parse --abbrev-ref HEAD)"
 scratch="verify-changelog-check-scratch"
 
