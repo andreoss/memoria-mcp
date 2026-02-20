@@ -237,6 +237,10 @@ where
     }
 }
 
+fn handle_health() -> (u16, Vec<u8>) {
+    (200, br#"{"status":"ok"}"#.to_vec())
+}
+
 fn handle_delete_memory<L, E, V>(memory: &Memory<L, E, V>, id: &str) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
@@ -421,6 +425,8 @@ async fn handle_connection<L, E, V>(
 
             let (status, body) = if !rate_limiter.check_and_consume(peer_ip) {
                 (429, error_body("rate limit exceeded"))
+            } else if req.method == "GET" && req.path == "/health" {
+                handle_health()
             } else if is_authorized(token.as_deref(), &req.headers) {
                 route(&memory, &req)
             } else {
@@ -526,6 +532,13 @@ mod tests {
         assert!(!limiter.check_and_consume(ip));
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(limiter.check_and_consume(ip));
+    }
+
+    #[test]
+    fn handle_health_returns_200_with_ok_status() {
+        let (status, body) = handle_health();
+        assert_eq!(status, 200);
+        assert_eq!(body, br#"{"status":"ok"}"#);
     }
 
     #[test]
@@ -1164,6 +1177,33 @@ mod tests {
             assert!(response_text.starts_with("HTTP/1.1 204"), "got: {response_text}");
             assert!(response_text.contains("Access-Control-Allow-Methods: GET, POST, PUT, DELETE\r\n"), "got: {response_text}");
             assert!(response_text.contains("Access-Control-Allow-Headers: Content-Type, Authorization\r\n"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_answers_health_without_a_token_even_when_auth_is_configured() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(
+                listener,
+                memory,
+                Arc::new(Some("secret".to_string())),
+                Arc::new(RateLimiter::new(1000.0, 1000.0)),
+                Arc::new(None),
+            ));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            stream.write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response_text}");
+            assert!(response_text.ends_with(r#"{"status":"ok"}"#), "got: {response_text}");
         });
     }
 }

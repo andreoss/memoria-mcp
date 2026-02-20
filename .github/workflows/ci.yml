@@ -41,3 +41,36 @@ jobs:
 
       - name: Cargo Test (Workspace)
         run: cargo test --workspace
+
+  smoke-test-server:
+    name: Server Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build Server (Release)
+        run: cargo build --release -p server
+
+      - name: Start Server
+        run: |
+          MEMORIA_API_KEY=ci-smoke-test-key ./target/release/server &
+          echo $! > server.pid
+          for _ in $(seq 1 20); do
+            curl -s -o /dev/null http://127.0.0.1:8080/health && break
+            sleep 0.5
+          done
+
+      - name: Run Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_API_KEY: ci-smoke-test-key
+        run: bash scripts/smoke-test-server.sh
+
+      - name: Stop Server
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
