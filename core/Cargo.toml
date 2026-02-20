@@ -1,8 +1,9 @@
 [package]
-name = "core"
+name = "memoria-core"
 version = "0.1.0"
 edition = "2021"
-publish = false
+publish = true
+description = "Self-hosted memory engine for AI agents: providers, vector storage, and the core Memory API."
 
 [lints]
 workspace = true
