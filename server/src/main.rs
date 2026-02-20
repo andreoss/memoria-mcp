@@ -237,8 +237,24 @@ where
     }
 }
 
+fn format_log_line(method: &str, path: &str, status: u16) -> String {
+    format!("{method} {path} {status}")
+}
+
 fn handle_health() -> (u16, Vec<u8>) {
     (200, br#"{"status":"ok"}"#.to_vec())
+}
+
+fn handle_ready<L, E, V>(memory: &Memory<L, E, V>) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    match memory.health_check() {
+        Ok(()) => (200, br#"{"status":"ready"}"#.to_vec()),
+        Err(err) => (503, error_body(format!("not ready: {err}"))),
+    }
 }
 
 fn handle_delete_memory<L, E, V>(memory: &Memory<L, E, V>, id: &str) -> (u16, Vec<u8>)
@@ -340,6 +356,7 @@ const fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -405,6 +422,7 @@ async fn handle_connection<L, E, V>(
         buf.extend_from_slice(&chunk[..n]);
         if let Some(headers) = parse_headers(&buf) {
             if let Some((status, body)) = check_body_size(headers.content_length) {
+                eprintln!("{}", format_log_line(&headers.method, &headers.path, status));
                 let response = build_response(status, &body);
                 let _ = stream.write_all(&response).await;
                 return;
@@ -418,6 +436,7 @@ async fn handle_connection<L, E, V>(
                 let mut headers: Vec<(String, String)> = cors_header.into_iter().collect();
                 headers.push(("Access-Control-Allow-Methods".to_string(), "GET, POST, PUT, DELETE".to_string()));
                 headers.push(("Access-Control-Allow-Headers".to_string(), "Content-Type, Authorization".to_string()));
+                eprintln!("{}", format_log_line(&req.method, &req.path, 204));
                 let response = build_response_with_headers(204, b"", &headers);
                 let _ = stream.write_all(&response).await;
                 return;
@@ -427,11 +446,14 @@ async fn handle_connection<L, E, V>(
                 (429, error_body("rate limit exceeded"))
             } else if req.method == "GET" && req.path == "/health" {
                 handle_health()
+            } else if req.method == "GET" && req.path == "/ready" {
+                handle_ready(&memory)
             } else if is_authorized(token.as_deref(), &req.headers) {
                 route(&memory, &req)
             } else {
                 (401, error_body("unauthorized"))
             };
+            eprintln!("{}", format_log_line(&req.method, &req.path, status));
             let response = build_response_with_headers(status, &body, &cors_header.into_iter().collect::<Vec<_>>());
             let _ = stream.write_all(&response).await;
             return;
@@ -532,6 +554,64 @@ mod tests {
         assert!(!limiter.check_and_consume(ip));
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(limiter.check_and_consume(ip));
+    }
+
+    struct FailingLlmProvider;
+
+    impl core::llm::LlmProvider for FailingLlmProvider {
+        fn complete(&self, _messages: &[Message]) -> Result<core::llm::Completion, core::llm::LlmError> {
+            Err(core::llm::LlmError::Timeout)
+        }
+    }
+
+    #[test]
+    fn error_response_maps_validation_to_400() {
+        let (status, _) = error_response(&core::CoreError::Validation("bad input".to_string()));
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn error_response_maps_not_found_to_404() {
+        let (status, _) = error_response(&core::CoreError::NotFound("missing".to_string()));
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn error_response_maps_config_to_500() {
+        let (status, _) = error_response(&core::CoreError::Config("bad config".to_string()));
+        assert_eq!(status, 500);
+    }
+
+    #[test]
+    fn error_response_maps_provider_to_500() {
+        let err: core::CoreError = core::llm::LlmError::Timeout.into();
+        let (status, _) = error_response(&err);
+        assert_eq!(status, 500);
+    }
+
+    #[test]
+    fn format_log_line_includes_method_path_and_status() {
+        assert_eq!(format_log_line("GET", "/memories", 200), "GET /memories 200");
+    }
+
+    #[test]
+    fn format_log_line_handles_an_error_status_and_a_deep_path() {
+        assert_eq!(format_log_line("DELETE", "/memories/rec-1-2-3", 404), "DELETE /memories/rec-1-2-3 404");
+    }
+
+    #[test]
+    fn handle_ready_returns_200_when_providers_are_healthy() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, body) = handle_ready(&memory);
+        assert_eq!(status, 200);
+        assert_eq!(body, br#"{"status":"ready"}"#);
+    }
+
+    #[test]
+    fn handle_ready_returns_503_when_a_provider_is_unhealthy() {
+        let memory = Memory::new(FailingLlmProvider, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, _body) = handle_ready(&memory);
+        assert_eq!(status, 503);
     }
 
     #[test]
@@ -1204,6 +1284,33 @@ mod tests {
 
             assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response_text}");
             assert!(response_text.ends_with(r#"{"status":"ok"}"#), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_answers_ready_without_a_token_when_providers_are_healthy() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(
+                listener,
+                memory,
+                Arc::new(Some("secret".to_string())),
+                Arc::new(RateLimiter::new(1000.0, 1000.0)),
+                Arc::new(None),
+            ));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            stream.write_all(b"GET /ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response_text}");
+            assert!(response_text.ends_with(r#"{"status":"ready"}"#), "got: {response_text}");
         });
     }
 }
