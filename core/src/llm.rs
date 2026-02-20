@@ -90,6 +90,12 @@ pub trait LlmProvider {
     fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError>;
 }
 
+impl<T: LlmProvider + ?Sized> LlmProvider for Box<T> {
+    fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+        self.as_ref().complete(messages)
+    }
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub fn extract_facts(
     provider: &impl LlmProvider,

@@ -365,6 +365,66 @@ fn resolve_cors_origin(env: Option<String>) -> Option<String> {
     env.filter(|origin| !origin.is_empty())
 }
 
+fn resolve_llm_provider(
+    provider_choice: Option<&str>,
+    model: Option<String>,
+    base_url: Option<String>,
+) -> Result<(Box<dyn core::llm::LlmProvider + Send + Sync>, String), String> {
+    match provider_choice.unwrap_or("local") {
+        "local" => Ok((
+            Box::new(LocalSentenceLlmProvider::new()),
+            "LocalSentenceLlmProvider (local, non-AI; see ADR-12)".to_string(),
+        )),
+        "ollama" => {
+            #[cfg(feature = "ollama")]
+            {
+                let model = model.unwrap_or_else(|| "qwen2.5:0.5b".to_string());
+                let resolved_base_url = base_url.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
+                let config = core::llm::LlmConfig { model: model.clone(), base_url, api_key: None, temperature: None };
+                let provider = core::llm::OllamaLlmProvider::from_config(config).map_err(|err| err.to_string())?;
+                let label = format!("OllamaLlmProvider (model={model}, base_url={resolved_base_url}; see ADR-25)");
+                Ok((Box::new(provider), label))
+            }
+            #[cfg(not(feature = "ollama"))]
+            {
+                let _ = (model, base_url);
+                Err("MEMORIA_LLM_PROVIDER=ollama requires the server binary to be built with --features ollama".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_LLM_PROVIDER value {other:?} (expected \"local\" or \"ollama\")")),
+    }
+}
+
+fn resolve_embedding_provider(
+    provider_choice: Option<&str>,
+    model: Option<String>,
+    base_url: Option<String>,
+) -> Result<(Box<dyn core::embedding::EmbeddingProvider + Send + Sync>, String), String> {
+    match provider_choice.unwrap_or("local") {
+        "local" => Ok((
+            Box::new(LocalHashEmbeddingProvider::new()),
+            "LocalHashEmbeddingProvider (local, non-AI; see ADR-12)".to_string(),
+        )),
+        "ollama" => {
+            #[cfg(feature = "ollama")]
+            {
+                let model = model.unwrap_or_else(|| "nomic-embed-text".to_string());
+                let resolved_base_url = base_url.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
+                let config = core::embedding::EmbeddingConfig { model: model.clone(), base_url, api_key: None, dimensions: None };
+                let provider = core::embedding::OllamaEmbeddingProvider::from_config(config).map_err(|err| err.to_string())?;
+                let label = format!("OllamaEmbeddingProvider (model={model}, base_url={resolved_base_url}; see ADR-24)");
+                Ok((Box::new(provider), label))
+            }
+            #[cfg(not(feature = "ollama"))]
+            {
+                let _ = (model, base_url);
+                Err("MEMORIA_EMBEDDING_PROVIDER=ollama requires the server binary to be built with --features ollama".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_EMBEDDING_PROVIDER value {other:?} (expected \"local\" or \"ollama\")")),
+    }
+}
+
 fn validate_cors_origin(origin: Option<String>) -> Result<Option<String>, String> {
     if origin.as_deref() == Some("*") {
         return Err(
@@ -452,18 +512,26 @@ async fn handle_connection<L, E, V>(
                 return;
             }
 
-            let (status, body) = if !rate_limiter.check_and_consume(peer_ip) {
-                (429, error_body("rate limit exceeded"))
-            } else if req.method == "GET" && req.path == "/health" {
-                handle_health()
-            } else if req.method == "GET" && req.path == "/ready" {
-                handle_ready(&memory)
-            } else if is_authorized(token.as_deref(), &req.headers) {
-                route(&memory, &req)
-            } else {
-                (401, error_body("unauthorized"))
-            };
-            eprintln!("{}", format_log_line(&req.method, &req.path, status));
+            let blocking_memory = Arc::clone(&memory);
+            let blocking_token = Arc::clone(&token);
+            let blocking_rate_limiter = Arc::clone(&rate_limiter);
+            let (status, body) = tokio::task::spawn_blocking(move || {
+                let (status, body) = if !blocking_rate_limiter.check_and_consume(peer_ip) {
+                    (429, error_body("rate limit exceeded"))
+                } else if req.method == "GET" && req.path == "/health" {
+                    handle_health()
+                } else if req.method == "GET" && req.path == "/ready" {
+                    handle_ready(&blocking_memory)
+                } else if is_authorized(blocking_token.as_deref(), &req.headers) {
+                    route(&blocking_memory, &req)
+                } else {
+                    (401, error_body("unauthorized"))
+                };
+                eprintln!("{}", format_log_line(&req.method, &req.path, status));
+                (status, body)
+            })
+            .await
+            .expect("request-handling task should not panic");
             let response = build_response_with_headers(status, &body, &cors_header.into_iter().collect::<Vec<_>>());
             let _ = stream.write_all(&response).await;
             return;
@@ -522,13 +590,38 @@ fn main() {
         }
     };
 
+    let llm_provider_choice = std::env::var("MEMORIA_LLM_PROVIDER").ok();
+    let (llm_provider, llm_label) = match resolve_llm_provider(
+        llm_provider_choice.as_deref(),
+        std::env::var("MEMORIA_LLM_MODEL").ok(),
+        std::env::var("MEMORIA_LLM_BASE_URL").ok(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    let embedding_provider_choice = std::env::var("MEMORIA_EMBEDDING_PROVIDER").ok();
+    let (embedding_provider, embedding_label) = match resolve_embedding_provider(
+        embedding_provider_choice.as_deref(),
+        std::env::var("MEMORIA_EMBEDDING_MODEL").ok(),
+        std::env::var("MEMORIA_EMBEDDING_BASE_URL").ok(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("llm provider: {llm_label}");
+    eprintln!("embedding provider: {embedding_label}");
+
+    let memory_outliving_the_runtime = Arc::new(Memory::new(llm_provider, embedding_provider, InMemoryVectorStore::new()));
+
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
-        let memory = Arc::new(Memory::new(
-            LocalSentenceLlmProvider::new(),
-            LocalHashEmbeddingProvider::new(),
-            InMemoryVectorStore::new(),
-        ));
+        let memory = Arc::clone(&memory_outliving_the_runtime);
         let rate_limiter = Arc::new(RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC));
         let listener = TcpListener::bind("127.0.0.1:8080").await.expect("failed to bind to 127.0.0.1:8080");
         let shutdown = Box::pin(async {
@@ -664,6 +757,48 @@ mod tests {
     fn resolve_cors_origin_with_unset_or_empty_resolves_to_none() {
         assert_eq!(resolve_cors_origin(None), None);
         assert_eq!(resolve_cors_origin(Some(String::new())), None);
+    }
+
+    #[test]
+    fn resolve_llm_provider_defaults_to_local() {
+        let (_, label) = resolve_llm_provider(None, None, None).expect("expected a provider");
+        assert!(label.contains("LocalSentenceLlmProvider"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_llm_provider_rejects_an_unknown_choice() {
+        assert!(resolve_llm_provider(Some("bogus"), None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_embedding_provider_defaults_to_local() {
+        let (_, label) = resolve_embedding_provider(None, None, None).expect("expected a provider");
+        assert!(label.contains("LocalHashEmbeddingProvider"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_embedding_provider_rejects_an_unknown_choice() {
+        assert!(resolve_embedding_provider(Some("bogus"), None, None).is_err());
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn resolve_llm_provider_ollama_choice_builds_with_defaults() {
+        let (_, label) = resolve_llm_provider(Some("ollama"), None, None).expect("expected a provider");
+        assert!(label.contains("qwen2.5:0.5b"), "got: {label}");
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn resolve_embedding_provider_ollama_choice_builds_with_defaults() {
+        let (_, label) = resolve_embedding_provider(Some("ollama"), None, None).expect("expected a provider");
+        assert!(label.contains("nomic-embed-text"), "got: {label}");
+    }
+
+    #[cfg(not(feature = "ollama"))]
+    #[test]
+    fn resolve_llm_provider_ollama_choice_fails_clearly_without_the_feature() {
+        assert!(resolve_llm_provider(Some("ollama"), None, None).is_err());
     }
 
     #[test]
@@ -1384,6 +1519,7 @@ mod tests {
                 Arc::new(None),
                 shutdown,
             ));
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1404,6 +1540,48 @@ mod tests {
                 .await
                 .expect("serve() should return promptly once the in-flight connection finishes")
                 .expect("serve() task should not panic");
+        });
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn server_does_not_panic_when_a_blocking_provider_is_called_from_the_async_runtime() {
+        let llm_config = core::llm::LlmConfig {
+            model: "qwen2.5:0.5b".to_string(),
+            base_url: Some("http://127.0.0.1:1".to_string()),
+            api_key: None,
+            temperature: None,
+        };
+        let llm = core::llm::OllamaLlmProvider::from_config(llm_config).expect("valid config should construct");
+        let memory_outliving_the_runtime = Arc::new(Memory::new(llm, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::clone(&memory_outliving_the_runtime);
+
+            tokio::spawn(serve(
+                listener,
+                memory,
+                Arc::new(None),
+                Arc::new(RateLimiter::new(1000.0, 1000.0)),
+                Arc::new(None),
+                Box::pin(std::future::pending()),
+            ));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let body = br#"{"content":"hi","user_id":"u1"}"#;
+            let request = format!("POST /memories HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+            stream.write_all(body).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+
+            assert!(!response.is_empty(), "expected a real HTTP response, got none -- the request-handling task likely panicked");
+            let response_text = String::from_utf8_lossy(&response);
+            assert!(response_text.starts_with("HTTP/1.1 5"), "got: {response_text}");
         });
     }
 }

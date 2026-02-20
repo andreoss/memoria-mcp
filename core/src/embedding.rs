@@ -29,6 +29,16 @@ pub trait EmbeddingProvider {
     }
 }
 
+impl<T: EmbeddingProvider + ?Sized> EmbeddingProvider for Box<T> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.as_ref().embed(text)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.as_ref().embed_batch(texts)
+    }
+}
+
 pub struct LocalHashEmbeddingProvider;
 
 impl LocalHashEmbeddingProvider {

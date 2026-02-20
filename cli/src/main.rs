@@ -202,8 +202,68 @@ fn print_record(record: &VectorRecord, json: bool, quiet: bool) {
 #[derive(serde::Serialize)]
 struct WhoamiInfo {
     store: String,
-    llm_provider: &'static str,
-    embedding_provider: &'static str,
+    llm_provider: String,
+    embedding_provider: String,
+}
+
+fn resolve_llm_provider(
+    provider_choice: Option<&str>,
+    model: Option<String>,
+    base_url: Option<String>,
+) -> Result<(Box<dyn core::llm::LlmProvider>, String), String> {
+    match provider_choice.unwrap_or("local") {
+        "local" => Ok((
+            Box::new(LocalSentenceLlmProvider::new()),
+            "LocalSentenceLlmProvider (local, non-AI; see ADR-12)".to_string(),
+        )),
+        "ollama" => {
+            #[cfg(feature = "ollama")]
+            {
+                let model = model.unwrap_or_else(|| "qwen2.5:0.5b".to_string());
+                let resolved_base_url = base_url.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
+                let config = core::llm::LlmConfig { model: model.clone(), base_url, api_key: None, temperature: None };
+                let provider = core::llm::OllamaLlmProvider::from_config(config).map_err(|err| err.to_string())?;
+                let label = format!("OllamaLlmProvider (model={model}, base_url={resolved_base_url}; see ADR-25)");
+                Ok((Box::new(provider), label))
+            }
+            #[cfg(not(feature = "ollama"))]
+            {
+                let _ = (model, base_url);
+                Err("MEMORIA_LLM_PROVIDER=ollama requires the cli binary to be built with --features ollama".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_LLM_PROVIDER value {other:?} (expected \"local\" or \"ollama\")")),
+    }
+}
+
+fn resolve_embedding_provider(
+    provider_choice: Option<&str>,
+    model: Option<String>,
+    base_url: Option<String>,
+) -> Result<(Box<dyn core::embedding::EmbeddingProvider>, String), String> {
+    match provider_choice.unwrap_or("local") {
+        "local" => Ok((
+            Box::new(LocalHashEmbeddingProvider::new()),
+            "LocalHashEmbeddingProvider (local, non-AI; see ADR-12)".to_string(),
+        )),
+        "ollama" => {
+            #[cfg(feature = "ollama")]
+            {
+                let model = model.unwrap_or_else(|| "nomic-embed-text".to_string());
+                let resolved_base_url = base_url.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
+                let config = core::embedding::EmbeddingConfig { model: model.clone(), base_url, api_key: None, dimensions: None };
+                let provider = core::embedding::OllamaEmbeddingProvider::from_config(config).map_err(|err| err.to_string())?;
+                let label = format!("OllamaEmbeddingProvider (model={model}, base_url={resolved_base_url}; see ADR-24)");
+                Ok((Box::new(provider), label))
+            }
+            #[cfg(not(feature = "ollama"))]
+            {
+                let _ = (model, base_url);
+                Err("MEMORIA_EMBEDDING_PROVIDER=ollama requires the cli binary to be built with --features ollama".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_EMBEDDING_PROVIDER value {other:?} (expected \"local\" or \"ollama\")")),
+    }
 }
 
 fn main() {
@@ -215,12 +275,38 @@ fn main() {
     let file_config = read_config_file(&config_file_path(&home));
     let path = resolve_store_path(cli.store_path.as_deref(), env_override.as_deref(), file_config, &home);
     let store = load_store(&path);
-    let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), store);
 
-    run(cli.command, &memory, &path, json, quiet);
+    let llm_provider_choice = std::env::var("MEMORIA_LLM_PROVIDER").ok();
+    let (llm_provider, llm_label) = match resolve_llm_provider(
+        llm_provider_choice.as_deref(),
+        std::env::var("MEMORIA_LLM_MODEL").ok(),
+        std::env::var("MEMORIA_LLM_BASE_URL").ok(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    let embedding_provider_choice = std::env::var("MEMORIA_EMBEDDING_PROVIDER").ok();
+    let (embedding_provider, embedding_label) = match resolve_embedding_provider(
+        embedding_provider_choice.as_deref(),
+        std::env::var("MEMORIA_EMBEDDING_MODEL").ok(),
+        std::env::var("MEMORIA_EMBEDDING_BASE_URL").ok(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+
+    let memory = Memory::new(llm_provider, embedding_provider, store);
+
+    run(cli.command, &memory, &path, json, quiet, &llm_label, &embedding_label);
 }
 
-fn run<L, E, V>(command: Command, memory: &Memory<L, E, V>, path: &Path, json: bool, quiet: bool)
+fn run<L, E, V>(command: Command, memory: &Memory<L, E, V>, path: &Path, json: bool, quiet: bool, llm_label: &str, embedding_label: &str)
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
@@ -295,8 +381,8 @@ where
             if !quiet {
                 let info = WhoamiInfo {
                     store: path.display().to_string(),
-                    llm_provider: "LocalSentenceLlmProvider (local, non-AI; see ADR-12)",
-                    embedding_provider: "LocalHashEmbeddingProvider (local, non-AI; see ADR-12)",
+                    llm_provider: llm_label.to_string(),
+                    embedding_provider: embedding_label.to_string(),
                 };
                 if json {
                     println!("{}", serde_json::to_string(&info).unwrap_or_default());
@@ -324,6 +410,58 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_llm_provider_defaults_to_local() {
+        let (_, label) = resolve_llm_provider(None, None, None).expect("expected a provider");
+        assert!(label.contains("LocalSentenceLlmProvider"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_llm_provider_rejects_an_unknown_choice() {
+        let result = resolve_llm_provider(Some("bogus"), None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_embedding_provider_defaults_to_local() {
+        let (_, label) = resolve_embedding_provider(None, None, None).expect("expected a provider");
+        assert!(label.contains("LocalHashEmbeddingProvider"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_embedding_provider_rejects_an_unknown_choice() {
+        let result = resolve_embedding_provider(Some("bogus"), None, None);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn resolve_llm_provider_ollama_choice_builds_with_defaults() {
+        let (_, label) = resolve_llm_provider(Some("ollama"), None, None).expect("expected a provider");
+        assert!(label.contains("qwen2.5:0.5b"), "got: {label}");
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn resolve_llm_provider_ollama_choice_honors_a_custom_model() {
+        let (_, label) = resolve_llm_provider(Some("ollama"), Some("custom-model".to_string()), None).expect("expected a provider");
+        assert!(label.contains("custom-model"), "got: {label}");
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn resolve_embedding_provider_ollama_choice_builds_with_defaults() {
+        let (_, label) = resolve_embedding_provider(Some("ollama"), None, None).expect("expected a provider");
+        assert!(label.contains("nomic-embed-text"), "got: {label}");
+    }
+
+    #[cfg(not(feature = "ollama"))]
+    #[test]
+    fn resolve_llm_provider_ollama_choice_fails_clearly_without_the_feature() {
+        let result = resolve_llm_provider(Some("ollama"), None, None);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn build_scope_includes_only_provided_keys() {
