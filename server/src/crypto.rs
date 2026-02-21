@@ -9,16 +9,19 @@ const HASH_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 const PBKDF2_ITERATIONS: u32 = 600_000;
 
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; HASH_LEN] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
 fn pbkdf2_block(password: &[u8], salt: &[u8], iterations: u32, block_index: u32) -> [u8; HASH_LEN] {
-    let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
-    mac.update(salt);
-    mac.update(&block_index.to_be_bytes());
-    let mut result: [u8; HASH_LEN] = mac.finalize().into_bytes().into();
+    let mut first_message = salt.to_vec();
+    first_message.extend_from_slice(&block_index.to_be_bytes());
+    let mut result = hmac_sha256(password, &first_message);
     let mut previous = result;
     for _ in 1..iterations {
-        let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
-        mac.update(&previous);
-        let next: [u8; HASH_LEN] = mac.finalize().into_bytes().into();
+        let next = hmac_sha256(password, &previous);
         for (r, b) in result.iter_mut().zip(next.iter()) {
             *r ^= b;
         }
@@ -72,6 +75,63 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     };
     let actual_hash = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations, expected_hash.len());
     crate::constant_time_eq(&actual_hash, &expected_hash)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum JwtError {
+    Malformed,
+    UnsupportedAlgorithm,
+    BadSignature,
+    Expired,
+}
+
+fn base64url_encode(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+fn base64url_decode(s: &str) -> Result<Vec<u8>, JwtError> {
+    base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, s).map_err(|_| JwtError::Malformed)
+}
+
+pub fn encode_jwt(claims: &serde_json::Value, secret: &[u8]) -> String {
+    let header = serde_json::json!({"alg": "HS256", "typ": "JWT"});
+    let header_b64 = base64url_encode(&serde_json::to_vec(&header).expect("a static JSON object always serializes"));
+    let payload_b64 = base64url_encode(&serde_json::to_vec(claims).expect("caller-provided claims must be valid JSON"));
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = hmac_sha256(secret, signing_input.as_bytes());
+    let signature_b64 = base64url_encode(&signature);
+    format!("{signing_input}.{signature_b64}")
+}
+
+pub fn decode_jwt(token: &str, secret: &[u8], now_unix: u64) -> Result<serde_json::Value, JwtError> {
+    let mut parts = token.split('.');
+    let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(JwtError::Malformed);
+    };
+
+    let header_bytes = base64url_decode(header_b64)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|_| JwtError::Malformed)?;
+    if header.get("alg").and_then(serde_json::Value::as_str) != Some("HS256") {
+        return Err(JwtError::UnsupportedAlgorithm);
+    }
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let expected_signature = hmac_sha256(secret, signing_input.as_bytes());
+    let actual_signature = base64url_decode(signature_b64)?;
+    if !crate::constant_time_eq(&expected_signature, &actual_signature) {
+        return Err(JwtError::BadSignature);
+    }
+
+    let payload_bytes = base64url_decode(payload_b64)?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|_| JwtError::Malformed)?;
+    if let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_u64) {
+        if exp < now_unix {
+            return Err(JwtError::Expired);
+        }
+    }
+    Ok(claims)
 }
 
 #[cfg(test)]
@@ -174,6 +234,77 @@ mod tests {
         assert!(!verify_password("anything", "not-a-real-hash"));
         assert!(!verify_password("anything", "pbkdf2-sha256$not-a-number$salt$hash"));
         assert!(!verify_password("anything", "pbkdf2-sha256$1$salt"));
+    }
+
+    #[test]
+    fn decode_jwt_accepts_a_real_token_from_an_independent_implementation() {
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMH0.iH-RmEk064svZjjCuO1PCOL6k0OqmFSF-4EJx8nroBA";
+        let claims = decode_jwt(token, b"test-secret-key", 1_800_000_000).expect("a real, untampered HS256 token must decode");
+        assert_eq!(claims["sub"], "user-1");
+        assert_eq!(claims["exp"], 2_000_000_000);
+        assert_eq!(claims["iat"], 1_700_000_000);
+    }
+
+    #[test]
+    fn decode_jwt_rejects_the_same_token_under_the_wrong_secret() {
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMH0.iH-RmEk064svZjjCuO1PCOL6k0OqmFSF-4EJx8nroBA";
+        assert_eq!(decode_jwt(token, b"wrong-secret", 1_800_000_000), Err(JwtError::BadSignature));
+    }
+
+    #[test]
+    fn decode_jwt_rejects_the_same_token_once_expired() {
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMH0.iH-RmEk064svZjjCuO1PCOL6k0OqmFSF-4EJx8nroBA";
+        assert_eq!(decode_jwt(token, b"test-secret-key", 2_100_000_000), Err(JwtError::Expired));
+    }
+
+    #[test]
+    fn decode_jwt_rejects_a_middle_character_of_the_signature_being_flipped() {
+        let mut token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMH0.iH-RmEk064svZjjCuO1PCOL6k0OqmFSF-4EJx8nroBA".to_string();
+        let tamper_index = token.len() / 2;
+        let mut bytes: Vec<u8> = token.into_bytes();
+        let tampered_char = if bytes[tamper_index] == b'A' { b'B' } else { b'A' };
+        bytes[tamper_index] = tampered_char;
+        token = String::from_utf8(bytes).expect("ASCII base64url stays valid UTF-8 after a single-byte swap");
+        assert_eq!(decode_jwt(&token, b"test-secret-key", 1_800_000_000), Err(JwtError::BadSignature));
+    }
+
+    #[test]
+    fn decode_jwt_rejects_the_last_character_of_the_signature_being_flipped() {
+        let mut token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMH0.iH-RmEk064svZjjCuO1PCOL6k0OqmFSF-4EJx8nroBA".to_string();
+        let last_char = token.pop().expect("token is non-empty");
+        let tampered_char = if last_char == 'A' { 'B' } else { 'A' };
+        token.push(tampered_char);
+        assert!(decode_jwt(&token, b"test-secret-key", 1_800_000_000).is_err());
+    }
+
+    #[test]
+    fn decode_jwt_rejects_a_malformed_token() {
+        assert_eq!(decode_jwt("not-a-jwt", b"secret", 0), Err(JwtError::Malformed));
+        assert_eq!(decode_jwt("a.b", b"secret", 0), Err(JwtError::Malformed));
+        assert_eq!(decode_jwt("a.b.c.d", b"secret", 0), Err(JwtError::Malformed));
+    }
+
+    #[test]
+    fn decode_jwt_rejects_an_unsupported_algorithm() {
+        let alg_none_header = base64url_encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64url_encode(br#"{"sub":"x"}"#);
+        let token = format!("{alg_none_header}.{payload}.");
+        assert_eq!(decode_jwt(&token, b"secret", 0), Err(JwtError::UnsupportedAlgorithm));
+    }
+
+    #[test]
+    fn encode_jwt_then_decode_jwt_round_trips_real_claims() {
+        let claims = serde_json::json!({"sub": "round-trip", "exp": 3_000_000_000u64});
+        let token = encode_jwt(&claims, b"a-real-secret");
+        let decoded = decode_jwt(&token, b"a-real-secret", 1_000_000_000).expect("a freshly encoded token must decode");
+        assert_eq!(decoded, claims);
+    }
+
+    #[test]
+    fn encode_jwt_output_is_rejected_under_a_different_secret() {
+        let claims = serde_json::json!({"sub": "x"});
+        let token = encode_jwt(&claims, b"secret-a");
+        assert_eq!(decode_jwt(&token, b"secret-b", 0), Err(JwtError::BadSignature));
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
