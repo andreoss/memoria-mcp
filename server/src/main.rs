@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod crypto;
+
 use core::embedding::LocalHashEmbeddingProvider;
 use core::llm::{LocalSentenceLlmProvider, Message, Role};
 use core::memory::Memory;
@@ -321,7 +323,7 @@ fn resolve_auth_config(api_key_env: Option<String>, allow_no_auth_env: Option<St
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
