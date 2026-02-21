@@ -3,9 +3,10 @@
 use core::embedding::LocalHashEmbeddingProvider;
 use core::llm::{LocalSentenceLlmProvider, Message, Role};
 use core::memory::Memory;
-use core::vector_store::InMemoryVectorStore;
+use core::vector_store::{InMemoryVectorStore, VectorRecord, VectorStore};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,6 +14,48 @@ use tokio::net::{TcpListener, TcpStream};
 
 const RATE_LIMIT_CAPACITY: f64 = 20.0;
 const RATE_LIMIT_REFILL_PER_SEC: f64 = 5.0;
+
+fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("json.tmp.{}.{unique}", std::process::id()));
+    std::fs::write(&temp_path, data)?;
+    std::fs::rename(&temp_path, path)
+}
+
+fn resolve_store_path(env_override: Option<&str>, home: &str) -> PathBuf {
+    if let Some(p) = env_override {
+        return PathBuf::from(p);
+    }
+    Path::new(home).join(".memoria").join("server-store.json")
+}
+
+fn load_store(path: &Path) -> InMemoryVectorStore {
+    let store = InMemoryVectorStore::new();
+    if let Ok(data) = std::fs::read_to_string(path) {
+        if let Ok(records) = serde_json::from_str::<Vec<VectorRecord>>(&data) {
+            for record in records {
+                let _ = store.insert(record);
+            }
+        }
+    }
+    store
+}
+
+fn save_store<L, E, V>(memory: &Memory<L, E, V>, path: &Path) -> std::io::Result<()>
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let ids = memory.list(0, usize::MAX).unwrap_or_default();
+    let records: Vec<VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
+    let data = serde_json::to_vec(&records).unwrap_or_default();
+    write_atomically(path, &data)
+}
 
 struct RateLimitBucket {
     tokens: f64,
@@ -347,6 +390,15 @@ where
     }
 }
 
+fn is_successful_mutation(method: &str, path: &str, status: u16) -> bool {
+    let (path_only, _query) = path.split_once('?').unwrap_or((path, ""));
+    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
+    matches!(
+        (method, segments.as_slice(), status),
+        ("POST", ["memories"], 201) | ("PUT" | "DELETE", ["memories", _], 200)
+    )
+}
+
 const fn reason_phrase(status: u16) -> &'static str {
     match status {
         201 => "Created",
@@ -474,6 +526,7 @@ async fn handle_connection<L, E, V>(
     token: Arc<Option<String>>,
     rate_limiter: Arc<RateLimiter>,
     cors_origin: Arc<Option<String>>,
+    store_path: Arc<PathBuf>,
     peer_ip: IpAddr,
 ) where
     L: core::llm::LlmProvider + Send + Sync + 'static,
@@ -515,6 +568,7 @@ async fn handle_connection<L, E, V>(
             let blocking_memory = Arc::clone(&memory);
             let blocking_token = Arc::clone(&token);
             let blocking_rate_limiter = Arc::clone(&rate_limiter);
+            let blocking_store_path = Arc::clone(&store_path);
             let (status, body) = tokio::task::spawn_blocking(move || {
                 let (status, body) = if !blocking_rate_limiter.check_and_consume(peer_ip) {
                     (429, error_body("rate limit exceeded"))
@@ -523,7 +577,11 @@ async fn handle_connection<L, E, V>(
                 } else if req.method == "GET" && req.path == "/ready" {
                     handle_ready(&blocking_memory)
                 } else if is_authorized(blocking_token.as_deref(), &req.headers) {
-                    route(&blocking_memory, &req)
+                    let result = route(&blocking_memory, &req);
+                    if is_successful_mutation(&req.method, &req.path, result.0) {
+                        let _ = save_store(&blocking_memory, &blocking_store_path);
+                    }
+                    result
                 } else {
                     (401, error_body("unauthorized"))
                 };
@@ -545,6 +603,7 @@ async fn serve<L, E, V>(
     token: Arc<Option<String>>,
     rate_limiter: Arc<RateLimiter>,
     cors_origin: Arc<Option<String>>,
+    store_path: Arc<PathBuf>,
     mut shutdown: impl std::future::Future<Output = ()> + Unpin,
 ) where
     L: core::llm::LlmProvider + Send + Sync + 'static,
@@ -562,7 +621,8 @@ async fn serve<L, E, V>(
                 let token = Arc::clone(&token);
                 let rate_limiter = Arc::clone(&rate_limiter);
                 let cors_origin = Arc::clone(&cors_origin);
-                in_flight.spawn(handle_connection(stream, memory, token, rate_limiter, cors_origin, peer_addr.ip()));
+                let store_path = Arc::clone(&store_path);
+                in_flight.spawn(handle_connection(stream, memory, token, rate_limiter, cors_origin, store_path, peer_addr.ip()));
             }
             () = &mut shutdown => {
                 break;
@@ -617,7 +677,12 @@ fn main() {
     eprintln!("llm provider: {llm_label}");
     eprintln!("embedding provider: {embedding_label}");
 
-    let memory_outliving_the_runtime = Arc::new(Memory::new(llm_provider, embedding_provider, InMemoryVectorStore::new()));
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let store_path = Arc::new(resolve_store_path(std::env::var("MEMORIA_STORE_PATH").ok().as_deref(), &home));
+    eprintln!("store: {}", store_path.display());
+    let store = load_store(&store_path);
+
+    let memory_outliving_the_runtime = Arc::new(Memory::new(llm_provider, embedding_provider, store));
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
@@ -632,7 +697,7 @@ fn main() {
                 _ = tokio::signal::ctrl_c() => {}
             }
         });
-        serve(listener, memory, token, rate_limiter, cors_origin, shutdown).await;
+        serve(listener, memory, token, rate_limiter, cors_origin, store_path, shutdown).await;
     });
 }
 
@@ -643,6 +708,10 @@ mod tests {
 
     fn test_ip(last_octet: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, last_octet))
+    }
+
+    fn test_store_path() -> Arc<PathBuf> {
+        Arc::new(std::env::temp_dir().join("memoria-server-tests-scratch-store.json"))
     }
 
     #[test]
@@ -757,6 +826,126 @@ mod tests {
     fn resolve_cors_origin_with_unset_or_empty_resolves_to_none() {
         assert_eq!(resolve_cors_origin(None), None);
         assert_eq!(resolve_cors_origin(Some(String::new())), None);
+    }
+
+    #[test]
+    fn write_atomically_creates_the_file_with_the_given_contents() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-atomic-test-{}-1", std::process::id()));
+        let path = dir.join("store.json");
+        write_atomically(&path, b"hello").expect("write should succeed");
+        assert_eq!(std::fs::read(&path).expect("file should exist"), b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomically_leaves_no_temp_file_behind() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-atomic-test-{}-2", std::process::id()));
+        let path = dir.join("store.json");
+        write_atomically(&path, b"hello").expect("write should succeed");
+        let entries: Vec<_> = std::fs::read_dir(&dir).expect("dir should exist").filter_map(Result::ok).collect();
+        assert_eq!(entries.len(), 1, "expected exactly the target file, no leftover temp file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomically_overwrites_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-atomic-test-{}-3", std::process::id()));
+        let path = dir.join("store.json");
+        write_atomically(&path, b"first").expect("write should succeed");
+        write_atomically(&path, b"second").expect("write should succeed");
+        assert_eq!(std::fs::read(&path).expect("file should exist"), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomically_never_corrupts_the_file_under_concurrent_writers() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-atomic-test-{}-4", std::process::id()));
+        let path = Arc::new(dir.join("store.json"));
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    let payload = format!("payload-from-writer-{i}");
+                    write_atomically(&path, payload.as_bytes()).expect("write should succeed");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread should not panic");
+        }
+        let final_contents = std::fs::read_to_string(&*path).expect("file should exist");
+        assert!(
+            final_contents.starts_with("payload-from-writer-"),
+            "final file content must be exactly one writer's complete payload, got: {final_contents:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_store_path_defaults_to_a_server_specific_file_distinct_from_the_cli() {
+        let path = resolve_store_path(None, "/home/alice");
+        assert_eq!(path, PathBuf::from("/home/alice/.memoria/server-store.json"));
+    }
+
+    #[test]
+    fn resolve_store_path_env_override_wins() {
+        let path = resolve_store_path(Some("/custom/path.json"), "/home/alice");
+        assert_eq!(path, PathBuf::from("/custom/path.json"));
+    }
+
+    #[test]
+    fn is_successful_mutation_true_for_create() {
+        assert!(is_successful_mutation("POST", "/memories", 201));
+    }
+
+    #[test]
+    fn is_successful_mutation_true_for_update() {
+        assert!(is_successful_mutation("PUT", "/memories/rec-1", 200));
+    }
+
+    #[test]
+    fn is_successful_mutation_true_for_delete() {
+        assert!(is_successful_mutation("DELETE", "/memories/rec-1", 200));
+    }
+
+    #[test]
+    fn is_successful_mutation_false_for_search() {
+        assert!(!is_successful_mutation("POST", "/memories/search", 200));
+    }
+
+    #[test]
+    fn is_successful_mutation_false_for_get_and_list() {
+        assert!(!is_successful_mutation("GET", "/memories", 200));
+        assert!(!is_successful_mutation("GET", "/memories/rec-1", 200));
+    }
+
+    #[test]
+    fn is_successful_mutation_false_when_the_status_indicates_failure() {
+        assert!(!is_successful_mutation("POST", "/memories", 400));
+        assert!(!is_successful_mutation("PUT", "/memories/rec-1", 404));
+        assert!(!is_successful_mutation("DELETE", "/memories/rec-1", 500));
+    }
+
+    #[test]
+    fn load_store_with_no_file_present_is_empty() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-load-test-{}", std::process::id()));
+        let path = dir.join("does-not-exist.json");
+        let store = load_store(&path);
+        assert!(store.list(0, usize::MAX).expect("list should succeed").is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trips_records() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-roundtrip-test-{}", std::process::id()));
+        let path = dir.join("store.json");
+        let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+        memory.add(&[Message::new(Role::User, "Alice is an engineer.".to_string())], scope_from_optional(Some("alice".to_string()), None, None)).expect("add should succeed");
+
+        save_store(&memory, &path).expect("save should succeed");
+        let reloaded = load_store(&path);
+        assert_eq!(reloaded.list(0, usize::MAX).expect("list should succeed").len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1215,7 +1404,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1236,13 +1425,51 @@ mod tests {
     }
 
     #[test]
+    fn server_persists_a_real_create_request_to_disk_and_a_fresh_server_reloads_it() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-e2e-persist-test-{}", std::process::id()));
+        let path = Arc::new(dir.join("store.json"));
+
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            tokio::spawn(serve(
+                listener,
+                memory,
+                Arc::new(None),
+                Arc::new(RateLimiter::new(1000.0, 1000.0)),
+                Arc::new(None),
+                Arc::clone(&path),
+                Box::pin(std::future::pending()),
+            ));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let body = br#"{"content":"Bob is learning to play the guitar.","user_id":"bob"}"#;
+            let request = format!("POST /memories HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+            stream.write_all(body).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
+        });
+
+        let independently_reloaded_store = load_store(&path);
+        assert_eq!(independently_reloaded_store.list(0, usize::MAX).expect("list should succeed").len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn server_returns_404_over_tcp_for_unknown_route() {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -1262,7 +1489,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1285,7 +1512,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1311,7 +1538,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(2.0, 0.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(2.0, 0.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut last_response_text = String::new();
             for _ in 0..3 {
@@ -1333,7 +1560,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1.0, 1000.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut first_stream = TcpStream::connect(addr).await.expect("connect should succeed");
             first_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -1360,7 +1587,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let declared_length = MAX_REQUEST_BODY_BYTES + 1;
@@ -1384,7 +1611,7 @@ mod tests {
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
             let cors_origin = Arc::new(Some("https://example.com".to_string()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
@@ -1406,7 +1633,7 @@ mod tests {
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
             let cors_origin = Arc::new(Some("https://example.com".to_string()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n";
@@ -1428,7 +1655,7 @@ mod tests {
             let addr = listener.local_addr().expect("local_addr should succeed");
             let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
             let cors_origin = Arc::new(Some("https://example.com".to_string()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, Box::pin(std::future::pending())));
+            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, test_store_path(), Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let request = "OPTIONS /memories HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
@@ -1457,6 +1684,7 @@ mod tests {
                 Arc::new(Some("secret".to_string())),
                 Arc::new(RateLimiter::new(1000.0, 1000.0)),
                 Arc::new(None),
+                test_store_path(),
                 Box::pin(std::future::pending()),
             ));
 
@@ -1485,6 +1713,7 @@ mod tests {
                 Arc::new(Some("secret".to_string())),
                 Arc::new(RateLimiter::new(1000.0, 1000.0)),
                 Arc::new(None),
+                test_store_path(),
                 Box::pin(std::future::pending()),
             ));
 
@@ -1517,6 +1746,7 @@ mod tests {
                 Arc::new(None),
                 Arc::new(RateLimiter::new(1000.0, 1000.0)),
                 Arc::new(None),
+                test_store_path(),
                 shutdown,
             ));
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
@@ -1567,6 +1797,7 @@ mod tests {
                 Arc::new(None),
                 Arc::new(RateLimiter::new(1000.0, 1000.0)),
                 Arc::new(None),
+                test_store_path(),
                 Box::pin(std::future::pending()),
             ));
 
