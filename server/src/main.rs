@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod auth_store;
 mod crypto;
 
 use core::embedding::LocalHashEmbeddingProvider;
@@ -17,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 const RATE_LIMIT_CAPACITY: f64 = 20.0;
 const RATE_LIMIT_REFILL_PER_SEC: f64 = 5.0;
 
-fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
