@@ -64,20 +64,50 @@ impl ApiKey {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenRecord {
+    pub jti: String,
+    pub user_id: String,
+    pub issued_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+impl RefreshTokenRecord {
+    pub fn new(user_id: String) -> Self {
+        Self { jti: next_id("jti"), user_id, issued_at: unix_now(), revoked_at: None }
+    }
+
+    pub const fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefreshError {
+    Unknown,
+    AlreadyUsed,
+}
+
+pub const fn registration_is_allowed(existing_user_count: usize) -> bool {
+    existing_user_count == 0
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AuthSnapshot {
     users: Vec<User>,
     api_keys: Vec<ApiKey>,
+    refresh_tokens: Vec<RefreshTokenRecord>,
 }
 
 pub struct AuthStore {
     users: Mutex<Vec<User>>,
     api_keys: Mutex<Vec<ApiKey>>,
+    refresh_tokens: Mutex<Vec<RefreshTokenRecord>>,
 }
 
 impl AuthStore {
     pub const fn new() -> Self {
-        Self { users: Mutex::new(Vec::new()), api_keys: Mutex::new(Vec::new()) }
+        Self { users: Mutex::new(Vec::new()), api_keys: Mutex::new(Vec::new()), refresh_tokens: Mutex::new(Vec::new()) }
     }
 
     pub fn load(path: &Path) -> Self {
@@ -85,16 +115,45 @@ impl AuthStore {
             .ok()
             .and_then(|data| serde_json::from_str::<AuthSnapshot>(&data).ok())
             .unwrap_or_default();
-        Self { users: Mutex::new(snapshot.users), api_keys: Mutex::new(snapshot.api_keys) }
+        Self {
+            users: Mutex::new(snapshot.users),
+            api_keys: Mutex::new(snapshot.api_keys),
+            refresh_tokens: Mutex::new(snapshot.refresh_tokens),
+        }
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let snapshot = AuthSnapshot {
             users: self.users.lock().expect("auth store users lock poisoned").clone(),
             api_keys: self.api_keys.lock().expect("auth store api_keys lock poisoned").clone(),
+            refresh_tokens: self.refresh_tokens.lock().expect("auth store refresh_tokens lock poisoned").clone(),
         };
         let data = serde_json::to_vec(&snapshot).unwrap_or_default();
         crate::write_atomically(path, &data)
+    }
+
+    pub fn issue_refresh_token(&self, user_id: &str) -> String {
+        let record = RefreshTokenRecord::new(user_id.to_string());
+        let jti = record.jti.clone();
+        self.refresh_tokens.lock().expect("auth store refresh_tokens lock poisoned").push(record);
+        jti
+    }
+
+    pub fn rotate_refresh_token(&self, presented_jti: &str) -> Result<String, RefreshError> {
+        let mut tokens = self.refresh_tokens.lock().expect("auth store refresh_tokens lock poisoned");
+        let Some(existing) = tokens.iter_mut().find(|t| t.jti == presented_jti) else {
+            return Err(RefreshError::Unknown);
+        };
+        if !existing.is_active() {
+            return Err(RefreshError::AlreadyUsed);
+        }
+        existing.revoked_at = Some(unix_now());
+        let user_id = existing.user_id.clone();
+        let new_record = RefreshTokenRecord::new(user_id);
+        let new_jti = new_record.jti.clone();
+        tokens.push(new_record);
+        drop(tokens);
+        Ok(new_jti)
     }
 
     pub fn insert_user(&self, user: User) {
@@ -203,11 +262,12 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_round_trips_a_real_user_and_api_key() {
+    fn save_then_load_round_trips_a_real_user_api_key_and_refresh_token() {
         let path = scratch_path("round-trip");
         let store = AuthStore::new();
         store.insert_user(User::new("Bob".to_string(), "bob@example.com".to_string(), "hash".to_string(), Role::Admin));
         store.insert_api_key(ApiKey::new("user-1".to_string(), "ci key".to_string(), "keyhash".to_string(), "km_ab".to_string()));
+        let jti = store.issue_refresh_token("user-1");
         store.save(&path).expect("save should succeed");
 
         let reloaded = AuthStore::load(&path);
@@ -217,8 +277,51 @@ mod tests {
         let keys = reloaded.find_api_keys_by_user("user-1");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key_prefix, "km_ab");
+        assert!(
+            reloaded.rotate_refresh_token(&jti).is_ok(),
+            "a refresh token issued before save must still rotate cleanly after a reload"
+        );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotate_refresh_token_succeeds_once_and_returns_a_new_jti() {
+        let store = AuthStore::new();
+        let jti = store.issue_refresh_token("user-1");
+        let new_jti = store.rotate_refresh_token(&jti).expect("first rotation must succeed");
+        assert_ne!(jti, new_jti, "rotation must issue a genuinely new token, not reuse the old one");
+    }
+
+    #[test]
+    fn rotate_refresh_token_rejects_reuse_of_an_already_rotated_token() {
+        let store = AuthStore::new();
+        let jti = store.issue_refresh_token("user-1");
+        store.rotate_refresh_token(&jti).expect("first rotation must succeed");
+        assert_eq!(store.rotate_refresh_token(&jti), Err(RefreshError::AlreadyUsed));
+    }
+
+    #[test]
+    fn rotate_refresh_token_rejects_an_unknown_jti() {
+        let store = AuthStore::new();
+        assert_eq!(store.rotate_refresh_token("never-issued"), Err(RefreshError::Unknown));
+    }
+
+    #[test]
+    fn rotate_refresh_token_can_chain_through_several_real_rotations() {
+        let store = AuthStore::new();
+        let mut jti = store.issue_refresh_token("user-1");
+        for _ in 0..5 {
+            jti = store.rotate_refresh_token(&jti).expect("each rotation in the chain must succeed");
+        }
+        assert!(store.rotate_refresh_token(&jti).is_ok(), "the final token in the chain must still be usable once");
+    }
+
+    #[test]
+    fn registration_is_allowed_only_before_the_first_user_exists() {
+        assert!(registration_is_allowed(0));
+        assert!(!registration_is_allowed(1));
+        assert!(!registration_is_allowed(2));
     }
 
     #[test]
