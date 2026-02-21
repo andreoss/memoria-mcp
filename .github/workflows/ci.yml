@@ -45,6 +45,15 @@ jobs:
       - name: Cargo Test (Workspace)
         run: cargo test --workspace
 
+      - name: Cargo Build (ollama feature)
+        run: cargo build -p memoria-core -p cli -p server --features ollama
+
+      - name: Cargo Clippy (ollama feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p cli -p server --features ollama --all-targets -- -D warnings
+
+      - name: Cargo Test (ollama feature, non-network cases only)
+        run: cargo test -p memoria-core -p cli -p server --features ollama
+
   smoke-test-server:
     name: Server Smoke Test
     runs-on: ubuntu-latest
@@ -67,6 +76,56 @@ jobs:
           for _ in $(seq 1 20); do
             curl -s -o /dev/null http://127.0.0.1:8080/health && break
             sleep 0.5
+          done
+
+      - name: Run Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_API_KEY: ci-smoke-test-key
+        run: bash scripts/smoke-test-server.sh
+
+      - name: Stop Server
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  smoke-test-server-ollama:
+    name: Server Smoke Test (real Ollama, optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Pull Ollama Models
+        run: |
+          curl -s -X POST http://127.0.0.1:11434/api/pull -d '{"name":"qwen2.5:0.5b","stream":false}'
+          curl -s -X POST http://127.0.0.1:11434/api/pull -d '{"name":"nomic-embed-text","stream":false}'
+
+      - name: Build Server (Release, ollama feature)
+        run: cargo build --release -p server --features ollama
+
+      - name: Start Server
+        env:
+          MEMORIA_API_KEY: ci-smoke-test-key
+          MEMORIA_LLM_PROVIDER: ollama
+          MEMORIA_EMBEDDING_PROVIDER: ollama
+          MEMORIA_LLM_BASE_URL: http://127.0.0.1:11434
+          MEMORIA_EMBEDDING_BASE_URL: http://127.0.0.1:11434
+        run: |
+          ./target/release/server &
+          echo $! > server.pid
+          for _ in $(seq 1 40); do
+            curl -s -o /dev/null http://127.0.0.1:8080/health && break
+            sleep 1
           done
 
       - name: Run Smoke Test
