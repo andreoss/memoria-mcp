@@ -47,6 +47,8 @@ enum Command {
         run_id: Option<String>,
         #[arg(long, default_value_t = 10, help = "Maximum number of results")]
         top_k: usize,
+        #[arg(long, help = "Exclude results whose score exceeds this value")]
+        threshold: Option<f32>,
     },
     #[command(about = "Fetch a single memory by id")]
     Get {
@@ -326,9 +328,9 @@ where
                 }
             }
         }
-        Command::Search { query, user_id, agent_id, run_id, top_k } => {
+        Command::Search { query, user_id, agent_id, run_id, top_k, threshold } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.search(&query, top_k, &scope) {
+            match memory.search(&query, top_k, &scope, threshold) {
                 Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");

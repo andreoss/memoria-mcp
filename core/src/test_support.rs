@@ -207,7 +207,13 @@ impl VectorStore for VecVectorStore {
         Ok(())
     }
 
-    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>) -> Result<Vec<SearchResult>, VectorStoreError> {
+    fn search(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filters: &HashMap<String, String>,
+        threshold: Option<f32>,
+    ) -> Result<Vec<SearchResult>, VectorStoreError> {
         let mut scored: Vec<SearchResult> = self
             .records
             .lock()
@@ -219,6 +225,9 @@ impl VectorStore for VecVectorStore {
                 SearchResult { id: r.id.clone(), score, payload: r.payload.clone() }
             })
             .collect();
+        if let Some(threshold) = threshold {
+            scored.retain(|result| result.score <= threshold);
+        }
         scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k);
         Ok(scored)

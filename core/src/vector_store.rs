@@ -81,6 +81,7 @@ pub trait VectorStore {
         vector: &[f32],
         top_k: usize,
         filters: &HashMap<String, String>,
+        threshold: Option<f32>,
     ) -> Result<Vec<SearchResult>, VectorStoreError>;
 
     #[allow(clippy::missing_errors_doc)]
@@ -135,7 +136,7 @@ pub trait VectorStoreContractTests: VectorStore {
         }
         let top_k = 2;
         let results = self
-            .search(&[0.0, 0.0], top_k, &HashMap::new())
+            .search(&[0.0, 0.0], top_k, &HashMap::new(), None)
             .expect("search should succeed");
         assert_eq!(
             results.len(),
@@ -253,9 +254,38 @@ pub trait VectorStoreContractTests: VectorStore {
             self.insert(record).expect("insert should succeed");
         }
         let results = self
-            .search(&[1.1, 0.0], 3, &HashMap::new())
+            .search(&[1.1, 0.0], 3, &HashMap::new(), None)
             .expect("search should succeed");
         assert_eq!(results.first().expect("result").id, "a", "closest vector should come first");
+    }
+
+    fn contract_search_respects_threshold(&self) {
+        let records = [
+            VectorRecord::new("close", vec![1.0, 0.0], HashMap::new()),
+            VectorRecord::new("far", vec![50.0, 50.0], HashMap::new()),
+        ];
+        for record in records {
+            self.insert(record).expect("insert should succeed");
+        }
+        let results = self
+            .search(&[1.0, 0.0], 10, &HashMap::new(), Some(1.0))
+            .expect("search should succeed");
+        assert_eq!(results.len(), 1, "only the record within the score threshold should be returned");
+        assert_eq!(results[0].id, "close");
+    }
+
+    fn contract_search_with_no_threshold_returns_everything_up_to_top_k(&self) {
+        let records = [
+            VectorRecord::new("close", vec![1.0, 0.0], HashMap::new()),
+            VectorRecord::new("far", vec![50.0, 50.0], HashMap::new()),
+        ];
+        for record in records {
+            self.insert(record).expect("insert should succeed");
+        }
+        let results = self
+            .search(&[1.0, 0.0], 10, &HashMap::new(), None)
+            .expect("search should succeed");
+        assert_eq!(results.len(), 2, "an unset threshold should not filter anything");
     }
 
     fn contract_search_filters_by_metadata_key(&self) {
@@ -274,7 +304,7 @@ pub trait VectorStoreContractTests: VectorStore {
 
         let filters = HashMap::from([("user_id".to_string(), "alice".to_string())]);
         let results = self
-            .search(&[0.0, 0.0], 10, &filters)
+            .search(&[0.0, 0.0], 10, &filters, None)
             .expect("search should succeed");
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["alice-1"], "only alice's record should match");
@@ -300,7 +330,7 @@ pub trait VectorStoreContractTests: VectorStore {
 
         let filters = HashMap::from([("agent_id".to_string(), "agent-a".to_string())]);
         let results = self
-            .search(&[0.0, 0.0], 10, &filters)
+            .search(&[0.0, 0.0], 10, &filters, None)
             .expect("search should succeed");
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["agent-a-1"], "only agent-a's record should match");
@@ -326,7 +356,7 @@ pub trait VectorStoreContractTests: VectorStore {
 
         let filters = HashMap::from([("run_id".to_string(), "run-1".to_string())]);
         let results = self
-            .search(&[0.0, 0.0], 10, &filters)
+            .search(&[0.0, 0.0], 10, &filters, None)
             .expect("search should succeed");
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["run-1-1"], "only run-1's record should match");
@@ -380,6 +410,7 @@ impl VectorStore for InMemoryVectorStore {
         vector: &[f32],
         top_k: usize,
         filters: &HashMap<String, String>,
+        threshold: Option<f32>,
     ) -> Result<Vec<SearchResult>, VectorStoreError> {
         let records = self.records.lock().expect("lock poisoned");
         let mut scored: Vec<SearchResult> = records
@@ -404,6 +435,9 @@ impl VectorStore for InMemoryVectorStore {
             })
             .collect();
         drop(records);
+        if let Some(threshold) = threshold {
+            scored.retain(|result| result.score <= threshold);
+        }
         scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k);
         Ok(scored)
@@ -484,6 +518,16 @@ mod tests {
     }
 
     #[test]
+    fn vec_store_passes_search_respects_threshold_contract() {
+        VecVectorStore::new().contract_search_respects_threshold();
+    }
+
+    #[test]
+    fn vec_store_passes_search_with_no_threshold_returns_everything_contract() {
+        VecVectorStore::new().contract_search_with_no_threshold_returns_everything_up_to_top_k();
+    }
+
+    #[test]
     fn vec_store_passes_search_filters_by_agent_id_contract() {
         VecVectorStore::new().contract_search_filters_by_agent_id();
     }
@@ -526,6 +570,16 @@ mod tests {
     #[test]
     fn in_memory_store_passes_search_orders_by_score_contract() {
         InMemoryVectorStore::new().contract_search_orders_by_score();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_respects_threshold_contract() {
+        InMemoryVectorStore::new().contract_search_respects_threshold();
+    }
+
+    #[test]
+    fn in_memory_store_passes_search_with_no_threshold_returns_everything_contract() {
+        InMemoryVectorStore::new().contract_search_with_no_threshold_returns_everything_up_to_top_k();
     }
 
     #[test]

@@ -107,6 +107,7 @@ where
         query: &str,
         top_k: usize,
         scope: &HashMap<String, String>,
+        threshold: Option<f32>,
     ) -> Result<Vec<crate::vector_store::SearchResult>, crate::CoreError> {
         if top_k == 0 {
             return Err(crate::CoreError::Validation("top_k must be greater than zero".to_string()));
@@ -121,8 +122,13 @@ where
         if !has_scope_id(scope) {
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
         }
+        if let Some(threshold) = threshold {
+            if threshold < 0.0 {
+                return Err(crate::CoreError::Validation(format!("threshold must not be negative, got {threshold}")));
+            }
+        }
         let vector = self.embedding.embed(query)?;
-        self.vector_store.search(&vector, top_k, scope).map_err(From::from)
+        self.vector_store.search(&vector, top_k, scope, threshold).map_err(From::from)
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -237,7 +243,7 @@ where
         let mut ids = Vec::new();
         for fact in &facts {
             let vector = self.embedding.embed(fact)?;
-            if let Ok(results) = self.vector_store.search(&vector, 100, &scope) {
+            if let Ok(results) = self.vector_store.search(&vector, 100, &scope, None) {
                 if results.iter().any(|r| r.payload.get("content") == Some(fact)) {
                     continue;
                 }
@@ -338,7 +344,7 @@ mod tests {
         let query = vec![1.0_f32, 1.0, 1.0, 1.0];
         let results = memory
             .vector_store
-            .search(&query, ids.len(), &s)
+            .search(&query, ids.len(), &s, None)
             .expect("search should succeed");
         assert!(
             !results.is_empty(),
@@ -532,7 +538,7 @@ mod tests {
         let _ = memory.add(&messages, scope()).expect("add should succeed");
 
         let query = "Alice engineer";
-        let results = memory.search(query, 10, &scope()).expect("search should succeed");
+        let results = memory.search(query, 10, &scope(), None).expect("search should succeed");
         assert!(
             !results.is_empty(),
             "search should return matching memories"
@@ -562,7 +568,7 @@ mod tests {
         }
 
         let query = "fact";
-        let results = memory.search(query, 3, &scope()).expect("search should succeed");
+        let results = memory.search(query, 3, &scope(), None).expect("search should succeed");
         assert!(
             results.len() <= 3,
             "search should return at most top_k results, got {}",
@@ -592,7 +598,7 @@ mod tests {
         let bob_record = VectorRecord::new("rec-2".to_string(), bob_vector, bob_payload);
         memory.vector_store.insert(bob_record).expect("insert should succeed");
 
-        let results = memory.search("engineer", 10, &alice_scope).expect("search should succeed");
+        let results = memory.search("engineer", 10, &alice_scope, None).expect("search should succeed");
         assert_eq!(
             results.len(),
             1,
@@ -604,7 +610,7 @@ mod tests {
             "returned record should be alice's"
         );
 
-        let results = memory.search("designer", 10, &bob_scope).expect("search should succeed");
+        let results = memory.search("designer", 10, &bob_scope, None).expect("search should succeed");
         assert_eq!(
             results.len(),
             1,
@@ -624,7 +630,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &scope());
+        let result = memory.search("anything", 10, &scope(), None);
         assert!(matches!(result, Ok(vec) if vec.is_empty()));
     }
 
@@ -635,8 +641,30 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 0, &scope());
+        let result = memory.search("anything", 0, &scope(), None);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_search_rejects_a_negative_threshold() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 10, &scope(), Some(-0.1));
+        assert!(matches!(result, Err(crate::CoreError::Validation(_))));
+    }
+
+    #[test]
+    fn test_search_accepts_a_zero_threshold() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.search("anything", 10, &scope(), Some(0.0));
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -646,7 +674,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 1, &scope());
+        let result = memory.search("anything", 1, &scope(), None);
         assert!(result.is_ok());
     }
 
@@ -1092,8 +1120,8 @@ mod tests {
         memory.add(&[Message::new(Role::User, "I am an engineer.")], alice_scope.clone()).expect("add should succeed");
         memory.add(&[Message::new(Role::User, "I am an engineer.")], bob_scope.clone()).expect("add should succeed");
 
-        let alice_results = memory.search("engineer", 10, &alice_scope).expect("search should succeed");
-        let bob_results = memory.search("engineer", 10, &bob_scope).expect("search should succeed");
+        let alice_results = memory.search("engineer", 10, &alice_scope, None).expect("search should succeed");
+        let bob_results = memory.search("engineer", 10, &bob_scope, None).expect("search should succeed");
 
         assert_eq!(alice_results.len(), 1, "alice should see exactly her own memory, even though bob added identical content");
         assert_eq!(bob_results.len(), 1, "bob should see exactly his own memory, even though alice added identical content");
@@ -1118,8 +1146,8 @@ mod tests {
         memory.add(&[Message::new(Role::User, "I am an engineer.")], scheduler_scope.clone()).expect("add should succeed");
         memory.add(&[Message::new(Role::User, "I am an engineer.")], support_scope.clone()).expect("add should succeed");
 
-        let scheduler_results = memory.search("engineer", 10, &scheduler_scope).expect("search should succeed");
-        let support_results = memory.search("engineer", 10, &support_scope).expect("search should succeed");
+        let scheduler_results = memory.search("engineer", 10, &scheduler_scope, None).expect("search should succeed");
+        let support_results = memory.search("engineer", 10, &support_scope, None).expect("search should succeed");
 
         assert_eq!(scheduler_results.len(), 1, "scheduler-bot should see exactly its own memory");
         assert_eq!(support_results.len(), 1, "support-bot should see exactly its own memory");
@@ -1139,12 +1167,12 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
-        let before = memory.search("engineer", 10, &scope()).expect("search should succeed");
+        let before = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
         assert!(!before.is_empty(), "expected a result before reset for this test to be meaningful");
 
         memory.reset(&scope()).expect("reset should succeed");
 
-        let after = memory.search("engineer", 10, &scope()).expect("search should succeed");
+        let after = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
         assert!(after.is_empty(), "search after reset should return nothing");
     }
 
@@ -1160,7 +1188,7 @@ mod tests {
 
         memory.update(id, Some("Alice is a senior engineer."), None).expect("update should succeed");
 
-        let results = memory.search("senior engineer", 10, &scope()).expect("search should succeed");
+        let results = memory.search("senior engineer", 10, &scope(), None).expect("search should succeed");
         assert!(
             results.iter().any(|r| r.payload.get("content") == Some(&"Alice is a senior engineer.".to_string())),
             "search after update should reflect the new content"
@@ -1266,7 +1294,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &HashMap::new());
+        let result = memory.search("anything", 10, &HashMap::new(), None);
         assert!(
             matches!(result, Err(crate::CoreError::Validation(_))),
             "search with no scope-identifying key must be rejected, not silently return every scope's records"
@@ -1281,7 +1309,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let non_scope_filter = HashMap::from([("source".to_string(), "chat_import".to_string())]);
-        let result = memory.search("anything", 10, &non_scope_filter);
+        let result = memory.search("anything", 10, &non_scope_filter, None);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -1405,7 +1433,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &scope());
+        let result = memory.search("anything", 10, &scope(), None);
         assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
     }
 
@@ -1416,7 +1444,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store).with_max_top_k(50);
 
-        let result = memory.search("anything", 51, &scope());
+        let result = memory.search("anything", 51, &scope(), None);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -1427,7 +1455,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store).with_max_top_k(50);
 
-        let result = memory.search("anything", 50, &scope());
+        let result = memory.search("anything", 50, &scope(), None);
         assert!(result.is_ok(), "top_k exactly at the configured ceiling should be accepted");
     }
 
@@ -1438,7 +1466,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 1_000_000, &scope());
+        let result = memory.search("anything", 1_000_000, &scope(), None);
         assert!(result.is_ok(), "with no configured ceiling, top_k should never be rejected for being too large");
     }
 
@@ -1452,7 +1480,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
         assert!(!ids.is_empty());
 
-        let results = memory.search("engineer", 10, &scope()).expect("search should succeed");
+        let results = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
         assert!(results.iter().any(|r| r.payload.get("content") == Some(&"Alice is an engineer.".to_string())));
 
         let id = ids.first().expect("expected at least one id");
@@ -1471,7 +1499,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
         assert!(!ids.is_empty(), "EchoLlmProvider should still produce at least one fact (extract_facts wraps the conversation before echoing it)");
 
-        let results = memory.search("Alice", 10, &scope()).expect("search should succeed");
+        let results = memory.search("Alice", 10, &scope(), None).expect("search should succeed");
         assert!(!results.is_empty(), "search should find something after adding via a different LLM provider");
     }
 

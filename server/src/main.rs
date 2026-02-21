@@ -228,6 +228,7 @@ struct SearchMemoryRequest {
     run_id: Option<String>,
     #[serde(default = "default_top_k")]
     top_k: usize,
+    threshold: Option<f32>,
 }
 
 const fn default_top_k() -> usize {
@@ -251,7 +252,7 @@ where
     };
     let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
 
-    match memory.search(&request.query, request.top_k, &scope) {
+    match memory.search(&request.query, request.top_k, &scope, request.threshold) {
         Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -1129,6 +1130,24 @@ mod tests {
         assert_eq!(status, 200);
         let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert!(!response.results.is_empty());
+    }
+
+    #[test]
+    fn handle_search_memory_honors_a_threshold() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice","threshold":0.0}"#);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.results.is_empty(), "an unreachably strict threshold should filter out the hash-based placeholder's match");
+    }
+
+    #[test]
+    fn handle_search_memory_rejects_a_negative_threshold() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, _) = handle_search_memory(&memory, br#"{"query":"anything","user_id":"alice","threshold":-1.0}"#);
+        assert_eq!(status, 400);
     }
 
     #[test]
