@@ -316,6 +316,119 @@ fn handle_auth_refresh(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], bo
     (200, serde_json::to_vec(&response).unwrap_or_default())
 }
 
+fn current_user_from_headers(
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+) -> Option<auth_store::User> {
+    let token = bearer_token(headers)?;
+    let claims = crypto::decode_jwt(token, jwt_secret, auth_store::unix_now()).ok()?;
+    let sub = claims.get("sub")?.as_str()?;
+    auth_store.find_user_by_id(sub)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UserProfileResponse {
+    id: String,
+    name: String,
+    email: String,
+    role: String,
+    onboarding_complete: bool,
+}
+
+impl From<&auth_store::User> for UserProfileResponse {
+    fn from(user: &auth_store::User) -> Self {
+        let role = match user.role {
+            auth_store::Role::Admin => "admin",
+            auth_store::Role::User => "user",
+        };
+        Self {
+            id: user.id.clone(),
+            name: user.name.clone(),
+            email: user.email.clone(),
+            role: role.to_string(),
+            onboarding_complete: user.onboarding_complete,
+        }
+    }
+}
+
+fn handle_auth_me_get(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], headers: &[(String, String)]) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    (200, serde_json::to_vec(&UserProfileResponse::from(&user)).unwrap_or_default())
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateProfileRequest {
+    name: Option<String>,
+    email: Option<String>,
+}
+
+fn handle_auth_me_patch(
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    let request: UpdateProfileRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    let Some(updated) = auth_store.update_profile(&user.id, request.name, request.email) else {
+        return (404, error_body("user not found"));
+    };
+    (200, serde_json::to_vec(&UserProfileResponse::from(&updated)).unwrap_or_default())
+}
+
+#[derive(serde::Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+fn handle_auth_change_password(
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    let request: ChangePasswordRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    if !crypto::verify_password(&request.current_password, &user.password_hash) {
+        return (401, error_body("current password is incorrect"));
+    }
+    if request.new_password.is_empty() {
+        return (400, error_body("new_password must not be empty"));
+    }
+    let new_hash = crypto::hash_password(&request.new_password);
+    auth_store.update_password_hash(&user.id, new_hash);
+    (200, serde_json::to_vec(&UserProfileResponse::from(&user)).unwrap_or_default())
+}
+
+fn handle_auth_onboarding_complete(
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    auth_store.mark_onboarding_complete(&user.id);
+    let Some(updated) = auth_store.find_user_by_id(&user.id) else {
+        return (404, error_body("user not found"));
+    };
+    (200, serde_json::to_vec(&UserProfileResponse::from(&updated)).unwrap_or_default())
+}
+
 fn handle_create_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
@@ -459,15 +572,37 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn is_authorized(configured_token: Option<&str>, headers: &[(String, String)]) -> bool {
-    let Some(expected) = configured_token else {
-        return true;
-    };
+fn bearer_token(headers: &[(String, String)]) -> Option<&str> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
         .and_then(|(_, value)| value.strip_prefix("Bearer "))
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
+fn is_authorized(
+    admin_key: Option<&str>,
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+) -> bool {
+    let Some(admin_key) = admin_key else {
+        return true;
+    };
+    if let Some(token) = bearer_token(headers) {
+        if constant_time_eq(token.as_bytes(), admin_key.as_bytes()) {
+            return true;
+        }
+        if crypto::decode_jwt(token, jwt_secret, auth_store::unix_now()).is_ok() {
+            return true;
+        }
+    }
+    if let Some(key) = find_header(headers, "x-api-key") {
+        let key_hash = crypto::sha256_hex(key.as_bytes());
+        if auth_store.find_active_api_key_by_hash(&key_hash).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -664,6 +799,79 @@ where
     jwt_secret: Vec<u8>,
 }
 
+fn dispatch_request<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest, peer_ip: IpAddr) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    if !state.rate_limiter.check_and_consume(peer_ip) {
+        return (429, error_body("rate limit exceeded"));
+    }
+    if req.method == "GET" && req.path == "/health" {
+        return handle_health();
+    }
+    if req.method == "GET" && req.path == "/ready" {
+        return handle_ready(&state.memory);
+    }
+    if req.method == "POST" && req.path == "/auth/register" {
+        let result = handle_auth_register(&state.auth_store, &state.jwt_secret, &req.body);
+        if result.0 == 201 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    if req.method == "GET" && req.path == "/auth/setup-status" {
+        return handle_auth_setup_status(&state.auth_store);
+    }
+    if req.method == "POST" && req.path == "/auth/login" {
+        let result = handle_auth_login(&state.auth_store, &state.jwt_secret, &req.body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    if req.method == "POST" && req.path == "/auth/refresh" {
+        let result = handle_auth_refresh(&state.auth_store, &state.jwt_secret, &req.body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    if !is_authorized(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers) {
+        return (401, error_body("unauthorized"));
+    }
+    if req.method == "GET" && req.path == "/auth/me" {
+        return handle_auth_me_get(&state.auth_store, &state.jwt_secret, &req.headers);
+    }
+    if req.method == "PATCH" && req.path == "/auth/me" {
+        let result = handle_auth_me_patch(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    if req.method == "POST" && req.path == "/auth/change-password" {
+        let result = handle_auth_change_password(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    if req.method == "POST" && req.path == "/auth/onboarding-complete" {
+        let result = handle_auth_onboarding_complete(&state.auth_store, &state.jwt_secret, &req.headers);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    let result = route(&state.memory, req);
+    if is_successful_mutation(&req.method, &req.path, result.0) {
+        let _ = save_store(&state.memory, &state.store_path);
+    }
+    result
+}
+
 async fn handle_connection<L, E, V>(mut stream: TcpStream, state: Arc<ServerState<L, E, V>>, peer_ip: IpAddr)
 where
     L: core::llm::LlmProvider + Send + Sync + 'static,
@@ -694,8 +902,8 @@ where
 
             if req.method == "OPTIONS" && request_origin.is_some() {
                 let mut headers: Vec<(String, String)> = cors_header.into_iter().collect();
-                headers.push(("Access-Control-Allow-Methods".to_string(), "GET, POST, PUT, DELETE".to_string()));
-                headers.push(("Access-Control-Allow-Headers".to_string(), "Content-Type, Authorization".to_string()));
+                headers.push(("Access-Control-Allow-Methods".to_string(), "GET, POST, PUT, PATCH, DELETE".to_string()));
+                headers.push(("Access-Control-Allow-Headers".to_string(), "Content-Type, Authorization, X-API-Key".to_string()));
                 eprintln!("{}", format_log_line(&req.method, &req.path, 204));
                 let response = build_response_with_headers(204, b"", &headers);
                 let _ = stream.write_all(&response).await;
@@ -704,41 +912,7 @@ where
 
             let blocking_state = Arc::clone(&state);
             let (status, body) = tokio::task::spawn_blocking(move || {
-                let (status, body) = if !blocking_state.rate_limiter.check_and_consume(peer_ip) {
-                    (429, error_body("rate limit exceeded"))
-                } else if req.method == "GET" && req.path == "/health" {
-                    handle_health()
-                } else if req.method == "GET" && req.path == "/ready" {
-                    handle_ready(&blocking_state.memory)
-                } else if req.method == "POST" && req.path == "/auth/register" {
-                    let result = handle_auth_register(&blocking_state.auth_store, &blocking_state.jwt_secret, &req.body);
-                    if result.0 == 201 {
-                        let _ = blocking_state.auth_store.save(&blocking_state.auth_store_path);
-                    }
-                    result
-                } else if req.method == "GET" && req.path == "/auth/setup-status" {
-                    handle_auth_setup_status(&blocking_state.auth_store)
-                } else if req.method == "POST" && req.path == "/auth/login" {
-                    let result = handle_auth_login(&blocking_state.auth_store, &blocking_state.jwt_secret, &req.body);
-                    if result.0 == 200 {
-                        let _ = blocking_state.auth_store.save(&blocking_state.auth_store_path);
-                    }
-                    result
-                } else if req.method == "POST" && req.path == "/auth/refresh" {
-                    let result = handle_auth_refresh(&blocking_state.auth_store, &blocking_state.jwt_secret, &req.body);
-                    if result.0 == 200 {
-                        let _ = blocking_state.auth_store.save(&blocking_state.auth_store_path);
-                    }
-                    result
-                } else if is_authorized(blocking_state.token.as_deref(), &req.headers) {
-                    let result = route(&blocking_state.memory, &req);
-                    if is_successful_mutation(&req.method, &req.path, result.0) {
-                        let _ = save_store(&blocking_state.memory, &blocking_state.store_path);
-                    }
-                    result
-                } else {
-                    (401, error_body("unauthorized"))
-                };
+                let (status, body) = dispatch_request(&blocking_state, &req, peer_ip);
                 eprintln!("{}", format_log_line(&req.method, &req.path, status));
                 (status, body)
             })
@@ -1364,8 +1538,7 @@ mod tests {
     #[test]
     fn handle_auth_login_happy_path_returns_200_with_real_tokens() {
         let store = auth_store::AuthStore::new();
-        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
-        handle_auth_register(&store, b"jwt-secret", register_body);
+        seed_user_cheaply(&store, "correct horse battery staple");
 
         let login_body = br#"{"email":"alice@example.com","password":"correct horse battery staple"}"#;
         let (status, response_body) = handle_auth_login(&store, b"jwt-secret", login_body);
@@ -1377,8 +1550,7 @@ mod tests {
     #[test]
     fn handle_auth_login_rejects_the_wrong_password() {
         let store = auth_store::AuthStore::new();
-        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
-        handle_auth_register(&store, b"jwt-secret", register_body);
+        seed_user_cheaply(&store, "correct horse battery staple");
 
         let login_body = br#"{"email":"alice@example.com","password":"wrong password"}"#;
         let (status, _) = handle_auth_login(&store, b"jwt-secret", login_body);
@@ -1405,9 +1577,7 @@ mod tests {
     #[test]
     fn handle_auth_refresh_happy_path_rotates_and_returns_a_new_access_token() {
         let store = auth_store::AuthStore::new();
-        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
-        let (_, register_response) = handle_auth_register(&store, b"jwt-secret", register_body);
-        let tokens: AuthTokenResponse = serde_json::from_slice(&register_response).expect("expected valid JSON");
+        let tokens = seed_user_cheaply_and_issue_tokens(&store, "correct horse battery staple");
 
         let refresh_body = serde_json::to_vec(&serde_json::json!({"refresh_token": tokens.refresh_token})).expect("valid JSON");
         let (status, response_body) = handle_auth_refresh(&store, b"jwt-secret", &refresh_body);
@@ -1420,9 +1590,7 @@ mod tests {
     #[test]
     fn handle_auth_refresh_rejects_reuse_of_an_already_rotated_token() {
         let store = auth_store::AuthStore::new();
-        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
-        let (_, register_response) = handle_auth_register(&store, b"jwt-secret", register_body);
-        let tokens: AuthTokenResponse = serde_json::from_slice(&register_response).expect("expected valid JSON");
+        let tokens = seed_user_cheaply_and_issue_tokens(&store, "correct horse battery staple");
 
         let refresh_body = serde_json::to_vec(&serde_json::json!({"refresh_token": tokens.refresh_token})).expect("valid JSON");
         handle_auth_refresh(&store, b"jwt-secret", &refresh_body);
@@ -1443,6 +1611,126 @@ mod tests {
         let store = auth_store::AuthStore::new();
         let (status, _) = handle_auth_refresh(&store, b"jwt-secret", b"not json");
         assert_eq!(status, 400);
+    }
+
+    const CHEAP_NON_PRODUCTION_ITERATIONS_FOR_TEST_SETUP: u32 = 10;
+
+    fn seed_user_cheaply(store: &auth_store::AuthStore, password: &str) -> auth_store::User {
+        let password_hash = crypto::hash_password_with_iterations(password, CHEAP_NON_PRODUCTION_ITERATIONS_FOR_TEST_SETUP);
+        let user =
+            auth_store::User::new("Alice".to_string(), "alice@example.com".to_string(), password_hash, auth_store::Role::Admin);
+        store.insert_user(user.clone());
+        user
+    }
+
+    fn seed_user_cheaply_and_issue_tokens(store: &auth_store::AuthStore, password: &str) -> AuthTokenResponse {
+        let user = seed_user_cheaply(store, password);
+        issue_auth_tokens(store, b"jwt-secret", &user)
+    }
+
+    fn seed_user_cheaply_and_get_access_token(store: &auth_store::AuthStore, password: &str) -> String {
+        seed_user_cheaply_and_issue_tokens(store, password).access_token
+    }
+
+    fn bearer_headers(token: &str) -> Vec<(String, String)> {
+        vec![("Authorization".to_string(), format!("Bearer {token}"))]
+    }
+
+    #[test]
+    fn handle_auth_me_get_returns_the_real_authenticated_users_profile() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (status, body) = handle_auth_me_get(&store, b"jwt-secret", &bearer_headers(&token));
+        assert_eq!(status, 200);
+        let profile: UserProfileResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(profile.email, "alice@example.com");
+        assert_eq!(profile.role, "admin");
+    }
+
+    #[test]
+    fn handle_auth_me_get_rejects_a_missing_token() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_auth_me_get(&store, b"jwt-secret", &[]);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_me_get_rejects_a_token_signed_by_a_different_secret() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (status, _) = handle_auth_me_get(&store, b"a-different-secret", &bearer_headers(&token));
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_me_patch_updates_the_real_stored_name() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let body = br#"{"name":"Alicia"}"#;
+        let (status, response) = handle_auth_me_patch(&store, b"jwt-secret", &bearer_headers(&token), body);
+        assert_eq!(status, 200);
+        let profile: UserProfileResponse = serde_json::from_slice(&response).expect("expected valid JSON");
+        assert_eq!(profile.name, "Alicia");
+        assert_eq!(profile.email, "alice@example.com", "email must be unchanged when not provided");
+    }
+
+    #[test]
+    fn handle_auth_me_patch_rejects_a_missing_token() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_auth_me_patch(&store, b"jwt-secret", &[], br#"{"name":"X"}"#);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_change_password_then_login_succeeds_with_the_new_password() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let change_body = br#"{"current_password":"correct horse battery staple","new_password":"a brand new password"}"#;
+        let (status, _) = handle_auth_change_password(&store, b"jwt-secret", &bearer_headers(&token), change_body);
+        assert_eq!(status, 200);
+
+        let login_body = br#"{"email":"alice@example.com","password":"a brand new password"}"#;
+        let (login_status, _) = handle_auth_login(&store, b"jwt-secret", login_body);
+        assert_eq!(login_status, 200);
+
+        let old_login_body = br#"{"email":"alice@example.com","password":"correct horse battery staple"}"#;
+        let (old_login_status, _) = handle_auth_login(&store, b"jwt-secret", old_login_body);
+        assert_eq!(old_login_status, 401, "the old password must no longer work");
+    }
+
+    #[test]
+    fn handle_auth_change_password_rejects_the_wrong_current_password() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let body = br#"{"current_password":"wrong password","new_password":"a brand new password"}"#;
+        let (status, _) = handle_auth_change_password(&store, b"jwt-secret", &bearer_headers(&token), body);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_change_password_rejects_an_empty_new_password() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let body = br#"{"current_password":"correct horse battery staple","new_password":""}"#;
+        let (status, _) = handle_auth_change_password(&store, b"jwt-secret", &bearer_headers(&token), body);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_auth_onboarding_complete_flips_the_real_flag() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (status, response) = handle_auth_onboarding_complete(&store, b"jwt-secret", &bearer_headers(&token));
+        assert_eq!(status, 200);
+        let profile: UserProfileResponse = serde_json::from_slice(&response).expect("expected valid JSON");
+        assert!(profile.onboarding_complete);
+    }
+
+    #[test]
+    fn handle_auth_onboarding_complete_rejects_a_missing_token() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_auth_onboarding_complete(&store, b"jwt-secret", &[]);
+        assert_eq!(status, 401);
     }
 
     #[test]
@@ -1669,31 +1957,90 @@ mod tests {
     }
 
     #[test]
-    fn is_authorized_with_no_configured_token_allows_anything() {
-        assert!(is_authorized(None, &[]));
+    fn is_authorized_with_no_configured_admin_key_allows_anything() {
+        let store = auth_store::AuthStore::new();
+        assert!(is_authorized(None, &store, b"jwt-secret", &[]));
     }
 
     #[test]
-    fn is_authorized_with_correct_bearer_token_succeeds() {
+    fn is_authorized_with_correct_admin_bearer_token_succeeds() {
+        let store = auth_store::AuthStore::new();
         let headers = vec![("Authorization".to_string(), "Bearer secret".to_string())];
-        assert!(is_authorized(Some("secret"), &headers));
+        assert!(is_authorized(Some("secret"), &store, b"jwt-secret", &headers));
     }
 
     #[test]
     fn is_authorized_with_wrong_bearer_token_fails() {
+        let store = auth_store::AuthStore::new();
         let headers = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        assert!(!is_authorized(Some("secret"), &headers));
+        assert!(!is_authorized(Some("secret"), &store, b"jwt-secret", &headers));
     }
 
     #[test]
     fn is_authorized_with_missing_header_fails() {
-        assert!(!is_authorized(Some("secret"), &[]));
+        let store = auth_store::AuthStore::new();
+        assert!(!is_authorized(Some("secret"), &store, b"jwt-secret", &[]));
     }
 
     #[test]
     fn is_authorized_with_header_missing_bearer_prefix_fails() {
+        let store = auth_store::AuthStore::new();
         let headers = vec![("Authorization".to_string(), "secret".to_string())];
-        assert!(!is_authorized(Some("secret"), &headers));
+        assert!(!is_authorized(Some("secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_a_real_valid_jwt_succeeds() {
+        let store = auth_store::AuthStore::new();
+        let claims = serde_json::json!({"sub": "user-1", "exp": auth_store::unix_now() + 900});
+        let token = crypto::encode_jwt(&claims, b"jwt-secret");
+        let headers = vec![("Authorization".to_string(), format!("Bearer {token}"))];
+        assert!(is_authorized(Some("admin-secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_an_expired_jwt_fails() {
+        let store = auth_store::AuthStore::new();
+        let claims = serde_json::json!({"sub": "user-1", "exp": 0});
+        let token = crypto::encode_jwt(&claims, b"jwt-secret");
+        let headers = vec![("Authorization".to_string(), format!("Bearer {token}"))];
+        assert!(!is_authorized(Some("admin-secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_a_jwt_signed_by_a_different_secret_fails() {
+        let store = auth_store::AuthStore::new();
+        let claims = serde_json::json!({"sub": "user-1", "exp": auth_store::unix_now() + 900});
+        let token = crypto::encode_jwt(&claims, b"a-different-secret");
+        let headers = vec![("Authorization".to_string(), format!("Bearer {token}"))];
+        assert!(!is_authorized(Some("admin-secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_a_real_active_api_key_succeeds() {
+        let store = auth_store::AuthStore::new();
+        let key_hash = crypto::sha256_hex(b"a-real-api-key");
+        store.insert_api_key(auth_store::ApiKey::new("user-1".to_string(), "ci".to_string(), key_hash, "prefix".to_string()));
+        let headers = vec![("X-API-Key".to_string(), "a-real-api-key".to_string())];
+        assert!(is_authorized(Some("admin-secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_a_revoked_api_key_fails() {
+        let store = auth_store::AuthStore::new();
+        let key_hash = crypto::sha256_hex(b"a-real-api-key");
+        let mut key = auth_store::ApiKey::new("user-1".to_string(), "ci".to_string(), key_hash, "prefix".to_string());
+        key.revoked_at = Some(auth_store::unix_now());
+        store.insert_api_key(key);
+        let headers = vec![("X-API-Key".to_string(), "a-real-api-key".to_string())];
+        assert!(!is_authorized(Some("admin-secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn is_authorized_with_an_unknown_api_key_fails() {
+        let store = auth_store::AuthStore::new();
+        let headers = vec![("X-API-Key".to_string(), "never-issued".to_string())];
+        assert!(!is_authorized(Some("admin-secret"), &store, b"jwt-secret", &headers));
     }
 
     #[test]
@@ -2123,8 +2470,11 @@ mod tests {
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 204"), "got: {response_text}");
-            assert!(response_text.contains("Access-Control-Allow-Methods: GET, POST, PUT, DELETE\r\n"), "got: {response_text}");
-            assert!(response_text.contains("Access-Control-Allow-Headers: Content-Type, Authorization\r\n"), "got: {response_text}");
+            assert!(response_text.contains("Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE\r\n"), "got: {response_text}");
+            assert!(
+                response_text.contains("Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key\r\n"),
+                "got: {response_text}"
+            );
         });
     }
 

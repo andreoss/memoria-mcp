@@ -1,9 +1,18 @@
 #![allow(dead_code)]
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().fold(String::with_capacity(digest.len() * 2), |mut out, b| {
+        use std::fmt::Write;
+        write!(out, "{b:02x}").expect("writing to a String never fails");
+        out
+    })
+}
 
 const HASH_LEN: usize = 32;
 const SALT_LEN: usize = 16;
@@ -46,7 +55,7 @@ pub fn hash_password(password: &str) -> String {
     hash_password_with_iterations(password, PBKDF2_ITERATIONS)
 }
 
-fn hash_password_with_iterations(password: &str, iterations: u32) -> String {
+pub fn hash_password_with_iterations(password: &str, iterations: u32) -> String {
     let mut salt = [0u8; SALT_LEN];
     getrandom::fill(&mut salt).expect("the OS random source is available");
     let hash = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations, HASH_LEN);
@@ -137,6 +146,26 @@ pub fn decode_jwt(token: &str, secret: &[u8], now_unix: u64) -> Result<serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_matches_the_real_empty_string_vector() {
+        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn sha256_hex_matches_a_real_known_vector() {
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn sha256_hex_is_deterministic() {
+        assert_eq!(sha256_hex(b"same input"), sha256_hex(b"same input"));
+    }
+
+    #[test]
+    fn sha256_hex_differs_for_different_input() {
+        assert_ne!(sha256_hex(b"input a"), sha256_hex(b"input b"));
+    }
 
     #[test]
     fn pbkdf2_matches_a_real_vector_one_iteration() {

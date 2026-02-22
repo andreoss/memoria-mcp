@@ -35,11 +35,13 @@ pub struct User {
     pub password_hash: String,
     pub role: Role,
     pub created_at: u64,
+    #[serde(default)]
+    pub onboarding_complete: bool,
 }
 
 impl User {
     pub fn new(name: String, email: String, password_hash: String, role: Role) -> Self {
-        Self { id: next_id("user"), name, email, password_hash, role, created_at: unix_now() }
+        Self { id: next_id("user"), name, email, password_hash, role, created_at: unix_now(), onboarding_complete: false }
     }
 }
 
@@ -177,6 +179,45 @@ impl AuthStore {
         self.users.lock().expect("auth store users lock poisoned").iter().find(|u| u.id == id).cloned()
     }
 
+    pub fn update_profile(&self, id: &str, name: Option<String>, email: Option<String>) -> Option<User> {
+        let mut users = self.users.lock().expect("auth store users lock poisoned");
+        let Some(user) = users.iter_mut().find(|u| u.id == id) else {
+            drop(users);
+            return None;
+        };
+        if let Some(name) = name {
+            user.name = name;
+        }
+        if let Some(email) = email {
+            user.email = email;
+        }
+        let updated = user.clone();
+        drop(users);
+        Some(updated)
+    }
+
+    pub fn update_password_hash(&self, id: &str, new_password_hash: String) -> bool {
+        let mut users = self.users.lock().expect("auth store users lock poisoned");
+        let Some(user) = users.iter_mut().find(|u| u.id == id) else {
+            drop(users);
+            return false;
+        };
+        user.password_hash = new_password_hash;
+        drop(users);
+        true
+    }
+
+    pub fn mark_onboarding_complete(&self, id: &str) -> bool {
+        let mut users = self.users.lock().expect("auth store users lock poisoned");
+        let Some(user) = users.iter_mut().find(|u| u.id == id) else {
+            drop(users);
+            return false;
+        };
+        user.onboarding_complete = true;
+        drop(users);
+        true
+    }
+
     pub fn insert_api_key(&self, key: ApiKey) {
         self.api_keys.lock().expect("auth store api_keys lock poisoned").push(key);
     }
@@ -189,6 +230,15 @@ impl AuthStore {
             .filter(|k| k.user_id == user_id)
             .cloned()
             .collect()
+    }
+
+    pub fn find_active_api_key_by_hash(&self, key_hash: &str) -> Option<ApiKey> {
+        self.api_keys
+            .lock()
+            .expect("auth store api_keys lock poisoned")
+            .iter()
+            .find(|k| k.key_hash == key_hash && k.is_active())
+            .cloned()
     }
 }
 
@@ -238,6 +288,63 @@ mod tests {
     }
 
     #[test]
+    fn new_user_starts_with_onboarding_incomplete() {
+        let user = User::new("A".to_string(), "a@x.com".to_string(), "h".to_string(), Role::Admin);
+        assert!(!user.onboarding_complete);
+    }
+
+    #[test]
+    fn update_profile_changes_only_the_provided_fields() {
+        let store = AuthStore::new();
+        let user = User::new("Alice".to_string(), "alice@example.com".to_string(), "h".to_string(), Role::Admin);
+        store.insert_user(user.clone());
+
+        let updated = store.update_profile(&user.id, Some("Alicia".to_string()), None).expect("update must succeed");
+        assert_eq!(updated.name, "Alicia");
+        assert_eq!(updated.email, "alice@example.com", "email must be unchanged when not provided");
+    }
+
+    #[test]
+    fn update_profile_returns_none_for_an_unknown_id() {
+        let store = AuthStore::new();
+        assert!(store.update_profile("never-existed", Some("X".to_string()), None).is_none());
+    }
+
+    #[test]
+    fn update_password_hash_replaces_the_real_stored_hash() {
+        let store = AuthStore::new();
+        let user = User::new("Alice".to_string(), "alice@example.com".to_string(), "old-hash".to_string(), Role::Admin);
+        store.insert_user(user.clone());
+
+        assert!(store.update_password_hash(&user.id, "new-hash".to_string()));
+        let reloaded = store.find_user_by_id(&user.id).expect("user must still exist");
+        assert_eq!(reloaded.password_hash, "new-hash");
+    }
+
+    #[test]
+    fn update_password_hash_returns_false_for_an_unknown_id() {
+        let store = AuthStore::new();
+        assert!(!store.update_password_hash("never-existed", "new-hash".to_string()));
+    }
+
+    #[test]
+    fn mark_onboarding_complete_flips_the_real_flag() {
+        let store = AuthStore::new();
+        let user = User::new("Alice".to_string(), "alice@example.com".to_string(), "h".to_string(), Role::Admin);
+        store.insert_user(user.clone());
+
+        assert!(store.mark_onboarding_complete(&user.id));
+        let reloaded = store.find_user_by_id(&user.id).expect("user must still exist");
+        assert!(reloaded.onboarding_complete);
+    }
+
+    #[test]
+    fn mark_onboarding_complete_returns_false_for_an_unknown_id() {
+        let store = AuthStore::new();
+        assert!(!store.mark_onboarding_complete("never-existed"));
+    }
+
+    #[test]
     fn a_new_api_key_is_active_and_a_revoked_one_is_not() {
         let mut key = ApiKey::new("user-1".to_string(), "label".to_string(), "hash".to_string(), "prefix".to_string());
         assert!(key.is_active());
@@ -253,6 +360,29 @@ mod tests {
         let keys = store.find_api_keys_by_user("user-1");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].label, "a");
+    }
+
+    #[test]
+    fn find_active_api_key_by_hash_finds_a_real_active_key() {
+        let store = AuthStore::new();
+        store.insert_api_key(ApiKey::new("user-1".to_string(), "ci key".to_string(), "real-hash".to_string(), "prefix".to_string()));
+        let found = store.find_active_api_key_by_hash("real-hash").expect("the active key must be found");
+        assert_eq!(found.label, "ci key");
+    }
+
+    #[test]
+    fn find_active_api_key_by_hash_ignores_a_revoked_key() {
+        let store = AuthStore::new();
+        let mut key = ApiKey::new("user-1".to_string(), "ci key".to_string(), "real-hash".to_string(), "prefix".to_string());
+        key.revoked_at = Some(unix_now());
+        store.insert_api_key(key);
+        assert!(store.find_active_api_key_by_hash("real-hash").is_none());
+    }
+
+    #[test]
+    fn find_active_api_key_by_hash_returns_none_for_an_unknown_hash() {
+        let store = AuthStore::new();
+        assert!(store.find_active_api_key_by_hash("never-issued").is_none());
     }
 
     #[test]
