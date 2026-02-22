@@ -2,6 +2,7 @@
 
 mod auth_store;
 mod crypto;
+mod request_log;
 
 use core::embedding::LocalHashEmbeddingProvider;
 use core::llm::{LocalSentenceLlmProvider, Message, Role};
@@ -784,6 +785,40 @@ fn is_authorized(
     false
 }
 
+fn caller_is_admin(
+    admin_key: Option<&str>,
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+) -> bool {
+    if let Some(admin_key) = admin_key {
+        if let Some(token) = bearer_token(headers) {
+            if constant_time_eq(token.as_bytes(), admin_key.as_bytes()) {
+                return true;
+            }
+        }
+    }
+    current_user_from_headers(auth_store, jwt_secret, headers).is_some_and(|user| matches!(user.role, auth_store::Role::Admin))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RequestLogResponse {
+    requests: Vec<request_log::RequestLogEntry>,
+}
+
+fn handle_get_requests(
+    admin_key: Option<&str>,
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    request_log: &request_log::RequestLogStore,
+    headers: &[(String, String)],
+) -> (u16, Vec<u8>) {
+    if !caller_is_admin(admin_key, auth_store, jwt_secret, headers) {
+        return (403, error_body("admin access required"));
+    }
+    (200, serde_json::to_vec(&RequestLogResponse { requests: request_log.all() }).unwrap_or_default())
+}
+
 fn parse_query(query: &str) -> HashMap<String, String> {
     query
         .split('&')
@@ -978,6 +1013,7 @@ where
     auth_store: auth_store::AuthStore,
     auth_store_path: PathBuf,
     jwt_secret: Vec<u8>,
+    request_log: request_log::RequestLogStore,
 }
 
 fn dispatch_request<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest, peer_ip: IpAddr) -> (u16, Vec<u8>)
@@ -1077,6 +1113,9 @@ where
     if req.method == "POST" && req.path == "/generate-instructions" {
         return handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some());
     }
+    if req.method == "GET" && req.path == "/requests" {
+        return handle_get_requests(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &state.request_log, &req.headers);
+    }
     let result = route(&state.memory, req);
     if is_successful_mutation(&req.method, &req.path, result.0) {
         let _ = save_store(&state.memory, &state.store_path);
@@ -1124,7 +1163,17 @@ where
 
             let blocking_state = Arc::clone(&state);
             let (status, body) = tokio::task::spawn_blocking(move || {
+                let start = Instant::now();
                 let (status, body) = dispatch_request(&blocking_state, &req, peer_ip);
+                let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                blocking_state.request_log.append(request_log::RequestLogEntry {
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    status,
+                    latency_ms,
+                    auth_kind: request_log::classify_auth_kind(&req.headers).to_string(),
+                    created_at: auth_store::unix_now(),
+                });
                 eprintln!("{}", format_log_line(&req.method, &req.path, status));
                 (status, body)
             })
@@ -1239,6 +1288,7 @@ fn main() {
         auth_store,
         auth_store_path,
         jwt_secret,
+        request_log: request_log::RequestLogStore::new(),
     });
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
@@ -1301,12 +1351,26 @@ mod tests {
             auth_store: auth_store::AuthStore::new(),
             auth_store_path: test_auth_store_path(),
             jwt_secret: test_jwt_secret(),
+            request_log: request_log::RequestLogStore::new(),
         })
     }
 
     async fn post_over_tcp(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        post_over_tcp_with_headers(addr, path, body, &[]).await
+    }
+
+    async fn post_over_tcp_with_headers(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
-        let request = format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+        let mut request = format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n", body.len());
+        for (name, value) in headers {
+            let _ = std::fmt::Write::write_fmt(&mut request, format_args!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
         stream.write_all(request.as_bytes()).await.expect("write should succeed");
         stream.write_all(body).await.expect("write should succeed");
         let mut response = Vec::new();
@@ -2439,6 +2503,64 @@ mod tests {
     }
 
     #[test]
+    fn caller_is_admin_with_the_real_admin_key_succeeds() {
+        let store = auth_store::AuthStore::new();
+        let headers = vec![("Authorization".to_string(), "Bearer admin-secret".to_string())];
+        assert!(caller_is_admin(Some("admin-secret"), &store, b"jwt-secret", &headers));
+    }
+
+    #[test]
+    fn caller_is_admin_with_an_admin_role_jwt_succeeds() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        assert!(caller_is_admin(Some("admin-secret"), &store, b"jwt-secret", &bearer_headers(&token)));
+    }
+
+    #[test]
+    fn caller_is_admin_with_a_non_admin_role_jwt_fails() {
+        let store = auth_store::AuthStore::new();
+        let password_hash = crypto::hash_password_with_iterations("password", CHEAP_NON_PRODUCTION_ITERATIONS_FOR_TEST_SETUP);
+        let user = auth_store::User::new("Bob".to_string(), "bob@example.com".to_string(), password_hash, auth_store::Role::User);
+        store.insert_user(user.clone());
+        let token = issue_auth_tokens(&store, b"jwt-secret", &user).access_token;
+        assert!(!caller_is_admin(Some("admin-secret"), &store, b"jwt-secret", &bearer_headers(&token)));
+    }
+
+    #[test]
+    fn caller_is_admin_with_no_credential_fails() {
+        let store = auth_store::AuthStore::new();
+        assert!(!caller_is_admin(Some("admin-secret"), &store, b"jwt-secret", &[]));
+    }
+
+    #[test]
+    fn handle_get_requests_returns_the_real_log_for_an_admin() {
+        let store = auth_store::AuthStore::new();
+        let log = request_log::RequestLogStore::new();
+        log.append(request_log::RequestLogEntry {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            status: 200,
+            latency_ms: 1,
+            auth_kind: "none".to_string(),
+            created_at: 0,
+        });
+        let headers = vec![("Authorization".to_string(), "Bearer admin-secret".to_string())];
+        let (status, body) = handle_get_requests(Some("admin-secret"), &store, b"jwt-secret", &log, &headers);
+        assert_eq!(status, 200);
+        let response: RequestLogResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(response.requests.len(), 1);
+        assert_eq!(response.requests[0].path, "/health");
+    }
+
+    #[test]
+    fn handle_get_requests_rejects_a_non_admin_caller() {
+        let store = auth_store::AuthStore::new();
+        let log = request_log::RequestLogStore::new();
+        let (status, _) = handle_get_requests(Some("admin-secret"), &store, b"jwt-secret", &log, &[]);
+        assert_eq!(status, 403);
+    }
+
+    #[test]
     fn parse_query_extracts_key_value_pairs() {
         let params = parse_query("offset=5&limit=10");
         assert_eq!(params.get("offset"), Some(&"5".to_string()));
@@ -2584,6 +2706,85 @@ mod tests {
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
             assert!(response_text.contains("\"access_token\""));
+        });
+    }
+
+    async fn get_over_tcp(addr: std::net::SocketAddr, path: &str, headers: &[(&str, &str)]) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+        let mut request = format!("GET {path} HTTP/1.1\r\nContent-Length: 0\r\n");
+        for (name, value) in headers {
+            let _ = std::fmt::Write::write_fmt(&mut request, format_args!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write should succeed");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.expect("read should succeed");
+        let text = String::from_utf8(response).expect("response should be valid utf8");
+        let status: u16 = text.split_whitespace().nth(1).expect("a status line").parse().expect("a numeric status");
+        let json_start = text.find("\r\n\r\n").expect("a header/body separator") + 4;
+        (status, text.as_bytes()[json_start..].to_vec())
+    }
+
+    #[test]
+    fn server_logs_real_requests_and_reports_them_over_get_requests() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state =
+                test_state(memory, Some("admin-secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
+
+            let (health_status, _) = get_over_tcp(addr, "/health", &[]).await;
+            assert_eq!(health_status, 200);
+
+            let (requests_status, requests_body) =
+                get_over_tcp(addr, "/requests", &[("Authorization", "Bearer admin-secret")]).await;
+            assert_eq!(requests_status, 200);
+            let response: RequestLogResponse = serde_json::from_slice(&requests_body).expect("expected valid JSON");
+            let health_entry = response.requests.iter().find(|r| r.path == "/health").expect("the real health request must be logged");
+            assert_eq!(health_entry.status, 200);
+            assert_eq!(health_entry.auth_kind, "none");
+        });
+    }
+
+    #[test]
+    fn server_rejects_get_requests_for_a_non_admin_caller_over_tcp() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state =
+                test_state(memory, Some("admin-secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
+
+            let (register_status, register_body) = post_over_tcp(
+                addr,
+                "/auth/register",
+                br#"{"name":"Bob","email":"bob@example.com","password":"a real password"}"#,
+            )
+            .await;
+            assert_eq!(register_status, 201);
+            let registered: AuthTokenResponse = serde_json::from_slice(&register_body).expect("expected valid JSON");
+            let auth_header = format!("Bearer {}", registered.access_token);
+
+            let (create_key_status, create_key_body) = post_over_tcp_with_headers(
+                addr,
+                "/api-keys",
+                br#"{"label":"ci key"}"#,
+                &[("Authorization", &auth_header)],
+            )
+            .await;
+            assert_eq!(create_key_status, 201);
+            let created: CreateApiKeyResponse = serde_json::from_slice(&create_key_body).expect("expected valid JSON");
+
+            let (status, _) = get_over_tcp(addr, "/requests", &[("X-API-Key", &created.key)]).await;
+            assert_eq!(
+                status, 403,
+                "an API key must not be treated as admin just because the user who owns it is -- only a JWT's real role claim counts"
+            );
         });
     }
 
