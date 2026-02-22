@@ -171,6 +171,7 @@ struct CreateMemoryRequest {
     agent_id: Option<String>,
     run_id: Option<String>,
     infer: Option<bool>,
+    memory_type: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -636,7 +637,10 @@ where
         Ok(request) => request,
         Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
     };
-    let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+    let mut scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+    if let Some(memory_type) = request.memory_type {
+        scope.insert("memory_type".to_string(), memory_type);
+    }
     let infer = request.infer.unwrap_or(true);
 
     let messages = if let Some(inputs) = request.messages {
@@ -2301,6 +2305,37 @@ mod tests {
         let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
         let (status, _) = handle_create_memory(&memory, body);
         assert_eq!(status, 201, "omitting infer must not change today's default behavior");
+    }
+
+    #[test]
+    fn handle_create_memory_stores_a_real_memory_type_on_the_payload() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"Alice is an engineer.","user_id":"alice","memory_type":"procedural","infer":false}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("memory_type"), Some(&"procedural".to_string()));
+    }
+
+    #[test]
+    fn handle_create_memory_with_no_memory_type_leaves_the_payload_field_absent() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"Alice is an engineer.","user_id":"alice","infer":false}"#;
+        let (_, response_body) = handle_create_memory(&memory, body);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("memory_type"), None);
+    }
+
+    #[test]
+    fn handle_create_memory_accepts_any_real_memory_type_string_unvalidated() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"x","user_id":"alice","memory_type":"totally-made-up-type","infer":false}"#;
+        let (status, _) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201, "memory_type is opaque and must not be validated against a fixed set");
     }
 
     #[test]
