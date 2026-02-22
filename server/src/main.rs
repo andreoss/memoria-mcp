@@ -36,6 +36,20 @@ fn resolve_store_path(env_override: Option<&str>, home: &str) -> PathBuf {
     Path::new(home).join(".memoria").join("server-store.json")
 }
 
+fn resolve_auth_store_path(env_override: Option<&str>, home: &str) -> PathBuf {
+    if let Some(p) = env_override {
+        return PathBuf::from(p);
+    }
+    Path::new(home).join(".memoria").join("auth-store.json")
+}
+
+fn resolve_jwt_secret(env: Option<String>) -> Result<Vec<u8>, String> {
+    match env {
+        Some(secret) if !secret.is_empty() => Ok(secret.into_bytes()),
+        _ => Err("refusing to start: no MEMORIA_JWT_SECRET configured (ADR-29)".to_string()),
+    }
+}
+
 fn load_store(path: &Path) -> InMemoryVectorStore {
     let store = InMemoryVectorStore::new();
     if let Ok(data) = std::fs::read_to_string(path) {
@@ -190,6 +204,62 @@ fn error_response(err: &core::CoreError) -> (u16, Vec<u8>) {
         core::CoreError::NotFound(msg) => (404, error_body(msg.clone())),
         other => (500, error_body(other.to_string())),
     }
+}
+
+const ACCESS_TOKEN_TTL_SECS: u64 = 900;
+
+#[derive(serde::Deserialize)]
+struct RegisterRequest {
+    name: String,
+    email: String,
+    password: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuthTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SetupStatusResponse {
+    setup_complete: bool,
+}
+
+fn issue_auth_tokens(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], user: &auth_store::User) -> AuthTokenResponse {
+    let now = auth_store::unix_now();
+    let role_str = match user.role {
+        auth_store::Role::Admin => "admin",
+        auth_store::Role::User => "user",
+    };
+    let claims = serde_json::json!({"sub": user.id, "role": role_str, "iat": now, "exp": now + ACCESS_TOKEN_TTL_SECS});
+    let access_token = crypto::encode_jwt(&claims, jwt_secret);
+    let refresh_token = auth_store.issue_refresh_token(&user.id);
+    AuthTokenResponse { access_token, refresh_token, token_type: "bearer".to_string() }
+}
+
+fn handle_auth_register(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], body: &[u8]) -> (u16, Vec<u8>) {
+    if !auth_store::registration_is_allowed(auth_store.user_count()) {
+        return (403, error_body("registration is closed: an account already exists"));
+    }
+    let request: RegisterRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    if request.name.is_empty() || request.email.is_empty() || request.password.is_empty() {
+        return (400, error_body("name, email, and password must not be empty"));
+    }
+    let password_hash = crypto::hash_password(&request.password);
+    let user = auth_store::User::new(request.name, request.email, password_hash, auth_store::Role::Admin);
+    auth_store.insert_user(user.clone());
+    let tokens = issue_auth_tokens(auth_store, jwt_secret, &user);
+    (201, serde_json::to_vec(&tokens).unwrap_or_default())
+}
+
+fn handle_auth_setup_status(auth_store: &auth_store::AuthStore) -> (u16, Vec<u8>) {
+    let setup_complete = !auth_store::registration_is_allowed(auth_store.user_count());
+    (200, serde_json::to_vec(&SetupStatusResponse { setup_complete }).unwrap_or_default())
 }
 
 fn handle_create_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
@@ -524,15 +594,24 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
     headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
-async fn handle_connection<L, E, V>(
-    mut stream: TcpStream,
-    memory: Arc<Memory<L, E, V>>,
-    token: Arc<Option<String>>,
-    rate_limiter: Arc<RateLimiter>,
-    cors_origin: Arc<Option<String>>,
-    store_path: Arc<PathBuf>,
-    peer_ip: IpAddr,
-) where
+struct ServerState<L, E, V>
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    memory: Memory<L, E, V>,
+    token: Option<String>,
+    rate_limiter: RateLimiter,
+    cors_origin: Option<String>,
+    store_path: PathBuf,
+    auth_store: auth_store::AuthStore,
+    auth_store_path: PathBuf,
+    jwt_secret: Vec<u8>,
+}
+
+async fn handle_connection<L, E, V>(mut stream: TcpStream, state: Arc<ServerState<L, E, V>>, peer_ip: IpAddr)
+where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
     V: core::vector_store::VectorStore + Send + Sync + 'static,
@@ -557,7 +636,7 @@ async fn handle_connection<L, E, V>(
         }
         if let Some(req) = parse_request(&buf) {
             let request_origin = find_header(&req.headers, "origin");
-            let cors_header = cors_allow_origin_header(cors_origin.as_deref(), request_origin);
+            let cors_header = cors_allow_origin_header(state.cors_origin.as_deref(), request_origin);
 
             if req.method == "OPTIONS" && request_origin.is_some() {
                 let mut headers: Vec<(String, String)> = cors_header.into_iter().collect();
@@ -569,21 +648,26 @@ async fn handle_connection<L, E, V>(
                 return;
             }
 
-            let blocking_memory = Arc::clone(&memory);
-            let blocking_token = Arc::clone(&token);
-            let blocking_rate_limiter = Arc::clone(&rate_limiter);
-            let blocking_store_path = Arc::clone(&store_path);
+            let blocking_state = Arc::clone(&state);
             let (status, body) = tokio::task::spawn_blocking(move || {
-                let (status, body) = if !blocking_rate_limiter.check_and_consume(peer_ip) {
+                let (status, body) = if !blocking_state.rate_limiter.check_and_consume(peer_ip) {
                     (429, error_body("rate limit exceeded"))
                 } else if req.method == "GET" && req.path == "/health" {
                     handle_health()
                 } else if req.method == "GET" && req.path == "/ready" {
-                    handle_ready(&blocking_memory)
-                } else if is_authorized(blocking_token.as_deref(), &req.headers) {
-                    let result = route(&blocking_memory, &req);
+                    handle_ready(&blocking_state.memory)
+                } else if req.method == "POST" && req.path == "/auth/register" {
+                    let result = handle_auth_register(&blocking_state.auth_store, &blocking_state.jwt_secret, &req.body);
+                    if result.0 == 201 {
+                        let _ = blocking_state.auth_store.save(&blocking_state.auth_store_path);
+                    }
+                    result
+                } else if req.method == "GET" && req.path == "/auth/setup-status" {
+                    handle_auth_setup_status(&blocking_state.auth_store)
+                } else if is_authorized(blocking_state.token.as_deref(), &req.headers) {
+                    let result = route(&blocking_state.memory, &req);
                     if is_successful_mutation(&req.method, &req.path, result.0) {
-                        let _ = save_store(&blocking_memory, &blocking_store_path);
+                        let _ = save_store(&blocking_state.memory, &blocking_state.store_path);
                     }
                     result
                 } else {
@@ -603,11 +687,7 @@ async fn handle_connection<L, E, V>(
 
 async fn serve<L, E, V>(
     listener: TcpListener,
-    memory: Arc<Memory<L, E, V>>,
-    token: Arc<Option<String>>,
-    rate_limiter: Arc<RateLimiter>,
-    cors_origin: Arc<Option<String>>,
-    store_path: Arc<PathBuf>,
+    state: Arc<ServerState<L, E, V>>,
     mut shutdown: impl std::future::Future<Output = ()> + Unpin,
 ) where
     L: core::llm::LlmProvider + Send + Sync + 'static,
@@ -621,12 +701,8 @@ async fn serve<L, E, V>(
                 let Ok((stream, peer_addr)) = accepted else {
                     continue;
                 };
-                let memory = Arc::clone(&memory);
-                let token = Arc::clone(&token);
-                let rate_limiter = Arc::clone(&rate_limiter);
-                let cors_origin = Arc::clone(&cors_origin);
-                let store_path = Arc::clone(&store_path);
-                in_flight.spawn(handle_connection(stream, memory, token, rate_limiter, cors_origin, store_path, peer_addr.ip()));
+                let state = Arc::clone(&state);
+                in_flight.spawn(handle_connection(stream, state, peer_addr.ip()));
             }
             () = &mut shutdown => {
                 break;
@@ -640,14 +716,14 @@ fn main() {
     let api_key_env = std::env::var("MEMORIA_API_KEY").ok();
     let allow_no_auth_env = std::env::var("MEMORIA_ALLOW_NO_AUTH").ok();
     let token = match resolve_auth_config(api_key_env, allow_no_auth_env) {
-        Ok(token) => Arc::new(token),
+        Ok(token) => token,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(1);
         }
     };
     let cors_origin = match validate_cors_origin(resolve_cors_origin(std::env::var("MEMORIA_CORS_ORIGIN").ok())) {
-        Ok(origin) => Arc::new(origin),
+        Ok(origin) => origin,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(1);
@@ -681,17 +757,31 @@ fn main() {
     eprintln!("llm provider: {llm_label}");
     eprintln!("embedding provider: {embedding_label}");
 
+    let jwt_secret = match resolve_jwt_secret(std::env::var("MEMORIA_JWT_SECRET").ok()) {
+        Ok(secret) => secret,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let store_path = Arc::new(resolve_store_path(std::env::var("MEMORIA_STORE_PATH").ok().as_deref(), &home));
+    let store_path = resolve_store_path(std::env::var("MEMORIA_STORE_PATH").ok().as_deref(), &home);
     eprintln!("store: {}", store_path.display());
     let store = load_store(&store_path);
 
-    let memory_outliving_the_runtime = Arc::new(Memory::new(llm_provider, embedding_provider, store));
+    let auth_store_path = resolve_auth_store_path(std::env::var("MEMORIA_AUTH_STORE_PATH").ok().as_deref(), &home);
+    eprintln!("auth store: {}", auth_store_path.display());
+    let auth_store = auth_store::AuthStore::load(&auth_store_path);
+
+    let rate_limiter = RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC);
+    let memory = Memory::new(llm_provider, embedding_provider, store);
+    let state_outliving_the_runtime =
+        Arc::new(ServerState { memory, token, rate_limiter, cors_origin, store_path, auth_store, auth_store_path, jwt_secret });
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
-        let memory = Arc::clone(&memory_outliving_the_runtime);
-        let rate_limiter = Arc::new(RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC));
+        let state = Arc::clone(&state_outliving_the_runtime);
         let listener = TcpListener::bind("127.0.0.1:8080").await.expect("failed to bind to 127.0.0.1:8080");
         let shutdown = Box::pin(async {
             let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -701,7 +791,7 @@ fn main() {
                 _ = tokio::signal::ctrl_c() => {}
             }
         });
-        serve(listener, memory, token, rate_limiter, cors_origin, store_path, shutdown).await;
+        serve(listener, state, shutdown).await;
     });
 }
 
@@ -714,8 +804,40 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, last_octet))
     }
 
-    fn test_store_path() -> Arc<PathBuf> {
-        Arc::new(std::env::temp_dir().join("memoria-server-tests-scratch-store.json"))
+    fn test_store_path() -> PathBuf {
+        std::env::temp_dir().join("memoria-server-tests-scratch-store.json")
+    }
+
+    fn test_auth_store_path() -> PathBuf {
+        std::env::temp_dir().join(format!("memoria-server-tests-scratch-auth-store-{}.json", std::process::id()))
+    }
+
+    fn test_jwt_secret() -> Vec<u8> {
+        b"test-jwt-secret".to_vec()
+    }
+
+    fn test_state<L, E, V>(
+        memory: Memory<L, E, V>,
+        token: Option<String>,
+        rate_limiter: RateLimiter,
+        cors_origin: Option<String>,
+        store_path: PathBuf,
+    ) -> Arc<ServerState<L, E, V>>
+    where
+        L: core::llm::LlmProvider,
+        E: core::embedding::EmbeddingProvider,
+        V: core::vector_store::VectorStore,
+    {
+        Arc::new(ServerState {
+            memory,
+            token,
+            rate_limiter,
+            cors_origin,
+            store_path,
+            auth_store: auth_store::AuthStore::new(),
+            auth_store_path: test_auth_store_path(),
+            jwt_secret: test_jwt_secret(),
+        })
     }
 
     #[test]
@@ -898,6 +1020,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_auth_store_path_defaults_to_a_file_distinct_from_the_vector_store() {
+        let path = resolve_auth_store_path(None, "/home/alice");
+        assert_eq!(path, PathBuf::from("/home/alice/.memoria/auth-store.json"));
+    }
+
+    #[test]
+    fn resolve_auth_store_path_env_override_wins() {
+        let path = resolve_auth_store_path(Some("/custom/auth.json"), "/home/alice");
+        assert_eq!(path, PathBuf::from("/custom/auth.json"));
+    }
+
+    #[test]
+    fn resolve_jwt_secret_with_a_configured_value_resolves_to_that_value() {
+        let secret = resolve_jwt_secret(Some("real-secret".to_string())).expect("a configured secret must resolve");
+        assert_eq!(secret, b"real-secret".to_vec());
+    }
+
+    #[test]
+    fn resolve_jwt_secret_with_nothing_set_fails_closed() {
+        assert!(resolve_jwt_secret(None).is_err());
+    }
+
+    #[test]
+    fn resolve_jwt_secret_with_an_empty_value_fails_closed() {
+        assert!(resolve_jwt_secret(Some(String::new())).is_err(), "an empty MEMORIA_JWT_SECRET must not be treated as configured");
+    }
+
+    #[test]
     fn is_successful_mutation_true_for_create() {
         assert!(is_successful_mutation("POST", "/memories", 201));
     }
@@ -1075,6 +1225,61 @@ mod tests {
     fn parse_request_returns_none_when_headers_incomplete() {
         let raw = b"POST /memories HTTP/1.1\r\nContent-Le";
         assert!(parse_request(raw).is_none());
+    }
+
+    #[test]
+    fn handle_auth_register_happy_path_returns_201_with_real_tokens() {
+        let store = auth_store::AuthStore::new();
+        let body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+        let (status, response_body) = handle_auth_register(&store, b"jwt-secret", body);
+        assert_eq!(status, 201);
+        let response: AuthTokenResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.token_type, "bearer");
+        assert!(crypto::decode_jwt(&response.access_token, b"jwt-secret", auth_store::unix_now()).is_ok());
+        assert!(!response.refresh_token.is_empty());
+    }
+
+    #[test]
+    fn handle_auth_register_rejects_a_second_registration() {
+        let store = auth_store::AuthStore::new();
+        let body = br#"{"name":"Alice","email":"alice@example.com","password":"password-one"}"#;
+        handle_auth_register(&store, b"jwt-secret", body);
+        let second_body = br#"{"name":"Bob","email":"bob@example.com","password":"password-two"}"#;
+        let (status, _) = handle_auth_register(&store, b"jwt-secret", second_body);
+        assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn handle_auth_register_rejects_malformed_json_body() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_auth_register(&store, b"jwt-secret", b"not json");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_auth_register_rejects_an_empty_password() {
+        let store = auth_store::AuthStore::new();
+        let body = br#"{"name":"Alice","email":"alice@example.com","password":""}"#;
+        let (status, _) = handle_auth_register(&store, b"jwt-secret", body);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_auth_setup_status_reflects_real_store_state() {
+        let store = auth_store::AuthStore::new();
+        let (_, before) = handle_auth_setup_status(&store);
+        let before: SetupStatusResponse = serde_json::from_slice(&before).expect("expected valid JSON");
+        assert!(!before.setup_complete);
+
+        store.insert_user(auth_store::User::new(
+            "Alice".to_string(),
+            "alice@example.com".to_string(),
+            "hash".to_string(),
+            auth_store::Role::Admin,
+        ));
+        let (_, after) = handle_auth_setup_status(&store);
+        let after: SetupStatusResponse = serde_json::from_slice(&after).expect("expected valid JSON");
+        assert!(after.setup_complete);
     }
 
     #[test]
@@ -1425,8 +1630,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1447,6 +1653,36 @@ mod tests {
     }
 
     #[test]
+    fn server_handles_a_real_registration_over_tcp_even_with_auth_configured() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(
+                memory,
+                Some("a-real-configured-bearer-token".to_string()),
+                RateLimiter::new(1000.0, 1000.0),
+                None,
+                test_store_path(),
+            );
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            let body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+            let request = format!("POST /auth/register HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            stream.write_all(request.as_bytes()).await.expect("write should succeed");
+            stream.write_all(body).await.expect("write should succeed");
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+            assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
+            assert!(response_text.contains("\"access_token\""));
+        });
+    }
+
+    #[test]
     fn server_persists_a_real_create_request_to_disk_and_a_fresh_server_reloads_it() {
         let dir = std::env::temp_dir().join(format!("memoria-server-e2e-persist-test-{}", std::process::id()));
         let path = Arc::new(dir.join("store.json"));
@@ -1455,16 +1691,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(
-                listener,
-                memory,
-                Arc::new(None),
-                Arc::new(RateLimiter::new(1000.0, 1000.0)),
-                Arc::new(None),
-                Arc::clone(&path),
-                Box::pin(std::future::pending()),
-            ));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, (*path).clone());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Bob is learning to play the guitar.","user_id":"bob"}"#;
@@ -1490,8 +1719,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -1510,8 +1740,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, Some("secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1533,8 +1764,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(Some("secret".to_string())), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, Some("secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1559,8 +1791,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(2.0, 0.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(2.0, 0.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut last_response_text = String::new();
             for _ in 0..3 {
@@ -1581,8 +1814,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut first_stream = TcpStream::connect(addr).await.expect("connect should succeed");
             first_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -1608,8 +1842,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), Arc::new(None), test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let declared_length = MAX_REQUEST_BODY_BYTES + 1;
@@ -1631,9 +1866,10 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            let cors_origin = Arc::new(Some("https://example.com".to_string()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let cors_origin = Some("https://example.com".to_string());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), cors_origin, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
@@ -1653,9 +1889,10 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            let cors_origin = Arc::new(Some("https://example.com".to_string()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let cors_origin = Some("https://example.com".to_string());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), cors_origin, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n";
@@ -1675,9 +1912,10 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            let cors_origin = Arc::new(Some("https://example.com".to_string()));
-            tokio::spawn(serve(listener, memory, Arc::new(None), Arc::new(RateLimiter::new(1000.0, 1000.0)), cors_origin, test_store_path(), Box::pin(std::future::pending())));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let cors_origin = Some("https://example.com".to_string());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), cors_origin, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let request = "OPTIONS /memories HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
@@ -1699,16 +1937,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(
-                listener,
-                memory,
-                Arc::new(Some("secret".to_string())),
-                Arc::new(RateLimiter::new(1000.0, 1000.0)),
-                Arc::new(None),
-                test_store_path(),
-                Box::pin(std::future::pending()),
-            ));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, Some("secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -1728,16 +1959,9 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-            tokio::spawn(serve(
-                listener,
-                memory,
-                Arc::new(Some("secret".to_string())),
-                Arc::new(RateLimiter::new(1000.0, 1000.0)),
-                Arc::new(None),
-                test_store_path(),
-                Box::pin(std::future::pending()),
-            ));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, Some("secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
@@ -1757,20 +1981,13 @@ mod tests {
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, test_store_path());
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             let shutdown = Box::pin(async {
                 let _ = shutdown_rx.await;
             });
-            let serve_handle = tokio::spawn(serve(
-                listener,
-                memory,
-                Arc::new(None),
-                Arc::new(RateLimiter::new(1000.0, 1000.0)),
-                Arc::new(None),
-                test_store_path(),
-                shutdown,
-            ));
+            let serve_handle = tokio::spawn(serve(listener, state, shutdown));
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
@@ -1805,23 +2022,16 @@ mod tests {
             temperature: None,
         };
         let llm = core::llm::OllamaLlmProvider::from_config(llm_config).expect("valid config should construct");
-        let memory_outliving_the_runtime = Arc::new(Memory::new(llm, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+        let memory = Memory::new(llm, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let state_outliving_the_runtime = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, test_store_path());
 
         let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
             let addr = listener.local_addr().expect("local_addr should succeed");
-            let memory = Arc::clone(&memory_outliving_the_runtime);
+            let state = Arc::clone(&state_outliving_the_runtime);
 
-            tokio::spawn(serve(
-                listener,
-                memory,
-                Arc::new(None),
-                Arc::new(RateLimiter::new(1000.0, 1000.0)),
-                Arc::new(None),
-                test_store_path(),
-                Box::pin(std::future::pending()),
-            ));
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
 
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             let body = br#"{"content":"hi","user_id":"u1"}"#;
