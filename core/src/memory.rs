@@ -1,5 +1,5 @@
 use crate::embedding::{EmbeddingConfig, EmbeddingProvider};
-use crate::llm::{extract_facts, LlmConfig, LlmProvider, Message};
+use crate::llm::{extract_facts, LlmConfig, LlmProvider, Message, Role};
 use crate::vector_store::{VectorRecord, VectorStore, VectorStoreConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -214,6 +214,7 @@ where
         &self,
         messages: &[Message],
         scope: HashMap<String, String>,
+        infer: bool,
     ) -> Result<Vec<String>, crate::CoreError> {
         if !has_scope_id(&scope) {
             return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
@@ -239,25 +240,32 @@ where
                 }
             }
         }
-        let facts = extract_facts(&self.llm, messages)?;
+        let items: Vec<(String, Option<Role>)> = if infer {
+            extract_facts(&self.llm, messages)?.into_iter().map(|fact| (fact, None)).collect()
+        } else {
+            messages.iter().map(|m| (m.content.clone(), Some(m.role))).collect()
+        };
         let mut ids = Vec::new();
-        for fact in &facts {
-            let vector = self.embedding.embed(fact)?;
+        for (content, role) in &items {
+            let vector = self.embedding.embed(content)?;
             if let Ok(results) = self.vector_store.search(&vector, 100, &scope, None) {
-                if results.iter().any(|r| r.payload.get("content") == Some(fact)) {
+                if results.iter().any(|r| r.payload.get("content") == Some(content)) {
                     continue;
                 }
             }
             let id = next_record_id();
             let mut payload = scope.clone();
             if !payload.contains_key("content") {
-                payload.insert("content".to_string(), fact.clone());
+                payload.insert("content".to_string(), content.clone());
+            }
+            if let Some(role) = role {
+                payload.insert("role".to_string(), role.as_str().to_string());
             }
             let record = VectorRecord::new(id.clone(), vector, payload);
             self.vector_store.insert(record)?;
             self.history.lock().expect("lock poisoned").entry(id.clone()).or_default().push(HistoryEntry {
                 event: HistoryEvent::Added,
-                content: fact.clone(),
+                content: content.clone(),
             });
             ids.push(id);
         }
@@ -285,7 +293,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer and Bob lives in Berlin.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         assert!(
             !ids.is_empty(),
             "add should return at least one record id"
@@ -301,6 +309,82 @@ mod tests {
     }
 
     #[test]
+    fn test_add_with_infer_false_stores_raw_content_verbatim_not_extracted_facts() {
+        let llm = FakeLlmProvider::with_facts("a completely different extracted fact");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "The user is allergic to shellfish.")];
+        let ids = memory.add(&messages, scope(), false).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+        let record = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"The user is allergic to shellfish.".to_string()),
+            "infer=false must store the raw message content verbatim, never the LLM's extracted fact"
+        );
+    }
+
+    #[test]
+    fn test_add_with_infer_false_tags_the_payload_with_the_real_message_role() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::Assistant, "Sure, I can help with that.")];
+        let ids = memory.add(&messages, scope(), false).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+        let record = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("role"), Some(&"assistant".to_string()));
+    }
+
+    #[test]
+    fn test_add_with_infer_false_creates_one_record_per_message_not_per_fact() {
+        let llm = FakeLlmProvider::with_facts("one\ntwo\nthree");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "First message."), Message::new(Role::User, "Second message.")];
+        let ids = memory.add(&messages, scope(), false).expect("add should succeed");
+        assert_eq!(ids.len(), 2, "infer=false must produce exactly one record per input message");
+    }
+
+    #[test]
+    fn test_add_with_infer_true_still_calls_extract_facts_unchanged() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.\nBob lives in Berlin.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer and Bob lives in Berlin.")];
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
+        assert_eq!(ids.len(), 2, "infer=true's existing extraction behavior must be unchanged");
+        let contents: Vec<String> = ids
+            .iter()
+            .map(|id| memory.vector_store.get(id).unwrap().unwrap().payload.get("content").unwrap().clone())
+            .collect();
+        assert!(contents.contains(&"Alice is an engineer.".to_string()));
+        assert!(contents.contains(&"Bob lives in Berlin.".to_string()));
+    }
+
+    #[test]
+    fn test_add_with_infer_true_never_tags_a_role_on_the_payload() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+        let record = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("role"), None, "infer=true's facts have no single originating role to tag");
+    }
+
+    #[test]
     fn test_add_multiple_messages_in_one_call() {
         let llm = FakeLlmProvider::with_facts("The project started in 2021.\nThe team uses Rust.");
         let embedding = FakeEmbeddingProvider::new();
@@ -313,7 +397,7 @@ mod tests {
             Message::new(Role::User, "What language does the team use?"),
             Message::new(Role::Assistant, "They use Rust."),
         ];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         assert!(
             !ids.is_empty(),
             "add should return at least one record id for multiple messages"
@@ -338,7 +422,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = scope();
-        let ids = memory.add(&messages, s.clone()).expect("add should succeed");
+        let ids = memory.add(&messages, s.clone(), true).expect("add should succeed");
         assert!(!ids.is_empty());
 
         let query = vec![1.0_f32, 1.0, 1.0, 1.0];
@@ -371,7 +455,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("user_id".to_string(), "alice".to_string())]);
-        let ids = memory.add(&messages, s).expect("add should succeed");
+        let ids = memory.add(&messages, s, true).expect("add should succeed");
         assert!(!ids.is_empty());
     }
 
@@ -384,7 +468,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("agent_id".to_string(), "bot1".to_string())]);
-        let ids = memory.add(&messages, s).expect("add should succeed");
+        let ids = memory.add(&messages, s, true).expect("add should succeed");
         assert!(!ids.is_empty());
     }
 
@@ -397,7 +481,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("run_id".to_string(), "run-123".to_string())]);
-        let ids = memory.add(&messages, s).expect("add should succeed");
+        let ids = memory.add(&messages, s, true).expect("add should succeed");
         assert!(!ids.is_empty());
     }
 
@@ -410,7 +494,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::new();
-        let result = memory.add(&messages, s);
+        let result = memory.add(&messages, s, true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -423,7 +507,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("source".to_string(), "x".to_string())]);
-        let result = memory.add(&messages, s);
+        let result = memory.add(&messages, s, true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -436,7 +520,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("source".to_string(), "x".to_string()), ("user_id".to_string(), "alice".to_string())]);
-        let ids = memory.add(&messages, s).expect("add should succeed");
+        let ids = memory.add(&messages, s, true).expect("add should succeed");
         assert!(!ids.is_empty());
     }
 
@@ -449,7 +533,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("user_id".to_string(), "alice".to_string()), ("source".to_string(), "chat_import".to_string())]);
-        let ids = memory.add(&messages, s).expect("add should succeed");
+        let ids = memory.add(&messages, s, true).expect("add should succeed");
         assert!(!ids.is_empty());
 
         let id = ids.first().expect("expected at least one id");
@@ -472,8 +556,8 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = scope();
-        let ids1 = memory.add(&messages, s.clone()).expect("add should succeed");
-        let ids2 = memory.add(&messages, s).expect("add should succeed");
+        let ids1 = memory.add(&messages, s.clone(), true).expect("add should succeed");
+        let ids2 = memory.add(&messages, s, true).expect("add should succeed");
         assert!(ids2.is_empty(), "second add should return empty ids for duplicate");
         let record = memory.vector_store.get(&ids1[0]).expect("get should succeed").expect("record should exist");
         let payload = record.payload;
@@ -490,8 +574,8 @@ mod tests {
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s1 = HashMap::from([("user_id".to_string(), "alice".to_string())]);
         let s2 = HashMap::from([("user_id".to_string(), "bob".to_string())]);
-        let ids1 = memory.add(&messages, s1).expect("add should succeed");
-        let ids2 = memory.add(&messages, s2).expect("add should succeed");
+        let ids1 = memory.add(&messages, s1, true).expect("add should succeed");
+        let ids2 = memory.add(&messages, s2, true).expect("add should succeed");
         assert!(!ids2.is_empty(), "second add should return an id for different scope");
         let unique_ids: std::collections::HashSet<String> = ids1.into_iter().chain(ids2).collect();
         assert_eq!(unique_ids.len(), 2, "same fact in different scopes should result in two records");
@@ -508,7 +592,7 @@ mod tests {
             Message::new(Role::User, "Alice is an engineer."),
             Message::new(Role::User, ""),
         ];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -523,7 +607,7 @@ mod tests {
             Message::new(Role::User, "Alice is an engineer."),
             Message::new(Role::User, "Bob lives in Berlin."),
         ];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         assert!(!ids.is_empty());
     }
 
@@ -535,7 +619,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let _ = memory.add(&messages, scope()).expect("add should succeed");
+        let _ = memory.add(&messages, scope(), true).expect("add should succeed");
 
         let query = "Alice engineer";
         let results = memory.search(query, 10, &scope(), None).expect("search should succeed");
@@ -559,12 +643,12 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Five facts.")];
-        let _ = memory.add(&messages, scope()).expect("add should succeed");
+        let _ = memory.add(&messages, scope(), true).expect("add should succeed");
 
         for i in 1..=5 {
             let fact = format!("Fact {i}.");
             let s = HashMap::from([("user_id".to_string(), "alice".to_string())]);
-            memory.add(&[Message::new(Role::User, &fact)], s).expect("add should succeed");
+            memory.add(&[Message::new(Role::User, &fact)], s, true).expect("add should succeed");
         }
 
         let query = "fact";
@@ -686,7 +770,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         memory
@@ -724,7 +808,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         memory.update(id, None, Some(HashMap::from([("source".to_string(), "chat_import".to_string())]))).expect("update should succeed");
@@ -744,7 +828,7 @@ mod tests {
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let ids = memory
-            .add(&messages, HashMap::from([("user_id".to_string(), "alice".to_string()), ("source".to_string(), "chat_import".to_string())]))
+            .add(&messages, HashMap::from([("user_id".to_string(), "alice".to_string()), ("source".to_string(), "chat_import".to_string())]), true)
             .expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
@@ -766,7 +850,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         let result = memory.update(id, None, Some(HashMap::from([("user_id".to_string(), "mallory".to_string())])));
@@ -781,7 +865,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         let result = memory.update(id, None, Some(HashMap::from([("agent_id".to_string(), "other-bot".to_string())])));
@@ -796,7 +880,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         memory.delete(id).expect("delete should succeed");
@@ -813,7 +897,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         memory.delete(id).expect("first delete should succeed");
@@ -840,7 +924,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Two facts.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         assert!(ids.len() >= 2, "expected at least two records for this test to be meaningful");
 
         memory.reset(&scope()).expect("reset should succeed");
@@ -861,8 +945,8 @@ mod tests {
         let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
         let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
 
-        let alice_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], alice_scope.clone()).expect("add should succeed");
-        let bob_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], bob_scope).expect("add should succeed");
+        let alice_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], alice_scope.clone(), true).expect("add should succeed");
+        let bob_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], bob_scope, true).expect("add should succeed");
 
         memory.reset(&alice_scope).expect("reset should succeed");
 
@@ -881,7 +965,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
 
         let other_scope = HashMap::from([("user_id".to_string(), "nobody-here".to_string())]);
         memory.reset(&other_scope).expect("reset with no matches should not error");
@@ -898,7 +982,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         let entries = memory.history(id, 0, usize::MAX).expect("history should succeed");
@@ -925,7 +1009,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         memory.delete(id).expect("delete should succeed");
@@ -957,7 +1041,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
         memory.delete(id).expect("delete should succeed");
 
@@ -980,7 +1064,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         let page = memory.history(id, 10, 5).expect("history should succeed");
@@ -1001,7 +1085,7 @@ mod tests {
                 let memory_ref = &memory;
                 s.spawn(move || {
                     let thread_scope = HashMap::from([("user_id".to_string(), format!("user-{i}"))]);
-                    memory_ref.add(&[Message::new(Role::User, "Fact one.")], thread_scope).expect("add should succeed");
+                    memory_ref.add(&[Message::new(Role::User, "Fact one.")], thread_scope, true).expect("add should succeed");
                 });
             }
         });
@@ -1017,7 +1101,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Four facts.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Four facts.")], scope(), true).expect("add should succeed");
         assert!(ids.len() >= 4, "expected at least four records for this test to be meaningful");
 
         std::thread::scope(|s| {
@@ -1045,7 +1129,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id").clone();
 
         let update_result = std::thread::scope(|s| {
@@ -1117,8 +1201,8 @@ mod tests {
         let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
         let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
 
-        memory.add(&[Message::new(Role::User, "I am an engineer.")], alice_scope.clone()).expect("add should succeed");
-        memory.add(&[Message::new(Role::User, "I am an engineer.")], bob_scope.clone()).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], alice_scope.clone(), true).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], bob_scope.clone(), true).expect("add should succeed");
 
         let alice_results = memory.search("engineer", 10, &alice_scope, None).expect("search should succeed");
         let bob_results = memory.search("engineer", 10, &bob_scope, None).expect("search should succeed");
@@ -1143,8 +1227,8 @@ mod tests {
         let scheduler_scope = HashMap::from([("agent_id".to_string(), "scheduler-bot".to_string())]);
         let support_scope = HashMap::from([("agent_id".to_string(), "support-bot".to_string())]);
 
-        memory.add(&[Message::new(Role::User, "I am an engineer.")], scheduler_scope.clone()).expect("add should succeed");
-        memory.add(&[Message::new(Role::User, "I am an engineer.")], support_scope.clone()).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], scheduler_scope.clone(), true).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "I am an engineer.")], support_scope.clone(), true).expect("add should succeed");
 
         let scheduler_results = memory.search("engineer", 10, &scheduler_scope, None).expect("search should succeed");
         let support_results = memory.search("engineer", 10, &support_scope, None).expect("search should succeed");
@@ -1166,7 +1250,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let before = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
         assert!(!before.is_empty(), "expected a result before reset for this test to be meaningful");
 
@@ -1183,7 +1267,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         memory.update(id, Some("Alice is a senior engineer."), None).expect("update should succeed");
@@ -1207,7 +1291,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store).with_max_metadata_bytes(10);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(
             matches!(result, Err(crate::CoreError::Validation(_))),
             "scope() alone (\"user_id\" + \"alice\") is well over 10 bytes and should be rejected"
@@ -1222,7 +1306,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store).with_max_metadata_bytes(1000);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(result.is_ok(), "scope() is well under 1000 bytes and should be accepted");
     }
 
@@ -1236,7 +1320,7 @@ mod tests {
         let large_value = "x".repeat(10_000);
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
         let s = HashMap::from([("user_id".to_string(), "alice".to_string()), ("notes".to_string(), large_value)]);
-        let result = memory.add(&messages, s);
+        let result = memory.add(&messages, s, true);
         assert!(result.is_ok(), "with no configured limit, metadata size should never be rejected");
     }
 
@@ -1251,7 +1335,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
 
         assert!(
             matches!(result, Err(crate::CoreError::Provider { .. })),
@@ -1267,7 +1351,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Just saying hello, nothing memorable.")];
-        let ids = memory.add(&messages, scope()).expect("zero extracted facts should not be an error");
+        let ids = memory.add(&messages, scope(), true).expect("zero extracted facts should not be an error");
         assert!(ids.is_empty(), "no facts extracted should mean no records inserted, not an error");
     }
 
@@ -1279,7 +1363,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer, and again, Alice is an engineer. Bob lives in Berlin.")];
-        let ids = memory.add(&messages, scope()).expect("add should succeed");
+        let ids = memory.add(&messages, scope(), true).expect("add should succeed");
 
         assert_eq!(
             ids.len(), 2,
@@ -1320,7 +1404,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
         let before = memory.vector_store.get(id).expect("get should succeed").expect("record should exist");
 
@@ -1338,7 +1422,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer and Bob lives in Berlin.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer and Bob lives in Berlin.")], scope(), true).expect("add should succeed");
         assert!(ids.len() >= 2, "expected at least two records for this test to be meaningful");
         let first_id = &ids[0];
         let common_prefix = &first_id[..first_id.len() - 1];
@@ -1361,7 +1445,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store).with_max_content_length(10);
 
         let messages = [Message::new(Role::User, "This message is way longer than ten characters.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -1373,7 +1457,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store).with_max_content_length(1000);
 
         let messages = [Message::new(Role::User, "Short.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(result.is_ok(), "content well under the configured limit should be accepted");
     }
 
@@ -1386,7 +1470,7 @@ mod tests {
 
         let long_message = "x".repeat(10_000);
         let messages = [Message::new(Role::User, long_message)];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(result.is_ok(), "with no configured limit, message length should never be rejected");
     }
 
@@ -1398,7 +1482,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
     }
 
@@ -1410,7 +1494,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
     }
 
@@ -1422,7 +1506,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let messages = [Message::new(Role::User, "Alice is an engineer.")];
-        let result = memory.add(&messages, scope());
+        let result = memory.add(&messages, scope(), true);
         assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
     }
 
@@ -1477,7 +1561,7 @@ mod tests {
         let store = VecVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         assert!(!ids.is_empty());
 
         let results = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
@@ -1496,7 +1580,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         assert!(!ids.is_empty(), "EchoLlmProvider should still produce at least one fact (extract_facts wraps the conversation before echoing it)");
 
         let results = memory.search("Alice", 10, &scope(), None).expect("search should succeed");
@@ -1540,7 +1624,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         let id = ids.first().expect("expected at least one id");
 
         let record = memory.get(id).expect("get should succeed").expect("record should exist");
@@ -1565,7 +1649,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let ids = memory.add(&[Message::new(Role::User, "Two facts.")], scope()).expect("add should succeed");
+        let ids = memory.add(&[Message::new(Role::User, "Two facts.")], scope(), true).expect("add should succeed");
 
         let listed = memory.list(0, usize::MAX).expect("list should succeed");
         for id in &ids {

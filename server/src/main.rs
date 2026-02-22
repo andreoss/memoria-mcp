@@ -165,10 +165,27 @@ fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
 
 #[derive(serde::Deserialize)]
 struct CreateMemoryRequest {
-    content: String,
+    content: Option<String>,
+    messages: Option<Vec<MessageInput>>,
     user_id: Option<String>,
     agent_id: Option<String>,
     run_id: Option<String>,
+    infer: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct MessageInput {
+    role: String,
+    content: String,
+}
+
+fn parse_message_role(role: &str) -> Option<Role> {
+    match role {
+        "system" => Some(Role::System),
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        _ => None,
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -620,8 +637,27 @@ where
         Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
     };
     let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+    let infer = request.infer.unwrap_or(true);
 
-    match memory.add(&[Message::new(Role::User, request.content)], scope) {
+    let messages = if let Some(inputs) = request.messages {
+        let mut parsed = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let Some(role) = parse_message_role(&input.role) else {
+                return (
+                    400,
+                    error_body(format!("unknown message role {:?} (expected \"system\", \"user\", or \"assistant\")", input.role)),
+                );
+            };
+            parsed.push(Message::new(role, input.content));
+        }
+        parsed
+    } else if let Some(content) = request.content {
+        vec![Message::new(Role::User, content)]
+    } else {
+        return (400, error_body("request body must include either \"content\" or \"messages\""));
+    };
+
+    match memory.add(&messages, scope, infer) {
         Ok(ids) => (201, serde_json::to_vec(&CreateMemoryResponse { ids }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -1634,7 +1670,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("memoria-server-roundtrip-test-{}", std::process::id()));
         let path = dir.join("store.json");
         let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
-        memory.add(&[Message::new(Role::User, "Alice is an engineer.".to_string())], scope_from_optional(Some("alice".to_string()), None, None)).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "Alice is an engineer.".to_string())], scope_from_optional(Some("alice".to_string()), None, None), true).expect("add should succeed");
 
         save_store(&memory, &path).expect("save should succeed");
         let reloaded = load_store(&path);
@@ -2217,6 +2253,54 @@ mod tests {
         assert_eq!(status, 400);
         let response: ErrorResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
         assert!(response.error.contains("user_id"));
+    }
+
+    #[test]
+    fn handle_create_memory_accepts_a_real_messages_array() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"messages":[{"role":"user","content":"Alice is an engineer."}],"user_id":"alice"}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(!response.ids.is_empty());
+    }
+
+    #[test]
+    fn handle_create_memory_rejects_an_unknown_message_role() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"messages":[{"role":"narrator","content":"x"}],"user_id":"alice"}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 400);
+        let response: ErrorResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(response.error.contains("narrator"));
+    }
+
+    #[test]
+    fn handle_create_memory_rejects_neither_content_nor_messages() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"user_id":"alice"}"#;
+        let (status, _) = handle_create_memory(&memory, body);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_create_memory_with_infer_false_stores_the_real_content_verbatim() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"The user is allergic to shellfish.","user_id":"alice","infer":false}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("content"), Some(&"The user is allergic to shellfish.".to_string()));
+    }
+
+    #[test]
+    fn handle_create_memory_defaults_infer_to_true_when_omitted() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
+        let (status, _) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201, "omitting infer must not change today's default behavior");
     }
 
     #[test]

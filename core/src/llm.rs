@@ -7,6 +7,17 @@ pub enum Role {
     Assistant,
 }
 
+impl Role {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
@@ -222,20 +233,11 @@ impl OllamaLlmProvider {
 }
 
 #[cfg(feature = "ollama")]
-const fn role_str(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-    }
-}
-
-#[cfg(feature = "ollama")]
 fn build_chat_request(model: &str, messages: &[Message]) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "messages": messages.iter().map(|m| serde_json::json!({
-            "role": role_str(m.role),
+            "role": m.role.as_str(),
             "content": m.content,
         })).collect::<Vec<_>>(),
         "stream": false,

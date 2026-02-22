@@ -317,7 +317,7 @@ where
     match command {
         Command::Add { content, user_id, agent_id, run_id } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.add(&[Message::new(Role::User, content)], scope) {
+            match memory.add(&[Message::new(Role::User, content)], scope, true) {
                 Ok(ids) => {
                     print_ids(&ids, json, quiet);
                     save_store(memory, path);
