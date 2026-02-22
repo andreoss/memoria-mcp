@@ -14,6 +14,12 @@ pub fn sha256_hex(data: &[u8]) -> String {
     })
 }
 
+pub fn generate_random_key(byte_len: usize) -> String {
+    let mut bytes = vec![0u8; byte_len];
+    getrandom::fill(&mut bytes).expect("the OS random source is available");
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
 const HASH_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 const PBKDF2_ITERATIONS: u32 = 600_000;
@@ -165,6 +171,18 @@ mod tests {
     #[test]
     fn sha256_hex_differs_for_different_input() {
         assert_ne!(sha256_hex(b"input a"), sha256_hex(b"input b"));
+    }
+
+    #[test]
+    fn generate_random_key_produces_a_different_key_each_time() {
+        assert_ne!(generate_random_key(24), generate_random_key(24));
+    }
+
+    #[test]
+    fn generate_random_key_respects_the_requested_byte_length() {
+        let key = generate_random_key(32);
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &key).expect("valid base64url");
+        assert_eq!(decoded.len(), 32);
     }
 
     #[test]

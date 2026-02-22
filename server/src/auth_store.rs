@@ -240,6 +240,17 @@ impl AuthStore {
             .find(|k| k.key_hash == key_hash && k.is_active())
             .cloned()
     }
+
+    pub fn revoke_api_key(&self, id: &str) -> bool {
+        let mut keys = self.api_keys.lock().expect("auth store api_keys lock poisoned");
+        let Some(key) = keys.iter_mut().find(|k| k.id == id) else {
+            drop(keys);
+            return false;
+        };
+        key.revoked_at = Some(unix_now());
+        drop(keys);
+        true
+    }
 }
 
 impl Default for AuthStore {
@@ -383,6 +394,24 @@ mod tests {
     fn find_active_api_key_by_hash_returns_none_for_an_unknown_hash() {
         let store = AuthStore::new();
         assert!(store.find_active_api_key_by_hash("never-issued").is_none());
+    }
+
+    #[test]
+    fn revoke_api_key_makes_it_stop_matching_find_active_api_key_by_hash() {
+        let store = AuthStore::new();
+        let key = ApiKey::new("user-1".to_string(), "ci key".to_string(), "real-hash".to_string(), "prefix".to_string());
+        let id = key.id.clone();
+        store.insert_api_key(key);
+        assert!(store.find_active_api_key_by_hash("real-hash").is_some());
+
+        assert!(store.revoke_api_key(&id));
+        assert!(store.find_active_api_key_by_hash("real-hash").is_none());
+    }
+
+    #[test]
+    fn revoke_api_key_returns_false_for_an_unknown_id() {
+        let store = AuthStore::new();
+        assert!(!store.revoke_api_key("never-existed"));
     }
 
     #[test]

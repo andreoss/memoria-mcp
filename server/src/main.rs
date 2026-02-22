@@ -429,6 +429,103 @@ fn handle_auth_onboarding_complete(
     (200, serde_json::to_vec(&UserProfileResponse::from(&updated)).unwrap_or_default())
 }
 
+const API_KEY_LENGTH_BYTES: usize = 24;
+const API_KEY_PREFIX_LEN: usize = 8;
+
+#[derive(serde::Deserialize)]
+struct CreateApiKeyRequest {
+    label: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CreateApiKeyResponse {
+    id: String,
+    key: String,
+    label: String,
+    key_prefix: String,
+    created_at: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ApiKeyListItem {
+    id: String,
+    label: String,
+    key_prefix: String,
+    created_at: u64,
+    revoked_at: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ApiKeyListResponse {
+    keys: Vec<ApiKeyListItem>,
+}
+
+impl From<&auth_store::ApiKey> for ApiKeyListItem {
+    fn from(key: &auth_store::ApiKey) -> Self {
+        Self {
+            id: key.id.clone(),
+            label: key.label.clone(),
+            key_prefix: key.key_prefix.clone(),
+            created_at: key.created_at,
+            revoked_at: key.revoked_at,
+        }
+    }
+}
+
+fn handle_create_api_key(
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    let request: CreateApiKeyRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    if request.label.is_empty() {
+        return (400, error_body("label must not be empty"));
+    }
+    let raw_key = crypto::generate_random_key(API_KEY_LENGTH_BYTES);
+    let key_hash = crypto::sha256_hex(raw_key.as_bytes());
+    let key_prefix: String = raw_key.chars().take(API_KEY_PREFIX_LEN).collect();
+    let record = auth_store::ApiKey::new(user.id, request.label, key_hash, key_prefix.clone());
+    let response =
+        CreateApiKeyResponse { id: record.id.clone(), key: raw_key, label: record.label.clone(), key_prefix, created_at: record.created_at };
+    auth_store.insert_api_key(record);
+    (201, serde_json::to_vec(&response).unwrap_or_default())
+}
+
+fn handle_list_api_keys(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], headers: &[(String, String)]) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    let keys: Vec<ApiKeyListItem> = auth_store.find_api_keys_by_user(&user.id).iter().map(ApiKeyListItem::from).collect();
+    (200, serde_json::to_vec(&ApiKeyListResponse { keys }).unwrap_or_default())
+}
+
+fn handle_revoke_api_key(
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    key_id: &str,
+) -> (u16, Vec<u8>) {
+    let Some(user) = current_user_from_headers(auth_store, jwt_secret, headers) else {
+        return (401, error_body("a valid access token identifying a real user is required"));
+    };
+    let owns_key = auth_store.find_api_keys_by_user(&user.id).iter().any(|k| k.id == key_id);
+    if !owns_key {
+        return (404, error_body("api key not found"));
+    }
+    if auth_store.revoke_api_key(key_id) {
+        (200, Vec::new())
+    } else {
+        (404, error_body("api key not found"))
+    }
+}
+
 fn handle_create_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
@@ -860,6 +957,25 @@ where
     }
     if req.method == "POST" && req.path == "/auth/onboarding-complete" {
         let result = handle_auth_onboarding_complete(&state.auth_store, &state.jwt_secret, &req.headers);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    let (path_only, _query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
+    if req.method == "POST" && segments.as_slice() == ["api-keys"] {
+        let result = handle_create_api_key(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
+        if result.0 == 201 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return result;
+    }
+    if req.method == "GET" && segments.as_slice() == ["api-keys"] {
+        return handle_list_api_keys(&state.auth_store, &state.jwt_secret, &req.headers);
+    }
+    if let ("DELETE", ["api-keys", id]) = (req.method.as_str(), segments.as_slice()) {
+        let result = handle_revoke_api_key(&state.auth_store, &state.jwt_secret, &req.headers, id);
         if result.0 == 200 {
             let _ = state.auth_store.save(&state.auth_store_path);
         }
@@ -1731,6 +1847,111 @@ mod tests {
         let store = auth_store::AuthStore::new();
         let (status, _) = handle_auth_onboarding_complete(&store, b"jwt-secret", &[]);
         assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_create_api_key_happy_path_returns_a_real_raw_key_once() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let body = br#"{"label":"ci key"}"#;
+        let (status, response) = handle_create_api_key(&store, b"jwt-secret", &bearer_headers(&token), body);
+        assert_eq!(status, 201);
+        let created: CreateApiKeyResponse = serde_json::from_slice(&response).expect("expected valid JSON");
+        assert_eq!(created.label, "ci key");
+        assert!(!created.key.is_empty());
+        assert!(created.key.starts_with(&created.key_prefix));
+
+        let key_hash = crypto::sha256_hex(created.key.as_bytes());
+        assert!(store.find_active_api_key_by_hash(&key_hash).is_some(), "the returned raw key must actually authenticate");
+    }
+
+    #[test]
+    fn handle_create_api_key_rejects_a_missing_token() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_create_api_key(&store, b"jwt-secret", &[], br#"{"label":"x"}"#);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_create_api_key_rejects_an_empty_label() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (status, _) = handle_create_api_key(&store, b"jwt-secret", &bearer_headers(&token), br#"{"label":""}"#);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_list_api_keys_never_includes_the_raw_key() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        handle_create_api_key(&store, b"jwt-secret", &bearer_headers(&token), br#"{"label":"ci key"}"#);
+
+        let (status, response) = handle_list_api_keys(&store, b"jwt-secret", &bearer_headers(&token));
+        assert_eq!(status, 200);
+        assert!(!String::from_utf8_lossy(&response).contains("\"key\":"), "the list response must never carry the raw key field");
+        let listed: ApiKeyListResponse = serde_json::from_slice(&response).expect("expected valid JSON");
+        assert_eq!(listed.keys.len(), 1);
+        assert_eq!(listed.keys[0].label, "ci key");
+    }
+
+    #[test]
+    fn handle_list_api_keys_only_returns_the_callers_own_keys() {
+        let store = auth_store::AuthStore::new();
+        store.insert_api_key(auth_store::ApiKey::new(
+            "someone-elses-user-id".to_string(),
+            "not mine".to_string(),
+            "hash".to_string(),
+            "prefix".to_string(),
+        ));
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (_, response) = handle_list_api_keys(&store, b"jwt-secret", &bearer_headers(&token));
+        let listed: ApiKeyListResponse = serde_json::from_slice(&response).expect("expected valid JSON");
+        assert!(listed.keys.is_empty());
+    }
+
+    #[test]
+    fn handle_revoke_api_key_makes_the_raw_key_stop_authenticating() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (_, create_response) = handle_create_api_key(&store, b"jwt-secret", &bearer_headers(&token), br#"{"label":"ci key"}"#);
+        let created: CreateApiKeyResponse = serde_json::from_slice(&create_response).expect("expected valid JSON");
+
+        let (status, _) = handle_revoke_api_key(&store, b"jwt-secret", &bearer_headers(&token), &created.id);
+        assert_eq!(status, 200);
+
+        let key_hash = crypto::sha256_hex(created.key.as_bytes());
+        assert!(store.find_active_api_key_by_hash(&key_hash).is_none(), "a revoked key must stop authenticating immediately");
+    }
+
+    #[test]
+    fn handle_revoke_api_key_rejects_revoking_someone_elses_key() {
+        let store = auth_store::AuthStore::new();
+        let owner_token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (_, create_response) =
+            handle_create_api_key(&store, b"jwt-secret", &bearer_headers(&owner_token), br#"{"label":"ci key"}"#);
+        let created: CreateApiKeyResponse = serde_json::from_slice(&create_response).expect("expected valid JSON");
+
+        let attacker_password_hash =
+            crypto::hash_password_with_iterations("attacker password", CHEAP_NON_PRODUCTION_ITERATIONS_FOR_TEST_SETUP);
+        let attacker = auth_store::User::new(
+            "Mallory".to_string(),
+            "mallory@example.com".to_string(),
+            attacker_password_hash,
+            auth_store::Role::User,
+        );
+        store.insert_user(attacker.clone());
+        let attacker_token = issue_auth_tokens(&store, b"jwt-secret", &attacker).access_token;
+
+        let (status, _) = handle_revoke_api_key(&store, b"jwt-secret", &bearer_headers(&attacker_token), &created.id);
+        assert_eq!(status, 404, "revoking a key that belongs to a different user must not succeed or leak that it exists");
+    }
+
+    #[test]
+    fn handle_revoke_api_key_rejects_an_unknown_id() {
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (status, _) = handle_revoke_api_key(&store, b"jwt-secret", &bearer_headers(&token), "never-existed");
+        assert_eq!(status, 404);
     }
 
     #[test]
