@@ -227,14 +227,18 @@ struct SetupStatusResponse {
     setup_complete: bool,
 }
 
-fn issue_auth_tokens(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], user: &auth_store::User) -> AuthTokenResponse {
+fn build_access_token(user: &auth_store::User, jwt_secret: &[u8]) -> String {
     let now = auth_store::unix_now();
     let role_str = match user.role {
         auth_store::Role::Admin => "admin",
         auth_store::Role::User => "user",
     };
     let claims = serde_json::json!({"sub": user.id, "role": role_str, "iat": now, "exp": now + ACCESS_TOKEN_TTL_SECS});
-    let access_token = crypto::encode_jwt(&claims, jwt_secret);
+    crypto::encode_jwt(&claims, jwt_secret)
+}
+
+fn issue_auth_tokens(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], user: &auth_store::User) -> AuthTokenResponse {
+    let access_token = build_access_token(user, jwt_secret);
     let refresh_token = auth_store.issue_refresh_token(&user.id);
     AuthTokenResponse { access_token, refresh_token, token_type: "bearer".to_string() }
 }
@@ -260,6 +264,56 @@ fn handle_auth_register(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], b
 fn handle_auth_setup_status(auth_store: &auth_store::AuthStore) -> (u16, Vec<u8>) {
     let setup_complete = !auth_store::registration_is_allowed(auth_store.user_count());
     (200, serde_json::to_vec(&SetupStatusResponse { setup_complete }).unwrap_or_default())
+}
+
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| crypto::hash_password("dummy-password-for-login-timing-safety"))
+}
+
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+fn handle_auth_login(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], body: &[u8]) -> (u16, Vec<u8>) {
+    let request: LoginRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    let user = auth_store.find_user_by_email(&request.email);
+    let password_to_check = user.as_ref().map_or_else(|| dummy_password_hash().to_string(), |u| u.password_hash.clone());
+    let password_ok = crypto::verify_password(&request.password, &password_to_check);
+    let Some(user) = user.filter(|_| password_ok) else {
+        return (401, error_body("invalid email or password"));
+    };
+    let tokens = issue_auth_tokens(auth_store, jwt_secret, &user);
+    (200, serde_json::to_vec(&tokens).unwrap_or_default())
+}
+
+#[derive(serde::Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+fn handle_auth_refresh(auth_store: &auth_store::AuthStore, jwt_secret: &[u8], body: &[u8]) -> (u16, Vec<u8>) {
+    let request: RefreshRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    let (new_jti, user_id) = match auth_store.rotate_refresh_token(&request.refresh_token) {
+        Ok(rotated) => rotated,
+        Err(auth_store::RefreshError::Unknown | auth_store::RefreshError::AlreadyUsed) => {
+            return (401, error_body("invalid or already-used refresh token"));
+        }
+    };
+    let Some(user) = auth_store.find_user_by_id(&user_id) else {
+        return (401, error_body("invalid or already-used refresh token"));
+    };
+    let access_token = build_access_token(&user, jwt_secret);
+    let response = AuthTokenResponse { access_token, refresh_token: new_jti, token_type: "bearer".to_string() };
+    (200, serde_json::to_vec(&response).unwrap_or_default())
 }
 
 fn handle_create_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
@@ -664,6 +718,18 @@ where
                     result
                 } else if req.method == "GET" && req.path == "/auth/setup-status" {
                     handle_auth_setup_status(&blocking_state.auth_store)
+                } else if req.method == "POST" && req.path == "/auth/login" {
+                    let result = handle_auth_login(&blocking_state.auth_store, &blocking_state.jwt_secret, &req.body);
+                    if result.0 == 200 {
+                        let _ = blocking_state.auth_store.save(&blocking_state.auth_store_path);
+                    }
+                    result
+                } else if req.method == "POST" && req.path == "/auth/refresh" {
+                    let result = handle_auth_refresh(&blocking_state.auth_store, &blocking_state.jwt_secret, &req.body);
+                    if result.0 == 200 {
+                        let _ = blocking_state.auth_store.save(&blocking_state.auth_store_path);
+                    }
+                    result
                 } else if is_authorized(blocking_state.token.as_deref(), &req.headers) {
                     let result = route(&blocking_state.memory, &req);
                     if is_successful_mutation(&req.method, &req.path, result.0) {
@@ -838,6 +904,19 @@ mod tests {
             auth_store_path: test_auth_store_path(),
             jwt_secret: test_jwt_secret(),
         })
+    }
+
+    async fn post_over_tcp(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+        let request = format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+        stream.write_all(request.as_bytes()).await.expect("write should succeed");
+        stream.write_all(body).await.expect("write should succeed");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.expect("read should succeed");
+        let text = String::from_utf8(response).expect("response should be valid utf8");
+        let status: u16 = text.split_whitespace().nth(1).expect("a status line").parse().expect("a numeric status");
+        let json_start = text.find("\r\n\r\n").expect("a header/body separator") + 4;
+        (status, text.as_bytes()[json_start..].to_vec())
     }
 
     #[test]
@@ -1283,6 +1362,90 @@ mod tests {
     }
 
     #[test]
+    fn handle_auth_login_happy_path_returns_200_with_real_tokens() {
+        let store = auth_store::AuthStore::new();
+        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+        handle_auth_register(&store, b"jwt-secret", register_body);
+
+        let login_body = br#"{"email":"alice@example.com","password":"correct horse battery staple"}"#;
+        let (status, response_body) = handle_auth_login(&store, b"jwt-secret", login_body);
+        assert_eq!(status, 200);
+        let response: AuthTokenResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(crypto::decode_jwt(&response.access_token, b"jwt-secret", auth_store::unix_now()).is_ok());
+    }
+
+    #[test]
+    fn handle_auth_login_rejects_the_wrong_password() {
+        let store = auth_store::AuthStore::new();
+        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+        handle_auth_register(&store, b"jwt-secret", register_body);
+
+        let login_body = br#"{"email":"alice@example.com","password":"wrong password"}"#;
+        let (status, _) = handle_auth_login(&store, b"jwt-secret", login_body);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_login_rejects_an_unknown_email_taking_the_same_code_path_as_a_wrong_password() {
+        let store = auth_store::AuthStore::new();
+        let login_body = br#"{"email":"nobody@example.com","password":"anything"}"#;
+        let (status, response_body) = handle_auth_login(&store, b"jwt-secret", login_body);
+        assert_eq!(status, 401);
+        let response: ErrorResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.error, "invalid email or password");
+    }
+
+    #[test]
+    fn handle_auth_login_rejects_malformed_json_body() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_auth_login(&store, b"jwt-secret", b"not json");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_auth_refresh_happy_path_rotates_and_returns_a_new_access_token() {
+        let store = auth_store::AuthStore::new();
+        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+        let (_, register_response) = handle_auth_register(&store, b"jwt-secret", register_body);
+        let tokens: AuthTokenResponse = serde_json::from_slice(&register_response).expect("expected valid JSON");
+
+        let refresh_body = serde_json::to_vec(&serde_json::json!({"refresh_token": tokens.refresh_token})).expect("valid JSON");
+        let (status, response_body) = handle_auth_refresh(&store, b"jwt-secret", &refresh_body);
+        assert_eq!(status, 200);
+        let refreshed: AuthTokenResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_ne!(refreshed.refresh_token, tokens.refresh_token);
+        assert!(crypto::decode_jwt(&refreshed.access_token, b"jwt-secret", auth_store::unix_now()).is_ok());
+    }
+
+    #[test]
+    fn handle_auth_refresh_rejects_reuse_of_an_already_rotated_token() {
+        let store = auth_store::AuthStore::new();
+        let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+        let (_, register_response) = handle_auth_register(&store, b"jwt-secret", register_body);
+        let tokens: AuthTokenResponse = serde_json::from_slice(&register_response).expect("expected valid JSON");
+
+        let refresh_body = serde_json::to_vec(&serde_json::json!({"refresh_token": tokens.refresh_token})).expect("valid JSON");
+        handle_auth_refresh(&store, b"jwt-secret", &refresh_body);
+        let (status, _) = handle_auth_refresh(&store, b"jwt-secret", &refresh_body);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_refresh_rejects_an_unknown_token() {
+        let store = auth_store::AuthStore::new();
+        let refresh_body = br#"{"refresh_token":"never-issued"}"#;
+        let (status, _) = handle_auth_refresh(&store, b"jwt-secret", refresh_body);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn handle_auth_refresh_rejects_malformed_json_body() {
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_auth_refresh(&store, b"jwt-secret", b"not json");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
     fn handle_create_memory_happy_path_returns_201_with_ids() {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
@@ -1679,6 +1842,40 @@ mod tests {
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
             assert!(response_text.contains("\"access_token\""));
+        });
+    }
+
+    #[test]
+    fn server_handles_a_real_register_login_refresh_flow_over_tcp() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, None, RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
+
+            let register_body = br#"{"name":"Alice","email":"alice@example.com","password":"correct horse battery staple"}"#;
+            let (register_status, _) = post_over_tcp(addr, "/auth/register", register_body).await;
+            assert_eq!(register_status, 201);
+
+            let login_body = br#"{"email":"alice@example.com","password":"correct horse battery staple"}"#;
+            let (login_status, login_response) = post_over_tcp(addr, "/auth/login", login_body).await;
+            assert_eq!(login_status, 200);
+            let logged_in: AuthTokenResponse = serde_json::from_slice(&login_response).expect("valid JSON");
+            let decoded = crypto::decode_jwt(&logged_in.access_token, b"test-jwt-secret", auth_store::unix_now())
+                .expect("a real login's JWT must decode and verify");
+            assert_eq!(decoded["role"], "admin");
+
+            let refresh_body =
+                serde_json::to_vec(&serde_json::json!({"refresh_token": logged_in.refresh_token})).expect("valid JSON");
+            let (refresh_status, refresh_response) = post_over_tcp(addr, "/auth/refresh", &refresh_body).await;
+            assert_eq!(refresh_status, 200);
+            let refreshed: AuthTokenResponse = serde_json::from_slice(&refresh_response).expect("valid JSON");
+            assert_ne!(refreshed.refresh_token, logged_in.refresh_token);
+
+            let (reuse_status, _) = post_over_tcp(addr, "/auth/refresh", &refresh_body).await;
+            assert_eq!(reuse_status, 401, "a refresh token must not work a second time after it has already rotated");
         });
     }
 

@@ -139,7 +139,7 @@ impl AuthStore {
         jti
     }
 
-    pub fn rotate_refresh_token(&self, presented_jti: &str) -> Result<String, RefreshError> {
+    pub fn rotate_refresh_token(&self, presented_jti: &str) -> Result<(String, String), RefreshError> {
         let mut tokens = self.refresh_tokens.lock().expect("auth store refresh_tokens lock poisoned");
         let Some(existing) = tokens.iter_mut().find(|t| t.jti == presented_jti) else {
             return Err(RefreshError::Unknown);
@@ -149,11 +149,11 @@ impl AuthStore {
         }
         existing.revoked_at = Some(unix_now());
         let user_id = existing.user_id.clone();
-        let new_record = RefreshTokenRecord::new(user_id);
+        let new_record = RefreshTokenRecord::new(user_id.clone());
         let new_jti = new_record.jti.clone();
         tokens.push(new_record);
         drop(tokens);
-        Ok(new_jti)
+        Ok((new_jti, user_id))
     }
 
     pub fn insert_user(&self, user: User) {
@@ -289,8 +289,9 @@ mod tests {
     fn rotate_refresh_token_succeeds_once_and_returns_a_new_jti() {
         let store = AuthStore::new();
         let jti = store.issue_refresh_token("user-1");
-        let new_jti = store.rotate_refresh_token(&jti).expect("first rotation must succeed");
+        let (new_jti, user_id) = store.rotate_refresh_token(&jti).expect("first rotation must succeed");
         assert_ne!(jti, new_jti, "rotation must issue a genuinely new token, not reuse the old one");
+        assert_eq!(user_id, "user-1");
     }
 
     #[test]
@@ -312,7 +313,9 @@ mod tests {
         let store = AuthStore::new();
         let mut jti = store.issue_refresh_token("user-1");
         for _ in 0..5 {
-            jti = store.rotate_refresh_token(&jti).expect("each rotation in the chain must succeed");
+            let (new_jti, user_id) = store.rotate_refresh_token(&jti).expect("each rotation in the chain must succeed");
+            assert_eq!(user_id, "user-1", "rotation must preserve the original owner across the whole chain");
+            jti = new_jti;
         }
         assert!(store.rotate_refresh_token(&jti).is_ok(), "the final token in the chain must still be usable once");
     }
