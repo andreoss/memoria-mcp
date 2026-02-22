@@ -526,6 +526,88 @@ fn handle_revoke_api_key(
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EntityItem {
+    entity_type: String,
+    entity_id: String,
+    memory_count: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EntitiesResponse {
+    entities: Vec<EntityItem>,
+}
+
+const ENTITY_SCOPE_FIELDS: [&str; 3] = ["user_id", "agent_id", "run_id"];
+
+fn handle_list_entities<L, E, V>(memory: &Memory<L, E, V>) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let ids = memory.list(0, usize::MAX).unwrap_or_default();
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for id in ids {
+        let Ok(Some(record)) = memory.get(&id) else {
+            continue;
+        };
+        for field in ENTITY_SCOPE_FIELDS {
+            if let Some(value) = record.payload.get(field) {
+                *counts.entry((field.to_string(), value.clone())).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut entities: Vec<EntityItem> = counts
+        .into_iter()
+        .map(|((entity_type, entity_id), memory_count)| EntityItem { entity_type, entity_id, memory_count })
+        .collect();
+    entities.sort_by(|a, b| (&a.entity_type, &a.entity_id).cmp(&(&b.entity_type, &b.entity_id)));
+    (200, serde_json::to_vec(&EntitiesResponse { entities }).unwrap_or_default())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConfigureResponse {
+    llm_provider: String,
+    embedding_provider: String,
+}
+
+fn handle_get_configure(llm_label: &str, embedding_label: &str) -> (u16, Vec<u8>) {
+    let response = ConfigureResponse { llm_provider: llm_label.to_string(), embedding_provider: embedding_label.to_string() };
+    (200, serde_json::to_vec(&response).unwrap_or_default())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConfigureProvidersResponse {
+    llm_providers: Vec<String>,
+    embedding_providers: Vec<String>,
+}
+
+fn handle_get_configure_providers() -> (u16, Vec<u8>) {
+    let response = ConfigureProvidersResponse {
+        llm_providers: vec!["local".to_string(), "ollama".to_string()],
+        embedding_providers: vec!["local".to_string(), "ollama".to_string()],
+    };
+    (200, serde_json::to_vec(&response).unwrap_or_default())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GenerateInstructionsResponse {
+    instructions: String,
+}
+
+fn handle_generate_instructions(llm_label: &str, embedding_label: &str, auth_required: bool) -> (u16, Vec<u8>) {
+    let auth_line = if auth_required {
+        "This server requires authentication: register the first account with POST /auth/register, then log in with POST /auth/login."
+    } else {
+        "This server has no authentication configured (MEMORIA_ALLOW_NO_AUTH=1) -- every route is open."
+    };
+    let instructions = format!(
+        "Welcome to memoria.\n\nLLM provider: {llm_label}\nEmbedding provider: {embedding_label}\n\n{auth_line}\n\nCreate a memory with POST /memories, search with POST /search, and see docs/overview.md for the full API surface."
+    );
+    (200, serde_json::to_vec(&GenerateInstructionsResponse { instructions }).unwrap_or_default())
+}
+
 fn handle_create_memory<L, E, V>(memory: &Memory<L, E, V>, body: &[u8]) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
@@ -890,6 +972,8 @@ where
     token: Option<String>,
     rate_limiter: RateLimiter,
     cors_origin: Option<String>,
+    llm_label: String,
+    embedding_label: String,
     store_path: PathBuf,
     auth_store: auth_store::AuthStore,
     auth_store_path: PathBuf,
@@ -980,6 +1064,18 @@ where
             let _ = state.auth_store.save(&state.auth_store_path);
         }
         return result;
+    }
+    if req.method == "GET" && req.path == "/entities" {
+        return handle_list_entities(&state.memory);
+    }
+    if req.method == "GET" && req.path == "/configure" {
+        return handle_get_configure(&state.llm_label, &state.embedding_label);
+    }
+    if req.method == "GET" && req.path == "/configure/providers" {
+        return handle_get_configure_providers();
+    }
+    if req.method == "POST" && req.path == "/generate-instructions" {
+        return handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some());
     }
     let result = route(&state.memory, req);
     if is_successful_mutation(&req.method, &req.path, result.0) {
@@ -1132,8 +1228,18 @@ fn main() {
 
     let rate_limiter = RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC);
     let memory = Memory::new(llm_provider, embedding_provider, store);
-    let state_outliving_the_runtime =
-        Arc::new(ServerState { memory, token, rate_limiter, cors_origin, store_path, auth_store, auth_store_path, jwt_secret });
+    let state_outliving_the_runtime = Arc::new(ServerState {
+        memory,
+        token,
+        rate_limiter,
+        cors_origin,
+        llm_label,
+        embedding_label,
+        store_path,
+        auth_store,
+        auth_store_path,
+        jwt_secret,
+    });
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
@@ -1189,6 +1295,8 @@ mod tests {
             token,
             rate_limiter,
             cors_origin,
+            llm_label: "test-llm".to_string(),
+            embedding_label: "test-embedding".to_string(),
             store_path,
             auth_store: auth_store::AuthStore::new(),
             auth_store_path: test_auth_store_path(),
@@ -1952,6 +2060,72 @@ mod tests {
         let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
         let (status, _) = handle_revoke_api_key(&store, b"jwt-secret", &bearer_headers(&token), "never-existed");
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn handle_list_entities_groups_real_records_by_scope_field() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        handle_create_memory(&memory, br#"{"content":"Alice likes tea.","user_id":"alice"}"#);
+        handle_create_memory(&memory, br#"{"content":"Bob is a designer.","user_id":"bob"}"#);
+        handle_create_memory(&memory, br#"{"content":"Task one.","run_id":"run-1"}"#);
+
+        let (status, body) = handle_list_entities(&memory);
+        assert_eq!(status, 200);
+        let response: EntitiesResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+
+        let alice = response.entities.iter().find(|e| e.entity_type == "user_id" && e.entity_id == "alice").expect("alice entity");
+        assert_eq!(alice.memory_count, 2);
+        let bob = response.entities.iter().find(|e| e.entity_type == "user_id" && e.entity_id == "bob").expect("bob entity");
+        assert_eq!(bob.memory_count, 1);
+        let run = response.entities.iter().find(|e| e.entity_type == "run_id" && e.entity_id == "run-1").expect("run entity");
+        assert_eq!(run.memory_count, 1);
+    }
+
+    #[test]
+    fn handle_list_entities_with_no_records_is_empty() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, body) = handle_list_entities(&memory);
+        assert_eq!(status, 200);
+        let response: EntitiesResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.entities.is_empty());
+    }
+
+    #[test]
+    fn handle_get_configure_reports_the_real_active_providers() {
+        let (status, body) = handle_get_configure("OllamaLlmProvider", "OllamaEmbeddingProvider");
+        assert_eq!(status, 200);
+        let response: ConfigureResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(response.llm_provider, "OllamaLlmProvider");
+        assert_eq!(response.embedding_provider, "OllamaEmbeddingProvider");
+    }
+
+    #[test]
+    fn handle_get_configure_providers_lists_both_real_choices() {
+        let (status, body) = handle_get_configure_providers();
+        assert_eq!(status, 200);
+        let response: ConfigureProvidersResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.llm_providers.contains(&"local".to_string()));
+        assert!(response.llm_providers.contains(&"ollama".to_string()));
+        assert!(response.embedding_providers.contains(&"local".to_string()));
+        assert!(response.embedding_providers.contains(&"ollama".to_string()));
+    }
+
+    #[test]
+    fn handle_generate_instructions_mentions_the_real_active_providers() {
+        let (status, body) = handle_generate_instructions("LocalSentenceLlmProvider", "LocalHashEmbeddingProvider", true);
+        assert_eq!(status, 200);
+        let response: GenerateInstructionsResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.instructions.contains("LocalSentenceLlmProvider"));
+        assert!(response.instructions.contains("LocalHashEmbeddingProvider"));
+        assert!(response.instructions.contains("/auth/register"));
+    }
+
+    #[test]
+    fn handle_generate_instructions_reflects_no_auth_mode() {
+        let (_, body) = handle_generate_instructions("local", "local", false);
+        let response: GenerateInstructionsResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.instructions.contains("no authentication"));
     }
 
     #[test]
