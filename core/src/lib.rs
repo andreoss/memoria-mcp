@@ -2,6 +2,7 @@
 
 pub mod embedding;
 pub mod error;
+pub mod filter;
 pub mod llm;
 pub mod memory;
 pub mod vector_store;
