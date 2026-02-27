@@ -229,6 +229,66 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
     }
 }
 
+#[cfg(feature = "fastembed")]
+const FASTEMBED_MODEL_NAME: &str = "all-MiniLM-L6-v2";
+
+#[cfg(feature = "fastembed")]
+pub struct FastEmbedEmbeddingProvider {
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
+}
+
+#[cfg(feature = "fastembed")]
+impl FastEmbedEmbeddingProvider {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn from_config(config: &EmbeddingConfig, cache_dir: Option<std::path::PathBuf>) -> Result<Self, crate::CoreError> {
+        config.validate()?;
+        if config.model != FASTEMBED_MODEL_NAME {
+            return Err(crate::CoreError::Config(format!(
+                "unsupported fastembed model {:?}: only {FASTEMBED_MODEL_NAME:?} is supported",
+                config.model
+            )));
+        }
+        let mut options = fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2);
+        if let Some(cache_dir) = cache_dir {
+            options = options.with_cache_dir(cache_dir);
+        }
+        let model = fastembed::TextEmbedding::try_new(options)
+            .map_err(|err| crate::CoreError::Config(format!("fastembed model init failed: {err}")))?;
+        Ok(Self { model: std::sync::Mutex::new(model) })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl EmbeddingProvider for FastEmbedEmbeddingProvider {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if text.is_empty() {
+            return Err(EmbeddingError::EmptyInput);
+        }
+        let mut vectors = self.embed_many(&[text])?;
+        Ok(vectors.remove(0))
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.iter().any(|text| text.is_empty()) {
+            return Err(EmbeddingError::EmptyInput);
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.embed_many(texts)
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl FastEmbedEmbeddingProvider {
+    fn embed_many(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let mut model = self.model.lock().expect("lock poisoned");
+        model
+            .embed(texts, None)
+            .map_err(|err| EmbeddingError::Backend(err.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EmbeddingConfig, EmbeddingContractTests, EmbeddingError, EmbeddingProvider, LocalHashEmbeddingProvider};
@@ -445,6 +505,59 @@ mod tests {
             let related_a = provider.embed("Alice works as a nurse at the downtown hospital.").expect("embed should succeed");
             let related_b = provider.embed("Alice recently started a new nursing position at the hospital.").expect("embed should succeed");
             let unrelated = provider.embed("The weather in Paris was cold and rainy yesterday.").expect("embed should succeed");
+
+            let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+            let norm = |a: &[f32]| -> f32 { a.iter().map(|x| x * x).sum::<f32>().sqrt() };
+            let cosine = |a: &[f32], b: &[f32]| dot(a, b) / (norm(a) * norm(b));
+
+            let related_similarity = cosine(&related_a, &related_b);
+            let unrelated_similarity = cosine(&related_a, &unrelated);
+            assert!(
+                related_similarity > unrelated_similarity,
+                "related sentences ({related_similarity}) should be more similar than unrelated ones ({unrelated_similarity})"
+            );
+        }
+    }
+
+    #[cfg(feature = "fastembed")]
+    mod fastembed_tests {
+        use super::super::{FastEmbedEmbeddingProvider, FASTEMBED_MODEL_NAME};
+        use super::*;
+
+        fn valid_config() -> EmbeddingConfig {
+            EmbeddingConfig { model: FASTEMBED_MODEL_NAME.to_string(), base_url: None, api_key: None, dimensions: None }
+        }
+
+        #[test]
+        fn from_config_rejects_an_invalid_config_before_touching_the_model() {
+            let config = EmbeddingConfig { model: String::new(), base_url: None, api_key: None, dimensions: None };
+            assert!(matches!(FastEmbedEmbeddingProvider::from_config(&config, None), Err(crate::CoreError::Config(_))));
+        }
+
+        #[test]
+        fn from_config_rejects_an_unsupported_model_name_before_touching_the_model() {
+            let config = EmbeddingConfig { model: "some-other-model".to_string(), base_url: None, api_key: None, dimensions: None };
+            assert!(matches!(FastEmbedEmbeddingProvider::from_config(&config, None), Err(crate::CoreError::Config(_))));
+        }
+
+        #[test]
+        #[ignore = "downloads a real ~188MB model + ONNX runtime on first run; needs real network access"]
+        fn real_fastembed_model_produces_a_real_semantic_embedding() {
+            let cache_dir = std::env::var("MEMORIA_TEST_FASTEMBED_CACHE_DIR").ok().map(std::path::PathBuf::from);
+            let provider =
+                FastEmbedEmbeddingProvider::from_config(&valid_config(), cache_dir).expect("valid config should construct");
+
+            provider.contract_happy_path();
+            provider.contract_rejects_empty_string();
+            provider.contract_embed_is_deterministic();
+            provider.contract_embed_batch_matches_individual_calls();
+            provider.contract_embed_batch_empty_list_returns_empty();
+
+            let related_a = provider.embed("Alice is a backend engineer.").expect("embed should succeed");
+            let related_b = provider.embed("Alice works on backend systems.").expect("embed should succeed");
+            let unrelated = provider.embed("The weather in Paris is sunny today.").expect("embed should succeed");
+
+            assert_eq!(related_a.len(), 384, "all-MiniLM-L6-v2 produces 384-dimension vectors");
 
             let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
             let norm = |a: &[f32]| -> f32 { a.iter().map(|x| x * x).sum::<f32>().sqrt() };
