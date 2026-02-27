@@ -326,4 +326,79 @@ mod tests {
         assert!(evaluate(&expr, &payload(&[("priority", "10")])));
         assert!(!evaluate(&expr, &payload(&[("priority", "11")])));
     }
+
+    #[test]
+    fn gt_gte_lt_lte_compare_numerically_when_both_sides_are_real_numbers() {
+        let field = HashMap::from([("priority".to_string(), "10".to_string())]);
+        assert!(evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Gt(FilterValue::Number(5.0))), &field));
+        assert!(!evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Gt(FilterValue::Number(10.0))), &field));
+        assert!(evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Gte(FilterValue::Number(10.0))), &field));
+        assert!(evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Lt(FilterValue::Number(20.0))), &field));
+        assert!(!evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Lt(FilterValue::Number(10.0))), &field));
+        assert!(evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Lte(FilterValue::Number(10.0))), &field));
+    }
+
+    #[test]
+    fn gt_gte_lt_lte_fall_back_to_lexicographic_comparison_on_a_real_expiration_date_shaped_field() {
+        let field = HashMap::from([("expiration_date".to_string(), "2026-06-15".to_string())]);
+        assert!(evaluate(
+            &FilterExpr::Field("expiration_date".to_string(), FilterOp::Gt(FilterValue::String("2026-01-01".to_string()))),
+            &field
+        ));
+        assert!(!evaluate(
+            &FilterExpr::Field("expiration_date".to_string(), FilterOp::Lt(FilterValue::String("2026-01-01".to_string()))),
+            &field
+        ));
+        assert!(evaluate(
+            &FilterExpr::Field("expiration_date".to_string(), FilterOp::Lte(FilterValue::String("2026-06-15".to_string()))),
+            &field
+        ));
+    }
+
+    #[test]
+    fn gt_is_false_when_the_field_is_absent() {
+        let expr = FilterExpr::Field("priority".to_string(), FilterOp::Gt(FilterValue::Number(5.0)));
+        assert!(!evaluate(&expr, &payload(&[])));
+    }
+
+    #[test]
+    fn contains_matches_a_real_substring() {
+        let expr = FilterExpr::Field("content".to_string(), FilterOp::Contains("engineer".to_string()));
+        assert!(evaluate(&expr, &payload(&[("content", "Alice is an engineer.")])));
+        assert!(!evaluate(&expr, &payload(&[("content", "Alice is a designer.")])));
+    }
+
+    #[test]
+    fn contains_is_case_sensitive() {
+        let expr = FilterExpr::Field("content".to_string(), FilterOp::Contains("Engineer".to_string()));
+        assert!(!evaluate(&expr, &payload(&[("content", "alice is an engineer.")])));
+    }
+
+    #[test]
+    fn icontains_matches_regardless_of_case() {
+        let expr = FilterExpr::Field("content".to_string(), FilterOp::Icontains("ENGINEER".to_string()));
+        assert!(
+            evaluate(&expr, &payload(&[("content", "Alice is an engineer.")])),
+            "icontains must be genuinely case-insensitive (ADR-30)"
+        );
+    }
+
+    #[test]
+    fn icontains_still_fails_on_a_real_non_match() {
+        let expr = FilterExpr::Field("content".to_string(), FilterOp::Icontains("designer".to_string()));
+        assert!(!evaluate(&expr, &payload(&[("content", "Alice is an engineer.")])));
+    }
+
+    #[test]
+    fn parses_range_and_substring_operators_from_real_json() {
+        assert_eq!(parse(r#"{"priority": {"gt": 5}}"#), FilterExpr::Field("priority".to_string(), FilterOp::Gt(FilterValue::Number(5.0))));
+        assert_eq!(
+            parse(r#"{"content": {"contains": "engineer"}}"#),
+            FilterExpr::Field("content".to_string(), FilterOp::Contains("engineer".to_string()))
+        );
+        assert_eq!(
+            parse(r#"{"content": {"icontains": "ENGINEER"}}"#),
+            FilterExpr::Field("content".to_string(), FilterOp::Icontains("ENGINEER".to_string()))
+        );
+    }
 }
