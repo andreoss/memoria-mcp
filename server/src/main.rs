@@ -69,7 +69,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let ids = memory.list(0, usize::MAX).unwrap_or_default();
+    let ids = memory.list(0, usize::MAX, true).unwrap_or_default();
     let records: Vec<VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
     let data = serde_json::to_vec(&records).unwrap_or_default();
     write_atomically(path, &data)
@@ -172,6 +172,7 @@ struct CreateMemoryRequest {
     run_id: Option<String>,
     infer: Option<bool>,
     memory_type: Option<String>,
+    expiration_date: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -187,6 +188,16 @@ fn parse_message_role(role: &str) -> Option<Role> {
         "assistant" => Some(Role::Assistant),
         _ => None,
     }
+}
+
+fn is_valid_ymd_format(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -565,7 +576,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let ids = memory.list(0, usize::MAX).unwrap_or_default();
+    let ids = memory.list(0, usize::MAX, true).unwrap_or_default();
     let mut counts: HashMap<(String, String), usize> = HashMap::new();
     for id in ids {
         let Ok(Some(record)) = memory.get(&id) else {
@@ -641,6 +652,12 @@ where
     if let Some(memory_type) = request.memory_type {
         scope.insert("memory_type".to_string(), memory_type);
     }
+    if let Some(expiration_date) = request.expiration_date {
+        if !is_valid_ymd_format(&expiration_date) {
+            return (400, error_body(format!("expiration_date {expiration_date:?} must be in YYYY-MM-DD format")));
+        }
+        scope.insert("expiration_date".to_string(), expiration_date);
+    }
     let infer = request.infer.unwrap_or(true);
 
     let messages = if let Some(inputs) = request.messages {
@@ -689,6 +706,7 @@ struct SearchMemoryRequest {
     #[serde(default = "default_top_k")]
     top_k: usize,
     threshold: Option<f32>,
+    show_expired: Option<bool>,
 }
 
 const fn default_top_k() -> usize {
@@ -711,8 +729,9 @@ where
         Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
     };
     let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+    let show_expired = request.show_expired.unwrap_or(false);
 
-    match memory.search(&request.query, request.top_k, &scope, request.threshold) {
+    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired) {
         Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -881,8 +900,9 @@ where
     let params = parse_query(query);
     let offset = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100);
+    let show_expired = params.get("show_expired").is_some_and(|v| v == "true");
 
-    match memory.list(offset, limit) {
+    match memory.list(offset, limit, show_expired) {
         Ok(ids) => (200, serde_json::to_vec(&ListMemoryResponse { ids }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -2336,6 +2356,76 @@ mod tests {
         let body = br#"{"content":"x","user_id":"alice","memory_type":"totally-made-up-type","infer":false}"#;
         let (status, _) = handle_create_memory(&memory, body);
         assert_eq!(status, 201, "memory_type is opaque and must not be validated against a fixed set");
+    }
+
+    #[test]
+    fn handle_create_memory_stores_a_real_expiration_date() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"Expires soon.","user_id":"alice","expiration_date":"2099-01-01","infer":false}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("expiration_date"), Some(&"2099-01-01".to_string()));
+    }
+
+    #[test]
+    fn handle_create_memory_rejects_a_malformed_expiration_date() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"x","user_id":"alice","expiration_date":"not-a-date","infer":false}"#;
+        let (status, _) = handle_create_memory(&memory, body);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_search_memory_excludes_an_expired_record_by_default() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let create_body = br#"{"content":"An expired fact.","user_id":"alice","expiration_date":"2000-01-01","infer":false}"#;
+        handle_create_memory(&memory, create_body);
+
+        let search_body = br#"{"query":"fact","user_id":"alice"}"#;
+        let (_, response_body) = handle_search_memory(&memory, search_body);
+        let response: SearchMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(response.results.iter().all(|r| r.payload.get("content") != Some(&"An expired fact.".to_string())));
+    }
+
+    #[test]
+    fn handle_search_memory_includes_an_expired_record_with_show_expired_true() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let create_body = br#"{"content":"An expired fact.","user_id":"alice","expiration_date":"2000-01-01","infer":false}"#;
+        handle_create_memory(&memory, create_body);
+
+        let search_body = br#"{"query":"fact","user_id":"alice","show_expired":true}"#;
+        let (_, response_body) = handle_search_memory(&memory, search_body);
+        let response: SearchMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(response.results.iter().any(|r| r.payload.get("content") == Some(&"An expired fact.".to_string())));
+    }
+
+    #[test]
+    fn handle_list_memory_excludes_an_expired_record_by_default() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let create_body = br#"{"content":"An expired fact.","user_id":"alice","expiration_date":"2000-01-01","infer":false}"#;
+        let (_, create_response) = handle_create_memory(&memory, create_body);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_response).expect("expected valid JSON");
+        let expired_id = created.ids.first().expect("expected an id");
+
+        let (_, response_body) = handle_list_memory(&memory, "");
+        let response: ListMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(!response.ids.contains(expired_id));
+    }
+
+    #[test]
+    fn handle_list_memory_includes_an_expired_record_with_show_expired_query_param() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let create_body = br#"{"content":"An expired fact.","user_id":"alice","expiration_date":"2000-01-01","infer":false}"#;
+        let (_, create_response) = handle_create_memory(&memory, create_body);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_response).expect("expected valid JSON");
+        let expired_id = created.ids.first().expect("expected an id");
+
+        let (_, response_body) = handle_list_memory(&memory, "show_expired=true");
+        let response: ListMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert!(response.ids.contains(expired_id));
     }
 
     #[test]

@@ -129,7 +129,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let Ok(ids) = memory.list(0, usize::MAX) else {
+    let Ok(ids) = memory.list(0, usize::MAX, true) else {
         return;
     };
     let records: Vec<VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
@@ -330,7 +330,7 @@ where
         }
         Command::Search { query, user_id, agent_id, run_id, top_k, threshold } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.search(&query, top_k, &scope, threshold) {
+            match memory.search(&query, top_k, &scope, threshold, true) {
                 Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -349,7 +349,7 @@ where
                 std::process::exit(1);
             }
         },
-        Command::List { offset, limit } => match memory.list(offset, limit) {
+        Command::List { offset, limit } => match memory.list(offset, limit, true) {
             Ok(ids) => print_ids(&ids, json, quiet),
             Err(err) => {
                 eprintln!("error: {err}");

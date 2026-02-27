@@ -20,6 +20,34 @@ fn has_scope_id(scope: &HashMap<String, String>) -> bool {
     scope.keys().any(|k| k == "user_id" || k == "agent_id" || k == "run_id")
 }
 
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, u32::try_from(m).unwrap_or(1), u32::try_from(d).unwrap_or(1))
+}
+
+fn unix_seconds_to_ymd_string(seconds: u64) -> String {
+    let days_since_epoch = i64::try_from(seconds / 86_400).unwrap_or(0);
+    let (y, m, d) = civil_from_days(days_since_epoch);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn today_ymd_string() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    unix_seconds_to_ymd_string(now)
+}
+
+fn is_expired(payload: &HashMap<String, String>, today: &str) -> bool {
+    payload.get("expiration_date").is_some_and(|expiration_date| expiration_date.as_str() < today)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryEvent {
     Added,
@@ -102,12 +130,14 @@ where
     }
 
     #[allow(clippy::missing_errors_doc)]
+    #[allow(clippy::fn_params_excessive_bools)]
     pub fn search(
         &self,
         query: &str,
         top_k: usize,
         scope: &HashMap<String, String>,
         threshold: Option<f32>,
+        show_expired: bool,
     ) -> Result<Vec<crate::vector_store::SearchResult>, crate::CoreError> {
         if top_k == 0 {
             return Err(crate::CoreError::Validation("top_k must be greater than zero".to_string()));
@@ -128,7 +158,13 @@ where
             }
         }
         let vector = self.embedding.embed(query)?;
-        self.vector_store.search(&vector, top_k, scope, threshold).map_err(From::from)
+        let mut results = self.vector_store.search(&vector, usize::MAX, scope, threshold)?;
+        if !show_expired {
+            let today = today_ymd_string();
+            results.retain(|r| !is_expired(&r.payload, &today));
+        }
+        results.truncate(top_k);
+        Ok(results)
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -163,8 +199,17 @@ where
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, crate::CoreError> {
-        self.vector_store.list(offset, limit).map_err(From::from)
+    pub fn list(&self, offset: usize, limit: usize, show_expired: bool) -> Result<Vec<String>, crate::CoreError> {
+        if show_expired {
+            return self.vector_store.list(offset, limit).map_err(From::from);
+        }
+        let today = today_ymd_string();
+        let all_ids = self.vector_store.list(0, usize::MAX)?;
+        let surviving: Vec<String> = all_ids
+            .into_iter()
+            .filter(|id| self.vector_store.get(id).ok().flatten().is_none_or(|record| !is_expired(&record.payload, &today)))
+            .collect();
+        Ok(surviving.into_iter().skip(offset).take(limit).collect())
     }
 
     #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
@@ -283,6 +328,156 @@ mod tests {
 
     fn scope() -> HashMap<String, String> {
         HashMap::from([("user_id".to_string(), "alice".to_string())])
+    }
+
+    #[test]
+    fn unix_seconds_to_ymd_string_matches_real_reference_dates() {
+        assert_eq!(unix_seconds_to_ymd_string(0), "1970-01-01");
+        assert_eq!(unix_seconds_to_ymd_string(86400), "1970-01-02");
+        assert_eq!(unix_seconds_to_ymd_string(1_609_459_200), "2021-01-01");
+        assert_eq!(unix_seconds_to_ymd_string(1_700_000_000), "2023-11-14");
+        assert_eq!(unix_seconds_to_ymd_string(1_787_500_000), "2026-08-23");
+        assert_eq!(unix_seconds_to_ymd_string(946_684_800), "2000-01-01");
+        assert_eq!(unix_seconds_to_ymd_string(1_735_689_599), "2024-12-31");
+    }
+
+    #[test]
+    fn unix_seconds_to_ymd_string_handles_a_real_leap_day() {
+        assert_eq!(unix_seconds_to_ymd_string(951_782_400), "2000-02-29", "the year 2000 is a leap year (divisible by 400)");
+    }
+
+    #[test]
+    fn is_expired_true_for_a_past_date() {
+        let payload = HashMap::from([("expiration_date".to_string(), "2020-01-01".to_string())]);
+        assert!(is_expired(&payload, "2026-08-24"));
+    }
+
+    #[test]
+    fn is_expired_false_for_a_future_date() {
+        let payload = HashMap::from([("expiration_date".to_string(), "2030-01-01".to_string())]);
+        assert!(!is_expired(&payload, "2026-08-24"));
+    }
+
+    #[test]
+    fn is_expired_false_for_the_current_date() {
+        let payload = HashMap::from([("expiration_date".to_string(), "2026-08-24".to_string())]);
+        assert!(!is_expired(&payload, "2026-08-24"), "a record expiring today has not yet expired");
+    }
+
+    #[test]
+    fn is_expired_false_when_no_expiration_date_is_set() {
+        let payload = HashMap::new();
+        assert!(!is_expired(&payload, "2026-08-24"));
+    }
+
+    #[test]
+    fn test_search_excludes_an_expired_record_by_default() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let expired_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("expiration_date".to_string(), "2000-01-01".to_string())]);
+        memory.add(&[Message::new(Role::User, "An expired fact.")], expired_scope, false).expect("add should succeed");
+
+        let results = memory.search("fact", 10, &scope(), None, false).expect("search should succeed");
+        assert!(
+            !results.iter().any(|r| r.payload.get("content").map(String::as_str) == Some("An expired fact.")),
+            "an expired record must not appear in search results by default"
+        );
+    }
+
+    #[test]
+    fn test_search_includes_an_expired_record_with_show_expired_true() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let expired_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("expiration_date".to_string(), "2000-01-01".to_string())]);
+        memory.add(&[Message::new(Role::User, "An expired fact.")], expired_scope, false).expect("add should succeed");
+
+        let results = memory.search("fact", 10, &scope(), None, true).expect("search should succeed");
+        assert!(
+            results.iter().any(|r| r.payload.get("content").map(String::as_str) == Some("An expired fact.")),
+            "show_expired=true must still surface an expired record"
+        );
+    }
+
+    #[test]
+    fn test_search_includes_a_non_expired_future_dated_record_by_default() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let future_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("expiration_date".to_string(), "2099-01-01".to_string())]);
+        memory.add(&[Message::new(Role::User, "A future fact.")], future_scope, false).expect("add should succeed");
+
+        let results = memory.search("fact", 10, &scope(), None, false).expect("search should succeed");
+        assert!(
+            results.iter().any(|r| r.payload.get("content").map(String::as_str) == Some("A future fact.")),
+            "a record expiring in the future must still appear with show_expired=false"
+        );
+    }
+
+    #[test]
+    fn test_search_excluding_expired_records_does_not_shrink_top_k_below_available_valid_results() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        for i in 1..=3 {
+            let expired_scope = HashMap::from([
+                ("user_id".to_string(), "alice".to_string()),
+                ("expiration_date".to_string(), "2000-01-01".to_string()),
+            ]);
+            memory.add(&[Message::new(Role::User, format!("Expired fact {i}."))], expired_scope, false).expect("add should succeed");
+        }
+        for i in 1..=3 {
+            let s = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+            memory.add(&[Message::new(Role::User, format!("Valid fact {i}."))], s, false).expect("add should succeed");
+        }
+
+        let results = memory.search("fact", 3, &scope(), None, false).expect("search should succeed");
+        assert_eq!(results.len(), 3, "top_k=3 must return 3 real results, not fewer because expired ones were counted against the limit");
+        assert!(results.iter().all(|r| r.payload.get("content").is_some_and(|c| c.starts_with("Valid fact"))));
+    }
+
+    #[test]
+    fn test_list_excludes_an_expired_record_by_default() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let expired_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("expiration_date".to_string(), "2000-01-01".to_string())]);
+        let ids = memory.add(&[Message::new(Role::User, "An expired fact.")], expired_scope, false).expect("add should succeed");
+        let expired_id = ids.first().expect("expected an id").clone();
+
+        let listed = memory.list(0, 100, false).expect("list should succeed");
+        assert!(!listed.contains(&expired_id), "an expired record must not appear in list results by default");
+    }
+
+    #[test]
+    fn test_list_includes_an_expired_record_with_show_expired_true() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let expired_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("expiration_date".to_string(), "2000-01-01".to_string())]);
+        let ids = memory.add(&[Message::new(Role::User, "An expired fact.")], expired_scope, false).expect("add should succeed");
+        let expired_id = ids.first().expect("expected an id").clone();
+
+        let listed = memory.list(0, 100, true).expect("list should succeed");
+        assert!(listed.contains(&expired_id), "show_expired=true must still surface an expired record in list");
     }
 
     #[test]
@@ -622,7 +817,7 @@ mod tests {
         let _ = memory.add(&messages, scope(), true).expect("add should succeed");
 
         let query = "Alice engineer";
-        let results = memory.search(query, 10, &scope(), None).expect("search should succeed");
+        let results = memory.search(query, 10, &scope(), None, true).expect("search should succeed");
         assert!(
             !results.is_empty(),
             "search should return matching memories"
@@ -652,7 +847,7 @@ mod tests {
         }
 
         let query = "fact";
-        let results = memory.search(query, 3, &scope(), None).expect("search should succeed");
+        let results = memory.search(query, 3, &scope(), None, true).expect("search should succeed");
         assert!(
             results.len() <= 3,
             "search should return at most top_k results, got {}",
@@ -682,7 +877,7 @@ mod tests {
         let bob_record = VectorRecord::new("rec-2".to_string(), bob_vector, bob_payload);
         memory.vector_store.insert(bob_record).expect("insert should succeed");
 
-        let results = memory.search("engineer", 10, &alice_scope, None).expect("search should succeed");
+        let results = memory.search("engineer", 10, &alice_scope, None, true).expect("search should succeed");
         assert_eq!(
             results.len(),
             1,
@@ -694,7 +889,7 @@ mod tests {
             "returned record should be alice's"
         );
 
-        let results = memory.search("designer", 10, &bob_scope, None).expect("search should succeed");
+        let results = memory.search("designer", 10, &bob_scope, None, true).expect("search should succeed");
         assert_eq!(
             results.len(),
             1,
@@ -714,7 +909,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &scope(), None);
+        let result = memory.search("anything", 10, &scope(), None, true);
         assert!(matches!(result, Ok(vec) if vec.is_empty()));
     }
 
@@ -725,7 +920,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 0, &scope(), None);
+        let result = memory.search("anything", 0, &scope(), None, true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -736,7 +931,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &scope(), Some(-0.1));
+        let result = memory.search("anything", 10, &scope(), Some(-0.1), true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -747,7 +942,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &scope(), Some(0.0));
+        let result = memory.search("anything", 10, &scope(), Some(0.0), true);
         assert!(result.is_ok());
     }
 
@@ -758,7 +953,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 1, &scope(), None);
+        let result = memory.search("anything", 1, &scope(), None, true);
         assert!(result.is_ok());
     }
 
@@ -1204,8 +1399,8 @@ mod tests {
         memory.add(&[Message::new(Role::User, "I am an engineer.")], alice_scope.clone(), true).expect("add should succeed");
         memory.add(&[Message::new(Role::User, "I am an engineer.")], bob_scope.clone(), true).expect("add should succeed");
 
-        let alice_results = memory.search("engineer", 10, &alice_scope, None).expect("search should succeed");
-        let bob_results = memory.search("engineer", 10, &bob_scope, None).expect("search should succeed");
+        let alice_results = memory.search("engineer", 10, &alice_scope, None, true).expect("search should succeed");
+        let bob_results = memory.search("engineer", 10, &bob_scope, None, true).expect("search should succeed");
 
         assert_eq!(alice_results.len(), 1, "alice should see exactly her own memory, even though bob added identical content");
         assert_eq!(bob_results.len(), 1, "bob should see exactly his own memory, even though alice added identical content");
@@ -1230,8 +1425,8 @@ mod tests {
         memory.add(&[Message::new(Role::User, "I am an engineer.")], scheduler_scope.clone(), true).expect("add should succeed");
         memory.add(&[Message::new(Role::User, "I am an engineer.")], support_scope.clone(), true).expect("add should succeed");
 
-        let scheduler_results = memory.search("engineer", 10, &scheduler_scope, None).expect("search should succeed");
-        let support_results = memory.search("engineer", 10, &support_scope, None).expect("search should succeed");
+        let scheduler_results = memory.search("engineer", 10, &scheduler_scope, None, true).expect("search should succeed");
+        let support_results = memory.search("engineer", 10, &support_scope, None, true).expect("search should succeed");
 
         assert_eq!(scheduler_results.len(), 1, "scheduler-bot should see exactly its own memory");
         assert_eq!(support_results.len(), 1, "support-bot should see exactly its own memory");
@@ -1251,12 +1446,12 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
-        let before = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
+        let before = memory.search("engineer", 10, &scope(), None, true).expect("search should succeed");
         assert!(!before.is_empty(), "expected a result before reset for this test to be meaningful");
 
         memory.reset(&scope()).expect("reset should succeed");
 
-        let after = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
+        let after = memory.search("engineer", 10, &scope(), None, true).expect("search should succeed");
         assert!(after.is_empty(), "search after reset should return nothing");
     }
 
@@ -1272,7 +1467,7 @@ mod tests {
 
         memory.update(id, Some("Alice is a senior engineer."), None).expect("update should succeed");
 
-        let results = memory.search("senior engineer", 10, &scope(), None).expect("search should succeed");
+        let results = memory.search("senior engineer", 10, &scope(), None, true).expect("search should succeed");
         assert!(
             results.iter().any(|r| r.payload.get("content") == Some(&"Alice is a senior engineer.".to_string())),
             "search after update should reflect the new content"
@@ -1378,7 +1573,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &HashMap::new(), None);
+        let result = memory.search("anything", 10, &HashMap::new(), None, true);
         assert!(
             matches!(result, Err(crate::CoreError::Validation(_))),
             "search with no scope-identifying key must be rejected, not silently return every scope's records"
@@ -1393,7 +1588,7 @@ mod tests {
         let memory = Memory::new(llm, embedding, store);
 
         let non_scope_filter = HashMap::from([("source".to_string(), "chat_import".to_string())]);
-        let result = memory.search("anything", 10, &non_scope_filter, None);
+        let result = memory.search("anything", 10, &non_scope_filter, None, true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -1517,7 +1712,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 10, &scope(), None);
+        let result = memory.search("anything", 10, &scope(), None, true);
         assert!(matches!(result, Err(crate::CoreError::Provider { .. })));
     }
 
@@ -1528,7 +1723,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store).with_max_top_k(50);
 
-        let result = memory.search("anything", 51, &scope(), None);
+        let result = memory.search("anything", 51, &scope(), None, true);
         assert!(matches!(result, Err(crate::CoreError::Validation(_))));
     }
 
@@ -1539,7 +1734,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store).with_max_top_k(50);
 
-        let result = memory.search("anything", 50, &scope(), None);
+        let result = memory.search("anything", 50, &scope(), None, true);
         assert!(result.is_ok(), "top_k exactly at the configured ceiling should be accepted");
     }
 
@@ -1550,7 +1745,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let result = memory.search("anything", 1_000_000, &scope(), None);
+        let result = memory.search("anything", 1_000_000, &scope(), None, true);
         assert!(result.is_ok(), "with no configured ceiling, top_k should never be rejected for being too large");
     }
 
@@ -1564,7 +1759,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         assert!(!ids.is_empty());
 
-        let results = memory.search("engineer", 10, &scope(), None).expect("search should succeed");
+        let results = memory.search("engineer", 10, &scope(), None, true).expect("search should succeed");
         assert!(results.iter().any(|r| r.payload.get("content") == Some(&"Alice is an engineer.".to_string())));
 
         let id = ids.first().expect("expected at least one id");
@@ -1583,7 +1778,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
         assert!(!ids.is_empty(), "EchoLlmProvider should still produce at least one fact (extract_facts wraps the conversation before echoing it)");
 
-        let results = memory.search("Alice", 10, &scope(), None).expect("search should succeed");
+        let results = memory.search("Alice", 10, &scope(), None, true).expect("search should succeed");
         assert!(!results.is_empty(), "search should find something after adding via a different LLM provider");
     }
 
@@ -1651,7 +1846,7 @@ mod tests {
 
         let ids = memory.add(&[Message::new(Role::User, "Two facts.")], scope(), true).expect("add should succeed");
 
-        let listed = memory.list(0, usize::MAX).expect("list should succeed");
+        let listed = memory.list(0, usize::MAX, true).expect("list should succeed");
         for id in &ids {
             assert!(listed.contains(id), "list should include every id add returned");
         }
@@ -1664,7 +1859,7 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let listed = memory.list(0, 0).expect("list should succeed");
+        let listed = memory.list(0, 0, true).expect("list should succeed");
         assert!(listed.is_empty(), "a zero limit should return nothing, not error");
     }
 
