@@ -401,4 +401,61 @@ mod tests {
             FilterExpr::Field("content".to_string(), FilterOp::Icontains("ENGINEER".to_string()))
         );
     }
+
+    #[test]
+    fn and_requires_every_real_clause_to_hold() {
+        let expr = FilterExpr::And(vec![
+            FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("engineering".to_string()))),
+            FilterExpr::Field("priority".to_string(), FilterOp::Gte(FilterValue::Number(5.0))),
+        ]);
+        assert!(evaluate(&expr, &payload(&[("category", "engineering"), ("priority", "8")])));
+        assert!(!evaluate(&expr, &payload(&[("category", "engineering"), ("priority", "2")])));
+        assert!(!evaluate(&expr, &payload(&[("category", "sales"), ("priority", "8")])));
+    }
+
+    #[test]
+    fn or_requires_only_one_real_clause_to_hold() {
+        let expr = FilterExpr::Or(vec![
+            FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("engineering".to_string()))),
+            FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("design".to_string()))),
+        ]);
+        assert!(evaluate(&expr, &payload(&[("category", "engineering")])));
+        assert!(evaluate(&expr, &payload(&[("category", "design")])));
+        assert!(!evaluate(&expr, &payload(&[("category", "sales")])));
+    }
+
+    #[test]
+    fn not_inverts_a_real_inner_expression() {
+        let expr = FilterExpr::Not(Box::new(FilterExpr::Field(
+            "category".to_string(),
+            FilterOp::Eq(FilterValue::String("spam".to_string())),
+        )));
+        assert!(evaluate(&expr, &payload(&[("category", "engineering")])));
+        assert!(!evaluate(&expr, &payload(&[("category", "spam")])));
+    }
+
+    #[test]
+    fn and_of_or_of_not_evaluates_correctly_nested_one_level_deeper() {
+        let category_is_engineering_or_design = FilterExpr::Or(vec![
+            FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("engineering".to_string()))),
+            FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("design".to_string()))),
+        ]);
+        let priority_is_not_low = FilterExpr::Not(Box::new(FilterExpr::Field(
+            "priority".to_string(),
+            FilterOp::Lt(FilterValue::Number(5.0)),
+        )));
+        let expr = FilterExpr::And(vec![category_is_engineering_or_design, priority_is_not_low]);
+        assert!(evaluate(&expr, &payload(&[("category", "engineering"), ("priority", "8")])), "engineering, high priority must match");
+        assert!(evaluate(&expr, &payload(&[("category", "design"), ("priority", "5")])), "design, priority at the boundary must match");
+        assert!(!evaluate(&expr, &payload(&[("category", "engineering"), ("priority", "2")])), "engineering but low priority must not match");
+        assert!(!evaluate(&expr, &payload(&[("category", "sales"), ("priority", "8")])), "wrong category must not match regardless of priority");
+    }
+
+    #[test]
+    fn a_real_compound_filter_from_parsed_json_evaluates_correctly_end_to_end() {
+        let expr = parse(r#"{"AND": [{"category": {"in": ["engineering", "design"]}}, {"priority": {"gte": 5}}]}"#);
+        assert!(evaluate(&expr, &payload(&[("category", "engineering"), ("priority", "8")])));
+        assert!(!evaluate(&expr, &payload(&[("category", "sales"), ("priority", "8")])));
+        assert!(!evaluate(&expr, &payload(&[("category", "engineering"), ("priority", "2")])));
+    }
 }
