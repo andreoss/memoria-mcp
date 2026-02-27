@@ -69,7 +69,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let ids = memory.list(0, usize::MAX, true).unwrap_or_default();
+    let ids = memory.list(0, usize::MAX, true, None).unwrap_or_default();
     let records: Vec<VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
     let data = serde_json::to_vec(&records).unwrap_or_default();
     write_atomically(path, &data)
@@ -576,7 +576,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let ids = memory.list(0, usize::MAX, true).unwrap_or_default();
+    let ids = memory.list(0, usize::MAX, true, None).unwrap_or_default();
     let mut counts: HashMap<(String, String), usize> = HashMap::new();
     for id in ids {
         let Ok(Some(record)) = memory.get(&id) else {
@@ -707,6 +707,7 @@ struct SearchMemoryRequest {
     top_k: usize,
     threshold: Option<f32>,
     show_expired: Option<bool>,
+    filters: Option<serde_json::Value>,
 }
 
 const fn default_top_k() -> usize {
@@ -730,8 +731,13 @@ where
     };
     let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
     let show_expired = request.show_expired.unwrap_or(false);
+    let filters = match request.filters.as_ref().map(core::filter::parse_filter_expr) {
+        Some(Ok(filters)) => Some(filters),
+        Some(Err(err)) => return (400, error_body(format!("malformed filters: {err}"))),
+        None => None,
+    };
 
-    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired) {
+    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref()) {
         Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -902,7 +908,7 @@ where
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100);
     let show_expired = params.get("show_expired").is_some_and(|v| v == "true");
 
-    match memory.list(offset, limit, show_expired) {
+    match memory.list(offset, limit, show_expired, None) {
         Ok(ids) => (200, serde_json::to_vec(&ListMemoryResponse { ids }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -918,7 +924,7 @@ where
     let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
     match (req.method.as_str(), segments.as_slice()) {
         ("POST", ["memories"]) => handle_create_memory(memory, &req.body),
-        ("POST", ["memories", "search"]) => handle_search_memory(memory, &req.body),
+        ("POST", ["search"]) => handle_search_memory(memory, &req.body),
         ("GET", ["memories"]) => handle_list_memory(memory, query),
         ("GET", ["memories", id]) => handle_get_memory(memory, id),
         ("PUT", ["memories", id]) => handle_update_memory(memory, id, &req.body),
@@ -2485,6 +2491,42 @@ mod tests {
     }
 
     #[test]
+    fn handle_search_memory_applies_a_real_filter() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(
+            &memory,
+            br#"{"content":"An engineering fact.","user_id":"alice","memory_type":"engineering","infer":false}"#,
+        );
+        handle_create_memory(&memory, br#"{"content":"A sales fact.","user_id":"alice","memory_type":"sales","infer":false}"#);
+
+        let body = br#"{"query":"fact","user_id":"alice","filters":{"memory_type":"engineering"}}"#;
+        let (status, response_body) = handle_search_memory(&memory, body);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].payload.get("content"), Some(&"An engineering fact.".to_string()));
+    }
+
+    #[test]
+    fn handle_search_memory_rejects_malformed_filters() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"query":"anything","user_id":"alice","filters":{"field":{"bogus":1}}}"#;
+        let (status, _) = handle_search_memory(&memory, body);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn handle_search_memory_with_no_filters_is_unaffected() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"A fact.","user_id":"alice","infer":false}"#);
+        let body = br#"{"query":"fact","user_id":"alice"}"#;
+        let (status, response_body) = handle_search_memory(&memory, body);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.results.len(), 1, "an absent filters field must not change existing search behavior");
+    }
+
+    #[test]
     fn handle_update_memory_happy_path_returns_200() {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
@@ -2519,13 +2561,13 @@ mod tests {
     }
 
     #[test]
-    fn route_dispatches_post_memories_search() {
+    fn route_dispatches_post_search() {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
 
         let req = ParsedRequest {
             method: "POST".to_string(),
-            path: "/memories/search".to_string(),
+            path: "/search".to_string(),
             headers: Vec::new(),
             body: br#"{"query":"engineer","user_id":"alice"}"#.to_vec(),
         };
