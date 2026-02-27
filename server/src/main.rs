@@ -798,6 +798,95 @@ where
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HistoryResponse {
+    entries: Vec<core::memory::HistoryEntry>,
+}
+
+fn handle_get_history<L, E, V>(memory: &Memory<L, E, V>, id: &str, query: &str) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let params = parse_query(query);
+    let offset = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100);
+    match memory.history(id, offset, limit) {
+        Ok(entries) => (200, serde_json::to_vec(&HistoryResponse { entries }).unwrap_or_default()),
+        Err(err) => error_response(&err),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteAllRequest {
+    user_id: Option<String>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    filters: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DeleteAllResponse {
+    deleted: usize,
+}
+
+fn parse_optional_filters(value: Option<&serde_json::Value>) -> Result<Option<core::filter::FilterExpr>, String> {
+    value.map(core::filter::parse_filter_expr).transpose()
+}
+
+fn handle_delete_all<L, E, V>(
+    admin_key: Option<&str>,
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    memory: &Memory<L, E, V>,
+    body: &[u8],
+) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    if !caller_is_admin(admin_key, auth_store, jwt_secret, headers) {
+        return (403, error_body("admin access required"));
+    }
+    let request: DeleteAllRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(err) => return (400, error_body(format!("malformed request body: {err}"))),
+    };
+    let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+    let filters = match parse_optional_filters(request.filters.as_ref()) {
+        Ok(filters) => filters,
+        Err(err) => return (400, error_body(format!("malformed filters: {err}"))),
+    };
+    match memory.reset(&scope, filters.as_ref()) {
+        Ok(deleted) => (200, serde_json::to_vec(&DeleteAllResponse { deleted }).unwrap_or_default()),
+        Err(err) => error_response(&err),
+    }
+}
+
+fn handle_reset_all<L, E, V>(
+    admin_key: Option<&str>,
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    memory: &Memory<L, E, V>,
+) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    if !caller_is_admin(admin_key, auth_store, jwt_secret, headers) {
+        return (403, error_body("admin access required"));
+    }
+    match memory.reset(&HashMap::new(), None) {
+        Ok(deleted) => (200, serde_json::to_vec(&DeleteAllResponse { deleted }).unwrap_or_default()),
+        Err(err) => error_response(&err),
+    }
+}
+
 fn resolve_auth_config(api_key_env: Option<String>, allow_no_auth_env: Option<String>) -> Result<Option<String>, String> {
     match (api_key_env, allow_no_auth_env) {
         (Some(key), _) if !key.is_empty() => Ok(Some(key)),
@@ -1124,69 +1213,98 @@ where
     if !is_authorized(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers) {
         return (401, error_body("unauthorized"));
     }
-    if req.method == "GET" && req.path == "/auth/me" {
-        return handle_auth_me_get(&state.auth_store, &state.jwt_secret, &req.headers);
-    }
-    if req.method == "PATCH" && req.path == "/auth/me" {
-        let result = handle_auth_me_patch(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
-    if req.method == "POST" && req.path == "/auth/change-password" {
-        let result = handle_auth_change_password(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
-    if req.method == "POST" && req.path == "/auth/onboarding-complete" {
-        let result = handle_auth_onboarding_complete(&state.auth_store, &state.jwt_secret, &req.headers);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
-    let (path_only, _query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    let (path_only, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
     let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
-    if req.method == "POST" && segments.as_slice() == ["api-keys"] {
-        let result = handle_create_api_key(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
-        if result.0 == 201 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
+    if let Some(result) = dispatch_authorized_routes(state, req, &segments, query) {
         return result;
-    }
-    if req.method == "GET" && segments.as_slice() == ["api-keys"] {
-        return handle_list_api_keys(&state.auth_store, &state.jwt_secret, &req.headers);
-    }
-    if let ("DELETE", ["api-keys", id]) = (req.method.as_str(), segments.as_slice()) {
-        let result = handle_revoke_api_key(&state.auth_store, &state.jwt_secret, &req.headers, id);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
-    if req.method == "GET" && req.path == "/entities" {
-        return handle_list_entities(&state.memory);
-    }
-    if req.method == "GET" && req.path == "/configure" {
-        return handle_get_configure(&state.llm_label, &state.embedding_label);
-    }
-    if req.method == "GET" && req.path == "/configure/providers" {
-        return handle_get_configure_providers();
-    }
-    if req.method == "POST" && req.path == "/generate-instructions" {
-        return handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some());
-    }
-    if req.method == "GET" && req.path == "/requests" {
-        return handle_get_requests(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &state.request_log, &req.headers);
     }
     let result = route(&state.memory, req);
     if is_successful_mutation(&req.method, &req.path, result.0) {
         let _ = save_store(&state.memory, &state.store_path);
     }
     result
+}
+
+fn dispatch_authorized_routes<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest, segments: &[&str], query: &str) -> Option<(u16, Vec<u8>)>
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    if req.method == "GET" && req.path == "/auth/me" {
+        return Some(handle_auth_me_get(&state.auth_store, &state.jwt_secret, &req.headers));
+    }
+    if req.method == "PATCH" && req.path == "/auth/me" {
+        let result = handle_auth_me_patch(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return Some(result);
+    }
+    if req.method == "POST" && req.path == "/auth/change-password" {
+        let result = handle_auth_change_password(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return Some(result);
+    }
+    if req.method == "POST" && req.path == "/auth/onboarding-complete" {
+        let result = handle_auth_onboarding_complete(&state.auth_store, &state.jwt_secret, &req.headers);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return Some(result);
+    }
+    if let ("GET", ["memories", id, "history"]) = (req.method.as_str(), segments) {
+        return Some(handle_get_history(&state.memory, id, query));
+    }
+    if req.method == "POST" && segments == ["api-keys"] {
+        let result = handle_create_api_key(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
+        if result.0 == 201 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return Some(result);
+    }
+    if req.method == "GET" && segments == ["api-keys"] {
+        return Some(handle_list_api_keys(&state.auth_store, &state.jwt_secret, &req.headers));
+    }
+    if let ("DELETE", ["api-keys", id]) = (req.method.as_str(), segments) {
+        let result = handle_revoke_api_key(&state.auth_store, &state.jwt_secret, &req.headers, id);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        return Some(result);
+    }
+    if req.method == "GET" && req.path == "/entities" {
+        return Some(handle_list_entities(&state.memory));
+    }
+    if req.method == "GET" && req.path == "/configure" {
+        return Some(handle_get_configure(&state.llm_label, &state.embedding_label));
+    }
+    if req.method == "GET" && req.path == "/configure/providers" {
+        return Some(handle_get_configure_providers());
+    }
+    if req.method == "POST" && req.path == "/generate-instructions" {
+        return Some(handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some()));
+    }
+    if req.method == "GET" && req.path == "/requests" {
+        return Some(handle_get_requests(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &state.request_log, &req.headers));
+    }
+    if req.method == "DELETE" && segments == ["memories"] {
+        let result = handle_delete_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory, &req.body);
+        if result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        return Some(result);
+    }
+    if req.method == "POST" && req.path == "/reset" {
+        let result = handle_reset_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory);
+        if result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        return Some(result);
+    }
+    None
 }
 
 async fn handle_connection<L, E, V>(mut stream: TcpStream, state: Arc<ServerState<L, E, V>>, peer_ip: IpAddr)
@@ -2613,6 +2731,83 @@ mod tests {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         let (status, _) = handle_delete_memory(&memory, "never-existed");
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn handle_get_history_returns_real_entries_in_order() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected an id");
+        handle_delete_memory(&memory, id);
+
+        let (status, body) = handle_get_history(&memory, id, "");
+        assert_eq!(status, 200);
+        let response: HistoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(response.entries.len(), 2);
+        assert_eq!(response.entries[0].event, core::memory::HistoryEvent::Added);
+        assert_eq!(response.entries[1].event, core::memory::HistoryEvent::Deleted);
+    }
+
+    #[test]
+    fn handle_get_history_for_an_unknown_id_is_an_empty_list_not_an_error() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (status, body) = handle_get_history(&memory, "never-existed", "");
+        assert_eq!(status, 200);
+        let response: HistoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.entries.is_empty());
+    }
+
+    #[test]
+    fn handle_delete_all_removes_only_records_matching_a_real_filter() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        handle_create_memory(
+            &memory,
+            br#"{"content":"An engineering fact.","user_id":"alice","memory_type":"engineering","infer":false}"#,
+        );
+        handle_create_memory(&memory, br#"{"content":"A sales fact.","user_id":"alice","memory_type":"sales","infer":false}"#);
+
+        let body = br#"{"user_id":"alice","filters":{"memory_type":"engineering"}}"#;
+        let (status, response_body) = handle_delete_all(Some("admin-secret"), &store, b"jwt-secret", &bearer_headers(&token), &memory, body);
+        assert_eq!(status, 200);
+        let response: DeleteAllResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.deleted, 1);
+        let remaining = memory.list(0, 100, true, None).expect("list should succeed");
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn handle_delete_all_rejects_a_non_admin_caller() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_delete_all(Some("admin-secret"), &store, b"jwt-secret", &[], &memory, br#"{"user_id":"alice"}"#);
+        assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn handle_reset_all_wipes_every_real_record() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        handle_create_memory(&memory, br#"{"content":"Alice's fact.","user_id":"alice","infer":false}"#);
+        handle_create_memory(&memory, br#"{"content":"Bob's fact.","user_id":"bob","infer":false}"#);
+
+        let (status, response_body) = handle_reset_all(Some("admin-secret"), &store, b"jwt-secret", &bearer_headers(&token), &memory);
+        assert_eq!(status, 200);
+        let response: DeleteAllResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.deleted, 2);
+        let remaining = memory.list(0, 100, true, None).expect("list should succeed");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn handle_reset_all_rejects_a_non_admin_caller() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_reset_all(Some("admin-secret"), &store, b"jwt-secret", &[], &memory);
+        assert_eq!(status, 403);
     }
 
     #[test]

@@ -49,12 +49,14 @@ fn is_expired(payload: &HashMap<String, String>, today: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum HistoryEvent {
     Added,
     Deleted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HistoryEntry {
     pub event: HistoryEvent,
     pub content: String,
@@ -242,18 +244,21 @@ where
     }
 
     #[allow(clippy::missing_errors_doc)]
-    pub fn reset(&self, scope: &HashMap<String, String>) -> Result<(), crate::CoreError> {
+    pub fn reset(&self, scope: &HashMap<String, String>, filters: Option<&crate::filter::FilterExpr>) -> Result<usize, crate::CoreError> {
         let ids = self.vector_store.list(0, usize::MAX)?;
+        let mut deleted = 0;
         for id in ids {
             let Some(record) = self.vector_store.get(&id)? else {
                 continue;
             };
-            let matches = scope.iter().all(|(k, v)| record.payload.get(k) == Some(v));
-            if matches {
-                self.vector_store.delete(&id)?;
+            let scope_matches = scope.iter().all(|(k, v)| record.payload.get(k) == Some(v));
+            let filter_matches = filters.is_none_or(|f| crate::filter::evaluate(f, &record.payload));
+            if scope_matches && filter_matches {
+                self.delete(&id)?;
+                deleted += 1;
             }
         }
-        Ok(())
+        Ok(deleted)
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -1214,7 +1219,7 @@ mod tests {
         let ids = memory.add(&messages, scope(), true).expect("add should succeed");
         assert!(ids.len() >= 2, "expected at least two records for this test to be meaningful");
 
-        memory.reset(&scope()).expect("reset should succeed");
+        memory.reset(&scope(), None).expect("reset should succeed");
 
         for id in &ids {
             let record = memory.vector_store.get(id).expect("get should succeed");
@@ -1235,7 +1240,7 @@ mod tests {
         let alice_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], alice_scope.clone(), true).expect("add should succeed");
         let bob_ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], bob_scope, true).expect("add should succeed");
 
-        memory.reset(&alice_scope).expect("reset should succeed");
+        memory.reset(&alice_scope, None).expect("reset should succeed");
 
         for id in &alice_ids {
             assert_eq!(memory.vector_store.get(id).expect("get should succeed"), None, "alice's records should be gone");
@@ -1243,6 +1248,82 @@ mod tests {
         for id in &bob_ids {
             assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "bob's records should be untouched");
         }
+    }
+
+    #[test]
+    fn test_reset_with_a_real_filter_deletes_only_matching_records() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let engineering_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("category".to_string(), "engineering".to_string())]);
+        let sales_scope =
+            HashMap::from([("user_id".to_string(), "alice".to_string()), ("category".to_string(), "sales".to_string())]);
+        let engineering_ids =
+            memory.add(&[Message::new(Role::User, "An engineering fact.")], engineering_scope, false).expect("add should succeed");
+        let sales_ids = memory.add(&[Message::new(Role::User, "A sales fact.")], sales_scope, false).expect("add should succeed");
+
+        let filter = FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("engineering".to_string())));
+        let deleted = memory.reset(&scope(), Some(&filter)).expect("reset should succeed");
+        assert_eq!(deleted, 1);
+
+        for id in &engineering_ids {
+            assert_eq!(memory.vector_store.get(id).expect("get should succeed"), None, "the matching record must be gone");
+        }
+        for id in &sales_ids {
+            assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "the non-matching record must survive");
+        }
+    }
+
+    #[test]
+    fn test_reset_with_an_empty_scope_and_no_filter_deletes_everything() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
+        let alice_ids = memory.add(&[Message::new(Role::User, "Alice's fact.")], alice_scope, false).expect("add should succeed");
+        let bob_ids = memory.add(&[Message::new(Role::User, "Bob's fact.")], bob_scope, false).expect("add should succeed");
+
+        let deleted = memory.reset(&HashMap::new(), None).expect("reset should succeed");
+        assert_eq!(deleted, 2);
+        for id in alice_ids.iter().chain(bob_ids.iter()) {
+            assert_eq!(memory.vector_store.get(id).expect("get should succeed"), None, "an empty scope with no filter must wipe everything");
+        }
+    }
+
+    #[test]
+    fn test_reset_returns_the_real_count_of_deleted_records() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+        for i in 1..=3 {
+            let s = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+            memory.add(&[Message::new(Role::User, format!("Fact {i}."))], s, false).expect("add should succeed");
+        }
+        let deleted = memory.reset(&scope(), None).expect("reset should succeed");
+        assert_eq!(deleted, 3);
+    }
+
+    #[test]
+    fn test_reset_records_a_deleted_history_entry_for_each_record_it_removes() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+        let ids = memory.add(&[Message::new(Role::User, "A fact worth remembering.")], scope(), false).expect("add should succeed");
+
+        memory.reset(&scope(), None).expect("reset should succeed");
+
+        let entries = memory.history(&ids[0], 0, 10).expect("history should succeed");
+        assert_eq!(entries.len(), 2, "reset must record a Deleted entry alongside the earlier Added one");
+        assert_eq!(entries[0].event, HistoryEvent::Added);
+        assert_eq!(entries[1].event, HistoryEvent::Deleted);
     }
 
     #[test]
@@ -1255,7 +1336,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
 
         let other_scope = HashMap::from([("user_id".to_string(), "nobody-here".to_string())]);
-        memory.reset(&other_scope).expect("reset with no matches should not error");
+        memory.reset(&other_scope, None).expect("reset with no matches should not error");
 
         for id in &ids {
             assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "unrelated scope's records should be untouched");
@@ -1541,7 +1622,7 @@ mod tests {
         let before = memory.search("engineer", 10, &scope(), None, true, None).expect("search should succeed");
         assert!(!before.is_empty(), "expected a result before reset for this test to be meaningful");
 
-        memory.reset(&scope()).expect("reset should succeed");
+        memory.reset(&scope(), None).expect("reset should succeed");
 
         let after = memory.search("engineer", 10, &scope(), None, true, None).expect("search should succeed");
         assert!(after.is_empty(), "search after reset should return nothing");
