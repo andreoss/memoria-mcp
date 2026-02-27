@@ -42,14 +42,31 @@ check "GET /memories with a valid token" 200 \
 check "PUT /memories/:id with a valid token" 200 \
   "$(status_of -H "Authorization: Bearer ${api_key}" -X PUT "${base_url}/memories/${record_id}" -d '{"content":"Alice is a senior engineer."}')"
 
-check "POST /memories/search with a valid token" 200 \
-  "$(status_of -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/memories/search" -d '{"query":"Alice","user_id":"smoke"}')"
+check "GET /memories/:id/history with a valid token" 200 \
+  "$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories/${record_id}/history")"
+
+check "POST /search with a valid token" 200 \
+  "$(status_of -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/search" -d '{"query":"Alice","user_id":"smoke"}')"
 
 check "POST /memories with a malformed body" 400 \
   "$(status_of -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/memories" -d 'not json')"
 
 check "DELETE /memories/:id with a valid token" 200 \
   "$(status_of -H "Authorization: Bearer ${api_key}" -X DELETE "${base_url}/memories/${record_id}")"
+
+bulk_response="$(curl -s -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/memories" -d '{"content":"smoke bulk-delete target.","user_id":"smoke"}')"
+bulk_id="$(printf '%s' "${bulk_response}" | grep -o '"[^"]*"' | sed -n '2p' | tr -d '"')"
+check "POST /memories for the bulk-delete target" "true" \
+  "$([[ -n "${bulk_id}" ]] && echo true || echo false)"
+
+check "DELETE /memories with a filter, admin token" 200 \
+  "$(status_of -H "Authorization: Bearer ${api_key}" -X DELETE "${base_url}/memories" -d '{"filters":{"content":{"contains":"bulk-delete target"}}}')"
+
+check "GET /memories/:id after its bulk deletion is 404" 404 \
+  "$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories/${bulk_id}")"
+
+check "POST /reset with an admin token" 200 \
+  "$(status_of -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/reset")"
 
 echo "-- burst: 25 rapid requests, expect at least one 429 --"
 saw_429=false

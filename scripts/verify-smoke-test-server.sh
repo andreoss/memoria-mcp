@@ -11,13 +11,19 @@ echo "exit code: ${not_running_rc}"
 
 echo "== Scenario 2: server running with the right key (expect zero) =="
 cargo build --offline -p server >/dev/null 2>&1
-MEMORIA_API_KEY=verify-smoke-key ./target/debug/server &
+scratch_dir="$(mktemp -d)"
+MEMORIA_API_KEY=verify-smoke-key \
+  MEMORIA_JWT_SECRET=verify-smoke-jwt-secret \
+  MEMORIA_STORE_PATH="${scratch_dir}/server-store.json" \
+  MEMORIA_AUTH_STORE_PATH="${scratch_dir}/auth-store.json" \
+  ./target/debug/server &
 server_pid=$!
 sleep 0.5
 MEMORIA_SMOKE_TEST_API_KEY="verify-smoke-key" bash scripts/smoke-test-server.sh >/dev/null 2>&1
 running_rc=$?
 kill "${server_pid}" 2>/dev/null || true
 wait "${server_pid}" 2>/dev/null || true
+rm -rf "${scratch_dir}"
 echo "exit code: ${running_rc}"
 
 if [[ "${not_running_rc}" -ne 0 && "${running_rc}" -eq 0 ]]; then
