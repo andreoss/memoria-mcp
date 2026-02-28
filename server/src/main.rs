@@ -5,17 +5,27 @@ mod auth_store;
 mod crypto;
 mod request_log;
 
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
 use core::embedding::LocalHashEmbeddingProvider;
 use core::llm::{LocalSentenceLlmProvider, Message, Role};
 use core::memory::Memory;
 use core::vector_store::{InMemoryVectorStore, VectorRecord, VectorStore};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+#[cfg(test)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+#[cfg(test)]
+use tokio::net::TcpStream;
 
 const RATE_LIMIT_CAPACITY: f64 = 20.0;
 const RATE_LIMIT_REFILL_PER_SEC: f64 = 5.0;
@@ -123,53 +133,6 @@ struct ParsedRequest {
 }
 
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
-
-struct ParsedHeaders {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    header_len: usize,
-    content_length: usize,
-}
-
-fn parse_headers(buf: &[u8]) -> Option<ParsedHeaders> {
-    let mut raw_headers = [httparse::EMPTY_HEADER; 32];
-    let mut req = httparse::Request::new(&mut raw_headers);
-    let httparse::Status::Complete(header_len) = req.parse(buf).ok()? else {
-        return None;
-    };
-    let method = req.method?.to_string();
-    let path = req.path?.to_string();
-    let headers: Vec<(String, String)> = req
-        .headers
-        .iter()
-        .filter_map(|h| std::str::from_utf8(h.value).ok().map(|v| (h.name.to_string(), v.to_string())))
-        .collect();
-    let content_length = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    Some(ParsedHeaders { method, path, headers, header_len, content_length })
-}
-
-fn check_body_size(content_length: usize) -> Option<(u16, Vec<u8>)> {
-    if content_length > MAX_REQUEST_BODY_BYTES {
-        Some((413, error_body("request body too large")))
-    } else {
-        None
-    }
-}
-
-fn parse_request(buf: &[u8]) -> Option<ParsedRequest> {
-    let parsed = parse_headers(buf)?;
-    let available = buf.len().saturating_sub(parsed.header_len);
-    if available < parsed.content_length {
-        return None;
-    }
-    let body = buf[parsed.header_len..parsed.header_len + parsed.content_length].to_vec();
-    Some(ParsedRequest { method: parsed.method, path: parsed.path, headers: parsed.headers, body })
-}
 
 #[derive(serde::Deserialize)]
 struct CreateMemoryRequest {
@@ -1039,20 +1002,6 @@ fn is_successful_mutation(method: &str, path: &str, status: u16) -> bool {
     )
 }
 
-const fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        201 => "Created",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "OK",
-    }
-}
-
 fn resolve_cors_origin(env: Option<String>) -> Option<String> {
     env.filter(|origin| !origin.is_empty())
 }
@@ -1182,25 +1131,6 @@ fn cors_allow_origin_header(configured: Option<&str>, request_origin: Option<&st
     }
 }
 
-fn build_response(status: u16, body: &[u8]) -> Vec<u8> {
-    build_response_with_headers(status, body, &[])
-}
-
-fn build_response_with_headers(status: u16, body: &[u8], extra_headers: &[(String, String)]) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-        reason_phrase(status),
-        body.len()
-    );
-    for (name, value) in extra_headers {
-        let _ = std::fmt::Write::write_fmt(&mut response, format_args!("{name}: {value}\r\n"));
-    }
-    response.push_str("\r\n");
-    let mut response = response.into_bytes();
-    response.extend_from_slice(body);
-    response
-}
-
 fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
@@ -1225,45 +1155,166 @@ where
     request_log: request_log::RequestLogStore,
 }
 
-fn dispatch_request<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest, peer_ip: IpAddr) -> (u16, Vec<u8>)
+fn headers_from_map(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str().to_string(), v.to_string())))
+        .collect()
+}
+
+fn to_axum_response(status: u16, body: Vec<u8>) -> Response {
+    let mut response = (StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body).into_response();
+    response.headers_mut().insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
+async fn wrap_handler<L, E, V, F>(state: Arc<ServerState<L, E, V>>, peer_ip: IpAddr, method: String, path: String, request_headers: Vec<(String, String)>, f: F) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+    F: FnOnce(&ServerState<L, E, V>) -> (u16, Vec<u8>) + Send + 'static,
+{
+    if !state.rate_limiter.check_and_consume(peer_ip) {
+        return to_axum_response(429, error_body("rate limit exceeded"));
+    }
+    let (status, body) = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let (status, body) = f(&state);
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        state.request_log.append(request_log::RequestLogEntry {
+            method: method.clone(),
+            path: path.clone(),
+            status,
+            latency_ms,
+            auth_kind: request_log::classify_auth_kind(&request_headers).to_string(),
+            created_at: auth_store::unix_now(),
+        });
+        eprintln!("{}", format_log_line(&method, &path, status));
+        (status, body)
+    })
+    .await
+    .expect("request-handling task should not panic");
+    to_axum_response(status, body)
+}
+
+async fn axum_handle_health<L, E, V>(State(state): State<Arc<ServerState<L, E, V>>>, ConnectInfo(peer_addr): ConnectInfo<SocketAddr>) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/health".to_string(), Vec::new(), |_state| handle_health()).await
+}
+
+async fn axum_handle_ready<L, E, V>(State(state): State<Arc<ServerState<L, E, V>>>, ConnectInfo(peer_addr): ConnectInfo<SocketAddr>) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/ready".to_string(), Vec::new(), |state| handle_ready(&state.memory)).await
+}
+
+async fn axum_handle_auth_register<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/auth/register".to_string(), headers_from_map(&headers), move |state| {
+        let result = handle_auth_register(&state.auth_store, &state.jwt_secret, &body);
+        if result.0 == 201 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_auth_setup_status<L, E, V>(State(state): State<Arc<ServerState<L, E, V>>>, ConnectInfo(peer_addr): ConnectInfo<SocketAddr>) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/auth/setup-status".to_string(), Vec::new(), |state| handle_auth_setup_status(&state.auth_store)).await
+}
+
+async fn axum_handle_auth_login<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/auth/login".to_string(), headers_from_map(&headers), move |state| {
+        let result = handle_auth_login(&state.auth_store, &state.jwt_secret, &body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_auth_refresh<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/auth/refresh".to_string(), headers_from_map(&headers), move |state| {
+        let result = handle_auth_refresh(&state.auth_store, &state.jwt_secret, &body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn legacy_fallback<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let method = req.method().to_string();
+    let path = req.uri().path_and_query().map_or_else(|| req.uri().path().to_string(), |pq| pq.as_str().to_string());
+    let headers = headers_from_map(req.headers());
+    let body = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(_) => return to_axum_response(413, error_body("request body too large")),
+    };
+    let parsed = ParsedRequest { method: method.clone(), path: path.clone(), headers: headers.clone(), body };
+    wrap_handler(state, peer_addr.ip(), method, path, headers, move |state| dispatch_authorized_or_legacy(state, &parsed)).await
+}
+
+fn dispatch_authorized_or_legacy<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    if !state.rate_limiter.check_and_consume(peer_ip) {
-        return (429, error_body("rate limit exceeded"));
-    }
-    if req.method == "GET" && req.path == "/health" {
-        return handle_health();
-    }
-    if req.method == "GET" && req.path == "/ready" {
-        return handle_ready(&state.memory);
-    }
-    if req.method == "POST" && req.path == "/auth/register" {
-        let result = handle_auth_register(&state.auth_store, &state.jwt_secret, &req.body);
-        if result.0 == 201 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
-    if req.method == "GET" && req.path == "/auth/setup-status" {
-        return handle_auth_setup_status(&state.auth_store);
-    }
-    if req.method == "POST" && req.path == "/auth/login" {
-        let result = handle_auth_login(&state.auth_store, &state.jwt_secret, &req.body);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
-    if req.method == "POST" && req.path == "/auth/refresh" {
-        let result = handle_auth_refresh(&state.auth_store, &state.jwt_secret, &req.body);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return result;
-    }
     if !is_authorized(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers) {
         return (401, error_body("unauthorized"));
     }
@@ -1277,6 +1328,73 @@ where
         let _ = save_store(&state.memory, &state.store_path);
     }
     result
+}
+
+async fn cors_middleware<L, E, V>(State(state): State<Arc<ServerState<L, E, V>>>, req: axum::extract::Request, next: Next) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_origin = req.headers().get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_string);
+    if req.method() == Method::OPTIONS && request_origin.is_some() {
+        let cors_header = cors_allow_origin_header(state.cors_origin.as_deref(), request_origin.as_deref());
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        if let Some((name, value)) = cors_header {
+            if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(&value)) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+        response.headers_mut().insert(
+            HeaderName::from_static("access-control-allow-methods"),
+            HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("access-control-allow-headers"),
+            HeaderValue::from_static("Content-Type, Authorization, X-API-Key"),
+        );
+        eprintln!("{}", format_log_line("OPTIONS", req.uri().path(), 204));
+        return response;
+    }
+    let mut response = next.run(req).await;
+    if let Some((name, value)) = cors_allow_origin_header(state.cors_origin.as_deref(), request_origin.as_deref()) {
+        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(&value)) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
+async fn body_size_limit_middleware(req: axum::extract::Request, next: Next) -> Response {
+    let declared_length = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    if declared_length > MAX_REQUEST_BODY_BYTES {
+        return to_axum_response(413, error_body("request body too large"));
+    }
+    next.run(req).await
+}
+
+fn build_router<L, E, V>(state: Arc<ServerState<L, E, V>>) -> Router
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/health", get(axum_handle_health::<L, E, V>))
+        .route("/ready", get(axum_handle_ready::<L, E, V>))
+        .route("/auth/register", post(axum_handle_auth_register::<L, E, V>))
+        .route("/auth/setup-status", get(axum_handle_auth_setup_status::<L, E, V>))
+        .route("/auth/login", post(axum_handle_auth_login::<L, E, V>))
+        .route("/auth/refresh", post(axum_handle_auth_refresh::<L, E, V>))
+        .fallback(legacy_fallback::<L, E, V>)
+        .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), cors_middleware::<L, E, V>))
+        .layer(axum::middleware::from_fn(body_size_limit_middleware))
+        .with_state(state)
 }
 
 fn dispatch_authorized_routes<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest, segments: &[&str], query: &str) -> Option<(u16, Vec<u8>)>
@@ -1361,94 +1479,14 @@ where
     None
 }
 
-async fn handle_connection<L, E, V>(mut stream: TcpStream, state: Arc<ServerState<L, E, V>>, peer_ip: IpAddr)
+async fn serve<L, E, V>(listener: TcpListener, state: Arc<ServerState<L, E, V>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static)
 where
     L: core::llm::LlmProvider + Send + Sync + 'static,
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
     V: core::vector_store::VectorStore + Send + Sync + 'static,
 {
-    let mut buf = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        let Ok(n) = stream.read(&mut chunk).await else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(headers) = parse_headers(&buf) {
-            if let Some((status, body)) = check_body_size(headers.content_length) {
-                eprintln!("{}", format_log_line(&headers.method, &headers.path, status));
-                let response = build_response(status, &body);
-                let _ = stream.write_all(&response).await;
-                return;
-            }
-        }
-        if let Some(req) = parse_request(&buf) {
-            let request_origin = find_header(&req.headers, "origin");
-            let cors_header = cors_allow_origin_header(state.cors_origin.as_deref(), request_origin);
-
-            if req.method == "OPTIONS" && request_origin.is_some() {
-                let mut headers: Vec<(String, String)> = cors_header.into_iter().collect();
-                headers.push(("Access-Control-Allow-Methods".to_string(), "GET, POST, PUT, PATCH, DELETE".to_string()));
-                headers.push(("Access-Control-Allow-Headers".to_string(), "Content-Type, Authorization, X-API-Key".to_string()));
-                eprintln!("{}", format_log_line(&req.method, &req.path, 204));
-                let response = build_response_with_headers(204, b"", &headers);
-                let _ = stream.write_all(&response).await;
-                return;
-            }
-
-            let blocking_state = Arc::clone(&state);
-            let (status, body) = tokio::task::spawn_blocking(move || {
-                let start = Instant::now();
-                let (status, body) = dispatch_request(&blocking_state, &req, peer_ip);
-                let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                blocking_state.request_log.append(request_log::RequestLogEntry {
-                    method: req.method.clone(),
-                    path: req.path.clone(),
-                    status,
-                    latency_ms,
-                    auth_kind: request_log::classify_auth_kind(&req.headers).to_string(),
-                    created_at: auth_store::unix_now(),
-                });
-                eprintln!("{}", format_log_line(&req.method, &req.path, status));
-                (status, body)
-            })
-            .await
-            .expect("request-handling task should not panic");
-            let response = build_response_with_headers(status, &body, &cors_header.into_iter().collect::<Vec<_>>());
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-    }
-}
-
-async fn serve<L, E, V>(
-    listener: TcpListener,
-    state: Arc<ServerState<L, E, V>>,
-    mut shutdown: impl std::future::Future<Output = ()> + Unpin,
-) where
-    L: core::llm::LlmProvider + Send + Sync + 'static,
-    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
-    V: core::vector_store::VectorStore + Send + Sync + 'static,
-{
-    let mut in_flight = tokio::task::JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let Ok((stream, peer_addr)) = accepted else {
-                    continue;
-                };
-                let state = Arc::clone(&state);
-                in_flight.spawn(handle_connection(stream, state, peer_addr.ip()));
-            }
-            () = &mut shutdown => {
-                break;
-            }
-        }
-    }
-    while in_flight.join_next().await.is_some() {}
+    let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app).with_graceful_shutdown(shutdown).await.expect("server should not fail while serving");
 }
 
 fn main() {
@@ -1608,6 +1646,29 @@ mod tests {
         })
     }
 
+    async fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_text = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length: usize = header_text
+                    .lines()
+                    .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let needed = header_end + 4 + content_length;
+                if buf.len() >= needed {
+                    buf.truncate(needed);
+                    return buf;
+                }
+            }
+            let n = stream.read(&mut chunk).await.expect("read should succeed");
+            assert!(n > 0, "connection closed before a complete HTTP response was received");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
     async fn post_over_tcp(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
         post_over_tcp_with_headers(addr, path, body, &[]).await
     }
@@ -1626,8 +1687,7 @@ mod tests {
         request.push_str("\r\n");
         stream.write_all(request.as_bytes()).await.expect("write should succeed");
         stream.write_all(body).await.expect("write should succeed");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.expect("read should succeed");
+        let response = read_http_response(&mut stream).await;
         let text = String::from_utf8(response).expect("response should be valid utf8");
         let status: u16 = text.split_whitespace().nth(1).expect("a status line").parse().expect("a numeric status");
         let json_start = text.find("\r\n\r\n").expect("a header/body separator") + 4;
@@ -2016,58 +2076,6 @@ mod tests {
     #[test]
     fn cors_allow_origin_header_is_absent_when_cors_is_not_configured() {
         assert_eq!(cors_allow_origin_header(None, Some("https://example.com")), None);
-    }
-
-    #[test]
-    fn build_response_with_headers_includes_the_extra_headers() {
-        let response = build_response_with_headers(200, b"{}", &[("Access-Control-Allow-Origin".to_string(), "https://example.com".to_string())]);
-        let text = String::from_utf8(response).expect("response should be valid utf8");
-        assert!(text.contains("Access-Control-Allow-Origin: https://example.com\r\n"), "got: {text}");
-    }
-
-    #[test]
-    fn parse_headers_extracts_content_length_before_the_body_arrives() {
-        let raw = b"POST /memories HTTP/1.1\r\nContent-Length: 999999\r\n\r\n";
-        let parsed = parse_headers(raw).expect("expected parsed headers");
-        assert_eq!(parsed.content_length, 999_999);
-    }
-
-    #[test]
-    fn parse_headers_returns_none_when_headers_incomplete() {
-        let raw = b"POST /memories HTTP/1.1\r\nContent-Le";
-        assert!(parse_headers(raw).is_none());
-    }
-
-    #[test]
-    fn check_body_size_allows_a_body_within_the_limit() {
-        assert!(check_body_size(1024).is_none());
-    }
-
-    #[test]
-    fn check_body_size_rejects_a_body_over_the_limit() {
-        let (status, _body) = check_body_size(MAX_REQUEST_BODY_BYTES + 1).expect("expected a rejection");
-        assert_eq!(status, 413);
-    }
-
-    #[test]
-    fn parse_request_extracts_method_path_and_body() {
-        let raw = b"POST /memories HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
-        let parsed = parse_request(raw).expect("expected a parsed request");
-        assert_eq!(parsed.method, "POST");
-        assert_eq!(parsed.path, "/memories");
-        assert_eq!(parsed.body, b"hello");
-    }
-
-    #[test]
-    fn parse_request_returns_none_when_body_incomplete() {
-        let raw = b"POST /memories HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello";
-        assert!(parse_request(raw).is_none());
-    }
-
-    #[test]
-    fn parse_request_returns_none_when_headers_incomplete() {
-        let raw = b"POST /memories HTTP/1.1\r\nContent-Le";
-        assert!(parse_request(raw).is_none());
     }
 
     #[test]
@@ -3207,15 +3215,6 @@ mod tests {
     }
 
     #[test]
-    fn build_response_has_correct_status_line_and_content_length() {
-        let response = build_response(201, b"{}");
-        let text = String::from_utf8(response).expect("response should be valid utf8");
-        assert!(text.starts_with("HTTP/1.1 201 Created\r\n"));
-        assert!(text.contains("Content-Length: 2\r\n"));
-        assert!(text.ends_with("{}"));
-    }
-
-    #[test]
     fn server_handles_a_real_create_memory_request_over_tcp() {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         runtime.block_on(async {
@@ -3234,8 +3233,7 @@ mod tests {
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
@@ -3265,8 +3263,7 @@ mod tests {
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
             assert!(response_text.contains("\"access_token\""));
@@ -3281,8 +3278,7 @@ mod tests {
         }
         request.push_str("\r\n");
         stream.write_all(request.as_bytes()).await.expect("write should succeed");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.expect("read should succeed");
+        let response = read_http_response(&mut stream).await;
         let text = String::from_utf8(response).expect("response should be valid utf8");
         let status: u16 = text.split_whitespace().nth(1).expect("a status line").parse().expect("a numeric status");
         let json_start = text.find("\r\n\r\n").expect("a header/body separator") + 4;
@@ -3405,8 +3401,7 @@ mod tests {
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
         });
@@ -3430,8 +3425,7 @@ mod tests {
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {response_text}");
@@ -3454,8 +3448,7 @@ mod tests {
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 401"), "got: {response_text}");
@@ -3481,8 +3474,7 @@ mod tests {
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
@@ -3503,8 +3495,7 @@ mod tests {
             for _ in 0..3 {
                 let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
                 stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
-                let mut response = Vec::new();
-                stream.read_to_end(&mut response).await.expect("read should succeed");
+                let response = read_http_response(&mut stream).await;
                 last_response_text = String::from_utf8(response).expect("response should be valid utf8");
             }
 
@@ -3524,8 +3515,7 @@ mod tests {
 
             let mut first_stream = TcpStream::connect(addr).await.expect("connect should succeed");
             first_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
-            let mut first_response = Vec::new();
-            first_stream.read_to_end(&mut first_response).await.expect("read should succeed");
+            let first_response = read_http_response(&mut first_stream).await;
             let first_text = String::from_utf8(first_response).expect("response should be valid utf8");
             assert!(first_text.starts_with("HTTP/1.1 404"), "got: {first_text}");
 
@@ -3533,8 +3523,7 @@ mod tests {
 
             let mut second_stream = TcpStream::connect(addr).await.expect("connect should succeed");
             second_stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
-            let mut second_response = Vec::new();
-            second_stream.read_to_end(&mut second_response).await.expect("read should succeed");
+            let second_response = read_http_response(&mut second_stream).await;
             let second_text = String::from_utf8(second_response).expect("response should be valid utf8");
             assert!(second_text.starts_with("HTTP/1.1 404"), "got: {second_text}");
         });
@@ -3556,8 +3545,7 @@ mod tests {
             request.extend_from_slice(b"only a few bytes, never the full declared body");
             stream.write_all(&request).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 413"), "got: {response_text}");
@@ -3579,11 +3567,10 @@ mod tests {
             let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
-            assert!(response_text.contains("Access-Control-Allow-Origin: https://example.com\r\n"), "got: {response_text}");
+            assert!(response_text.contains("access-control-allow-origin: https://example.com\r\n"), "got: {response_text}");
         });
     }
 
@@ -3602,8 +3589,7 @@ mod tests {
             let request = "GET /nonexistent HTTP/1.1\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n";
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(!response_text.contains("Access-Control-Allow-Origin"), "got: {response_text}");
@@ -3625,14 +3611,13 @@ mod tests {
             let request = "OPTIONS /memories HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Length: 0\r\n\r\n";
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 204"), "got: {response_text}");
-            assert!(response_text.contains("Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE\r\n"), "got: {response_text}");
+            assert!(response_text.contains("access-control-allow-methods: GET, POST, PUT, PATCH, DELETE\r\n"), "got: {response_text}");
             assert!(
-                response_text.contains("Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key\r\n"),
+                response_text.contains("access-control-allow-headers: Content-Type, Authorization, X-API-Key\r\n"),
                 "got: {response_text}"
             );
         });
@@ -3651,8 +3636,7 @@ mod tests {
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response_text}");
@@ -3673,8 +3657,7 @@ mod tests {
             let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
             stream.write_all(b"GET /ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 200 OK\r\n"), "got: {response_text}");
@@ -3707,8 +3690,7 @@ mod tests {
 
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
             assert!(response_text.starts_with("HTTP/1.1 201 Created\r\n"), "got: {response_text}");
 
@@ -3746,8 +3728,7 @@ mod tests {
             stream.write_all(request.as_bytes()).await.expect("write should succeed");
             stream.write_all(body).await.expect("write should succeed");
 
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.expect("read should succeed");
+            let response = read_http_response(&mut stream).await;
 
             assert!(!response.is_empty(), "expected a real HTTP response, got none -- the request-handling task likely panicked");
             let response_text = String::from_utf8_lossy(&response);

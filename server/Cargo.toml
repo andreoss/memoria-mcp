@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 core = { package = "memoria-core", path = "../core", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "signal", "sync"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 httparse = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
