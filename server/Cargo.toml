@@ -21,3 +21,4 @@ getrandom = "0.4.3"
 [features]
 ollama = ["core/ollama"]
 fastembed = ["core/fastembed"]
+sqlite = ["core/sqlite"]

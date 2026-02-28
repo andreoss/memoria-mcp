@@ -100,6 +100,42 @@ pub trait VectorStore {
     fn reset(&self) -> Result<(), VectorStoreError>;
 }
 
+impl<T: VectorStore + ?Sized> VectorStore for Box<T> {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.as_ref().insert(record)
+    }
+
+    fn search(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filters: &HashMap<String, String>,
+        threshold: Option<f32>,
+    ) -> Result<Vec<SearchResult>, VectorStoreError> {
+        self.as_ref().search(vector, top_k, filters, threshold)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        self.as_ref().get(id)
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.as_ref().update(record)
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        self.as_ref().delete(id)
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        self.as_ref().list(offset, limit)
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.as_ref().reset()
+    }
+}
+
 pub trait VectorStoreContractTests: VectorStore {
     fn contract_insert_then_get_round_trips(&self) {
         let record = VectorRecord::new("a", vec![1.0, 2.0], HashMap::new());
@@ -494,6 +530,9 @@ pub struct SqliteVectorStore {
 impl SqliteVectorStore {
     #[allow(clippy::missing_errors_doc)]
     pub fn open(path: &std::path::Path) -> Result<Self, VectorStoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        }
         let conn = rusqlite::Connection::open(path).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, vector TEXT NOT NULL, payload TEXT NOT NULL)",

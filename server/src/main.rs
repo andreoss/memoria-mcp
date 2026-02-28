@@ -44,6 +44,13 @@ fn resolve_auth_store_path(env_override: Option<&str>, home: &str) -> PathBuf {
     Path::new(home).join(".memoria").join("auth-store.json")
 }
 
+fn resolve_sqlite_path(env_override: Option<&str>, home: &str) -> PathBuf {
+    if let Some(p) = env_override {
+        return PathBuf::from(p);
+    }
+    Path::new(home).join(".memoria").join("server-store.db")
+}
+
 fn resolve_jwt_secret(env: Option<String>) -> Result<Vec<u8>, String> {
     match env {
         Some(secret) if !secret.is_empty() => Ok(secret.into_bytes()),
@@ -1127,6 +1134,33 @@ fn resolve_embedding_provider(
     }
 }
 
+fn resolve_vector_store(
+    choice: Option<&str>,
+    json_snapshot_path: &Path,
+    sqlite_path: &Path,
+) -> Result<(Box<dyn VectorStore + Send + Sync>, bool, String), String> {
+    match choice.unwrap_or("local") {
+        "local" => {
+            let store = load_store(json_snapshot_path);
+            Ok((Box::new(store), true, "InMemoryVectorStore + JSON snapshot (ADR-26)".to_string()))
+        }
+        "sqlite" => {
+            #[cfg(feature = "sqlite")]
+            {
+                let store = core::vector_store::SqliteVectorStore::open(sqlite_path).map_err(|err| err.to_string())?;
+                let label = format!("SqliteVectorStore ({}; see ADR-33)", sqlite_path.display());
+                Ok((Box::new(store), false, label))
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                let _ = (json_snapshot_path, sqlite_path);
+                Err("MEMORIA_VECTOR_STORE=sqlite requires the server binary to be built with --features sqlite".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"local\" or \"sqlite\")")),
+    }
+}
+
 fn validate_cors_origin(origin: Option<String>) -> Result<Option<String>, String> {
     if origin.as_deref() == Some("*") {
         return Err(
@@ -1183,6 +1217,7 @@ where
     llm_label: String,
     embedding_label: String,
     store_path: PathBuf,
+    persist_json_snapshot: bool,
     auth_store: auth_store::AuthStore,
     auth_store_path: PathBuf,
     jwt_secret: Vec<u8>,
@@ -1237,7 +1272,7 @@ where
         return result;
     }
     let result = route(&state.memory, req);
-    if is_successful_mutation(&req.method, &req.path, result.0) {
+    if state.persist_json_snapshot && is_successful_mutation(&req.method, &req.path, result.0) {
         let _ = save_store(&state.memory, &state.store_path);
     }
     result
@@ -1310,14 +1345,14 @@ where
     }
     if req.method == "DELETE" && segments == ["memories"] {
         let result = handle_delete_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory, &req.body);
-        if result.0 == 200 {
+        if state.persist_json_snapshot && result.0 == 200 {
             let _ = save_store(&state.memory, &state.store_path);
         }
         return Some(result);
     }
     if req.method == "POST" && req.path == "/reset" {
         let result = handle_reset_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory);
-        if result.0 == 200 {
+        if state.persist_json_snapshot && result.0 == 200 {
             let _ = save_store(&state.memory, &state.store_path);
         }
         return Some(result);
@@ -1471,15 +1506,27 @@ fn main() {
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let store_path = resolve_store_path(std::env::var("MEMORIA_STORE_PATH").ok().as_deref(), &home);
-    eprintln!("store: {}", store_path.display());
-    let store = load_store(&store_path);
+    let sqlite_path = resolve_sqlite_path(std::env::var("MEMORIA_SQLITE_PATH").ok().as_deref(), &home);
+    let vector_store_choice = std::env::var("MEMORIA_VECTOR_STORE").ok();
+    let (vector_store, persist_json_snapshot, vector_store_label) =
+        match resolve_vector_store(vector_store_choice.as_deref(), &store_path, &sqlite_path) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        };
+    eprintln!("vector store: {vector_store_label}");
+    if persist_json_snapshot {
+        eprintln!("store: {}", store_path.display());
+    }
 
     let auth_store_path = resolve_auth_store_path(std::env::var("MEMORIA_AUTH_STORE_PATH").ok().as_deref(), &home);
     eprintln!("auth store: {}", auth_store_path.display());
     let auth_store = auth_store::AuthStore::load(&auth_store_path);
 
     let rate_limiter = RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC);
-    let memory = Memory::new(llm_provider, embedding_provider, store);
+    let memory = Memory::new(llm_provider, embedding_provider, vector_store);
     let state_outliving_the_runtime = Arc::new(ServerState {
         memory,
         token,
@@ -1488,6 +1535,7 @@ fn main() {
         llm_label,
         embedding_label,
         store_path,
+        persist_json_snapshot,
         auth_store,
         auth_store_path,
         jwt_secret,
@@ -1551,6 +1599,7 @@ mod tests {
             llm_label: "test-llm".to_string(),
             embedding_label: "test-embedding".to_string(),
             store_path,
+            persist_json_snapshot: true,
             auth_store: auth_store::AuthStore::new(),
             auth_store_path: test_auth_store_path(),
             jwt_secret: test_jwt_secret(),
@@ -1901,6 +1950,40 @@ mod tests {
         let cache_dir = std::env::var("MEMORIA_TEST_FASTEMBED_CACHE_DIR").ok();
         let (_, label) = resolve_embedding_provider(Some("fastembed"), None, None, cache_dir).expect("expected a provider");
         assert!(label.contains("all-MiniLM-L6-v2"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_vector_store_defaults_to_local_and_persists_json_snapshot() {
+        let dir = std::env::temp_dir().join(format!("memoria-resolve-vector-store-default-{}", std::process::id()));
+        let path = dir.join("does-not-exist.json");
+        let (_, persist_json_snapshot, label) = resolve_vector_store(None, &path, &dir.join("unused.db")).expect("expected a store");
+        assert!(label.contains("InMemoryVectorStore"), "got: {label}");
+        assert!(persist_json_snapshot, "the local backend must keep saving JSON snapshots");
+    }
+
+    #[test]
+    fn resolve_vector_store_rejects_an_unknown_choice() {
+        let dir = std::env::temp_dir();
+        assert!(resolve_vector_store(Some("bogus"), &dir.join("a.json"), &dir.join("a.db")).is_err());
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn resolve_vector_store_sqlite_choice_fails_clearly_without_the_feature() {
+        let dir = std::env::temp_dir();
+        assert!(resolve_vector_store(Some("sqlite"), &dir.join("a.json"), &dir.join("a.db")).is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resolve_vector_store_sqlite_choice_builds_and_does_not_persist_json_snapshot() {
+        let dir = std::env::temp_dir().join(format!("memoria-resolve-vector-store-sqlite-{}", std::process::id()));
+        let db_path = dir.join("resolve-vector-store.db");
+        let _ = std::fs::remove_file(&db_path);
+        let (_, persist_json_snapshot, label) = resolve_vector_store(Some("sqlite"), &dir.join("unused.json"), &db_path).expect("expected a store");
+        assert!(label.contains("SqliteVectorStore"), "got: {label}");
+        assert!(!persist_json_snapshot, "the sqlite backend persists itself; it must not also write a JSON snapshot");
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
