@@ -10,7 +10,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use core::embedding::LocalHashEmbeddingProvider;
 use core::llm::{LocalSentenceLlmProvider, Message, Role};
@@ -1288,6 +1288,244 @@ where
     .await
 }
 
+async fn auth_gate_middleware<L, E, V>(State(state): State<Arc<ServerState<L, E, V>>>, req: axum::extract::Request, next: Next) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let headers = headers_from_map(req.headers());
+    if !is_authorized(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &headers) {
+        return to_axum_response(401, error_body("unauthorized"));
+    }
+    next.run(req).await
+}
+
+async fn axum_handle_auth_me_get<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/auth/me".to_string(), request_headers.clone(), move |state| {
+        handle_auth_me_get(&state.auth_store, &state.jwt_secret, &request_headers)
+    })
+    .await
+}
+
+async fn axum_handle_auth_me_patch<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "PATCH".to_string(), "/auth/me".to_string(), request_headers.clone(), move |state| {
+        let result = handle_auth_me_patch(&state.auth_store, &state.jwt_secret, &request_headers, &body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_auth_change_password<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/auth/change-password".to_string(), request_headers.clone(), move |state| {
+        let result = handle_auth_change_password(&state.auth_store, &state.jwt_secret, &request_headers, &body);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_auth_onboarding_complete<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/auth/onboarding-complete".to_string(), request_headers.clone(), move |state| {
+        let result = handle_auth_onboarding_complete(&state.auth_store, &state.jwt_secret, &request_headers);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_create_api_key<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/api-keys".to_string(), request_headers.clone(), move |state| {
+        let result = handle_create_api_key(&state.auth_store, &state.jwt_secret, &request_headers, &body);
+        if result.0 == 201 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_list_api_keys<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/api-keys".to_string(), request_headers.clone(), move |state| {
+        handle_list_api_keys(&state.auth_store, &state.jwt_secret, &request_headers)
+    })
+    .await
+}
+
+async fn axum_handle_revoke_api_key<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path(key_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let path = format!("/api-keys/{key_id}");
+    wrap_handler(state, peer_addr.ip(), "DELETE".to_string(), path, request_headers.clone(), move |state| {
+        let result = handle_revoke_api_key(&state.auth_store, &state.jwt_secret, &request_headers, &key_id);
+        if result.0 == 200 {
+            let _ = state.auth_store.save(&state.auth_store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_list_entities<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/entities".to_string(), headers_from_map(&headers), |state| {
+        handle_list_entities(&state.memory)
+    })
+    .await
+}
+
+async fn axum_handle_get_configure<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/configure".to_string(), headers_from_map(&headers), |state| {
+        handle_get_configure(&state.llm_label, &state.embedding_label)
+    })
+    .await
+}
+
+async fn axum_handle_get_configure_providers<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/configure/providers".to_string(), headers_from_map(&headers), |_state| {
+        handle_get_configure_providers()
+    })
+    .await
+}
+
+async fn axum_handle_generate_instructions<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/generate-instructions".to_string(), headers_from_map(&headers), |state| {
+        handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some())
+    })
+    .await
+}
+
+async fn axum_handle_get_requests<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/requests".to_string(), request_headers.clone(), move |state| {
+        handle_get_requests(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &state.request_log, &request_headers)
+    })
+    .await
+}
+
 async fn legacy_fallback<L, E, V>(
     State(state): State<Arc<ServerState<L, E, V>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -1384,6 +1622,19 @@ where
     E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
     V: core::vector_store::VectorStore + Send + Sync + 'static,
 {
+    let authenticated_routes = Router::new()
+        .route("/auth/me", get(axum_handle_auth_me_get::<L, E, V>).patch(axum_handle_auth_me_patch::<L, E, V>))
+        .route("/auth/change-password", post(axum_handle_auth_change_password::<L, E, V>))
+        .route("/auth/onboarding-complete", post(axum_handle_auth_onboarding_complete::<L, E, V>))
+        .route("/api-keys", post(axum_handle_create_api_key::<L, E, V>).get(axum_handle_list_api_keys::<L, E, V>))
+        .route("/api-keys/{id}", delete(axum_handle_revoke_api_key::<L, E, V>))
+        .route("/entities", get(axum_handle_list_entities::<L, E, V>))
+        .route("/configure", get(axum_handle_get_configure::<L, E, V>))
+        .route("/configure/providers", get(axum_handle_get_configure_providers::<L, E, V>))
+        .route("/generate-instructions", post(axum_handle_generate_instructions::<L, E, V>))
+        .route("/requests", get(axum_handle_get_requests::<L, E, V>))
+        .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth_gate_middleware::<L, E, V>));
+
     Router::new()
         .route("/health", get(axum_handle_health::<L, E, V>))
         .route("/ready", get(axum_handle_ready::<L, E, V>))
@@ -1391,6 +1642,7 @@ where
         .route("/auth/setup-status", get(axum_handle_auth_setup_status::<L, E, V>))
         .route("/auth/login", post(axum_handle_auth_login::<L, E, V>))
         .route("/auth/refresh", post(axum_handle_auth_refresh::<L, E, V>))
+        .merge(authenticated_routes)
         .fallback(legacy_fallback::<L, E, V>)
         .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), cors_middleware::<L, E, V>))
         .layer(axum::middleware::from_fn(body_size_limit_middleware))
@@ -1403,64 +1655,8 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    if req.method == "GET" && req.path == "/auth/me" {
-        return Some(handle_auth_me_get(&state.auth_store, &state.jwt_secret, &req.headers));
-    }
-    if req.method == "PATCH" && req.path == "/auth/me" {
-        let result = handle_auth_me_patch(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return Some(result);
-    }
-    if req.method == "POST" && req.path == "/auth/change-password" {
-        let result = handle_auth_change_password(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return Some(result);
-    }
-    if req.method == "POST" && req.path == "/auth/onboarding-complete" {
-        let result = handle_auth_onboarding_complete(&state.auth_store, &state.jwt_secret, &req.headers);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return Some(result);
-    }
     if let ("GET", ["memories", id, "history"]) = (req.method.as_str(), segments) {
         return Some(handle_get_history(&state.memory, id, query));
-    }
-    if req.method == "POST" && segments == ["api-keys"] {
-        let result = handle_create_api_key(&state.auth_store, &state.jwt_secret, &req.headers, &req.body);
-        if result.0 == 201 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return Some(result);
-    }
-    if req.method == "GET" && segments == ["api-keys"] {
-        return Some(handle_list_api_keys(&state.auth_store, &state.jwt_secret, &req.headers));
-    }
-    if let ("DELETE", ["api-keys", id]) = (req.method.as_str(), segments) {
-        let result = handle_revoke_api_key(&state.auth_store, &state.jwt_secret, &req.headers, id);
-        if result.0 == 200 {
-            let _ = state.auth_store.save(&state.auth_store_path);
-        }
-        return Some(result);
-    }
-    if req.method == "GET" && req.path == "/entities" {
-        return Some(handle_list_entities(&state.memory));
-    }
-    if req.method == "GET" && req.path == "/configure" {
-        return Some(handle_get_configure(&state.llm_label, &state.embedding_label));
-    }
-    if req.method == "GET" && req.path == "/configure/providers" {
-        return Some(handle_get_configure_providers());
-    }
-    if req.method == "POST" && req.path == "/generate-instructions" {
-        return Some(handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some()));
-    }
-    if req.method == "GET" && req.path == "/requests" {
-        return Some(handle_get_requests(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &state.request_log, &req.headers));
     }
     if req.method == "DELETE" && segments == ["memories"] {
         let result = handle_delete_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory, &req.body);
@@ -3299,6 +3495,9 @@ mod tests {
             let (health_status, _) = get_over_tcp(addr, "/health", &[]).await;
             assert_eq!(health_status, 200);
 
+            let (entities_status, _) = get_over_tcp(addr, "/entities", &[("Authorization", "Bearer admin-secret")]).await;
+            assert_eq!(entities_status, 200);
+
             let (requests_status, requests_body) =
                 get_over_tcp(addr, "/requests", &[("Authorization", "Bearer admin-secret")]).await;
             assert_eq!(requests_status, 200);
@@ -3306,6 +3505,8 @@ mod tests {
             let health_entry = response.requests.iter().find(|r| r.path == "/health").expect("the real health request must be logged");
             assert_eq!(health_entry.status, 200);
             assert_eq!(health_entry.auth_kind, "none");
+            let entities_entry = response.requests.iter().find(|r| r.path == "/entities").expect("the real entities request must be logged");
+            assert_eq!(entities_entry.auth_kind, "bearer", "an authenticated request must be logged with its real auth kind, not \"none\"");
         });
     }
 
