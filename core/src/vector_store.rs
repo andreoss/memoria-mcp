@@ -482,6 +482,173 @@ impl VectorStore for InMemoryVectorStore {
     }
 }
 
+#[cfg(feature = "sqlite")]
+use rusqlite::OptionalExtension as _;
+
+#[cfg(feature = "sqlite")]
+pub struct SqliteVectorStore {
+    conn: Mutex<rusqlite::Connection>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteVectorStore {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn open(path: &std::path::Path) -> Result<Self, VectorStoreError> {
+        let conn = rusqlite::Connection::open(path).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, vector TEXT NOT NULL, payload TEXT NOT NULL)",
+            [],
+        )
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    fn decode_record(id: String, vector_json: &str, payload_json: &str) -> Result<VectorRecord, VectorStoreError> {
+        let vector: Vec<f32> = serde_json::from_str(vector_json).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let payload: HashMap<String, String> = serde_json::from_str(payload_json).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        Ok(VectorRecord { id, vector, payload })
+    }
+
+    fn all_records(conn: &rusqlite::Connection) -> Result<Vec<VectorRecord>, VectorStoreError> {
+        let mut stmt = conn
+            .prepare("SELECT id, vector, payload FROM records")
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let vector: String = row.get(1)?;
+                let payload: String = row.get(2)?;
+                Ok((id, vector, payload))
+            })
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (id, vector, payload) = row.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+            records.push(Self::decode_record(id, &vector, &payload)?);
+        }
+        Ok(records)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl VectorStore for SqliteVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let existing_vector: Option<String> = conn
+            .query_row("SELECT vector FROM records LIMIT 1", [], |row| row.get(0))
+            .optional()
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        if let Some(existing_vector) = existing_vector {
+            let existing: Vec<f32> = serde_json::from_str(&existing_vector).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+            if existing.len() != record.vector.len() {
+                return Err(VectorStoreError::DimensionMismatch { expected: existing.len(), actual: record.vector.len() });
+            }
+        }
+        let vector_json = serde_json::to_string(&record.vector).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let payload_json = serde_json::to_string(&record.payload).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let result = conn
+            .execute(
+                "INSERT INTO records (id, vector, payload) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET vector = excluded.vector, payload = excluded.payload",
+                rusqlite::params![record.id, vector_json, payload_json],
+            )
+            .map(|_| ())
+            .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(conn);
+        result
+    }
+
+    fn search(
+        &self,
+        vector: &[f32],
+        top_k: usize,
+        filters: &HashMap<String, String>,
+        threshold: Option<f32>,
+    ) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let records = Self::all_records(&conn)?;
+        drop(conn);
+        let mut scored: Vec<SearchResult> = records
+            .iter()
+            .filter(|r| filters.iter().all(|(k, v)| r.payload.get(k).is_some_and(|pv| pv == v)))
+            .map(|r| {
+                let score = r.vector.iter().zip(vector.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, |acc, d| acc + d);
+                SearchResult { id: r.id.clone(), score, payload: r.payload.clone() }
+            })
+            .collect();
+        if let Some(threshold) = threshold {
+            scored.retain(|result| result.score <= threshold);
+        }
+        scored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let row: Result<Option<(String, String)>, VectorStoreError> = conn
+            .query_row("SELECT vector, payload FROM records WHERE id = ?1", rusqlite::params![id], |row| {
+                let vector: String = row.get(0)?;
+                let payload: String = row.get(1)?;
+                Ok((vector, payload))
+            })
+            .optional()
+            .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(conn);
+        match row? {
+            Some((vector, payload)) => Ok(Some(Self::decode_record(id.to_string(), &vector, &payload)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let vector_json = serde_json::to_string(&record.vector).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let payload_json = serde_json::to_string(&record.payload).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let affected = conn
+            .execute("UPDATE records SET vector = ?2, payload = ?3 WHERE id = ?1", rusqlite::params![record.id, vector_json, payload_json])
+            .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(conn);
+        if affected? == 0 {
+            return Err(VectorStoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let result = conn.execute("DELETE FROM records WHERE id = ?1", rusqlite::params![id]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(conn);
+        result
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT id FROM records ORDER BY id LIMIT ?1 OFFSET ?2")
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(rusqlite::params![limit, offset], |row| row.get::<_, String>(0))
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|err| VectorStoreError::Backend(err.to_string()))?);
+        }
+        drop(stmt);
+        drop(conn);
+        Ok(ids)
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let result = conn.execute("DELETE FROM records", []).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(conn);
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InMemoryVectorStore, VectorStoreConfig, VectorStoreContractTests};
@@ -685,5 +852,152 @@ mod tests {
             dimension: Some(0),
         };
         assert!(matches!(config.validate(), Err(crate::CoreError::Config(_))));
+    }
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite_tests {
+        use super::super::{SqliteVectorStore, VectorRecord, VectorStore, VectorStoreContractTests};
+        use std::collections::HashMap;
+
+        fn temp_db_path(name: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!("memoria-sqlite-vector-store-test-{name}-{}.db", std::process::id()))
+        }
+
+        struct TempStore {
+            store: SqliteVectorStore,
+            path: std::path::PathBuf,
+        }
+
+        impl Drop for TempStore {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        impl std::ops::Deref for TempStore {
+            type Target = SqliteVectorStore;
+            fn deref(&self) -> &Self::Target {
+                &self.store
+            }
+        }
+
+        fn temp_store(name: &str) -> TempStore {
+            let path = temp_db_path(name);
+            let _ = std::fs::remove_file(&path);
+            let store = SqliteVectorStore::open(&path).expect("open should succeed");
+            TempStore { store, path }
+        }
+
+        #[test]
+        fn sqlite_store_passes_insert_then_get_contract() {
+            temp_store("insert-then-get").contract_insert_then_get_round_trips();
+        }
+
+        #[test]
+        fn sqlite_store_passes_delete_then_get_contract() {
+            temp_store("delete-then-get").contract_delete_then_get_returns_none();
+        }
+
+        #[test]
+        fn sqlite_store_passes_reset_contract() {
+            temp_store("reset").contract_reset_clears_everything();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_respects_top_k_contract() {
+            temp_store("search-top-k").contract_search_respects_top_k();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_orders_by_score_contract() {
+            temp_store("search-orders").contract_search_orders_by_score();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_respects_threshold_contract() {
+            temp_store("search-threshold").contract_search_respects_threshold();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_with_no_threshold_returns_everything_contract() {
+            temp_store("search-no-threshold").contract_search_with_no_threshold_returns_everything_up_to_top_k();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_filters_by_metadata_key_contract() {
+            temp_store("search-filters-metadata").contract_search_filters_by_metadata_key();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_filters_by_agent_id_contract() {
+            temp_store("search-filters-agent").contract_search_filters_by_agent_id();
+        }
+
+        #[test]
+        fn sqlite_store_passes_search_filters_by_run_id_contract() {
+            temp_store("search-filters-run").contract_search_filters_by_run_id();
+        }
+
+        #[test]
+        fn sqlite_store_passes_update_then_get_contract() {
+            temp_store("update-then-get").contract_update_then_get_reflects_change();
+        }
+
+        #[test]
+        fn sqlite_store_passes_update_nonexistent_contract() {
+            temp_store("update-nonexistent").contract_update_nonexistent_returns_not_found();
+        }
+
+        #[test]
+        fn sqlite_store_passes_delete_nonexistent_is_idempotent_contract() {
+            temp_store("delete-nonexistent").contract_delete_nonexistent_is_idempotent();
+        }
+
+        #[test]
+        fn sqlite_store_passes_list_returns_all_inserted_ids_contract() {
+            temp_store("list-all").contract_list_returns_all_inserted_ids();
+        }
+
+        #[test]
+        fn sqlite_store_passes_list_on_empty_store_returns_empty_contract() {
+            temp_store("list-empty").contract_list_on_empty_store_returns_empty();
+        }
+
+        #[test]
+        fn sqlite_store_passes_insert_rejects_mismatched_dimension_contract() {
+            temp_store("dimension-mismatch").contract_insert_rejects_mismatched_dimension();
+        }
+
+        #[test]
+        fn sqlite_store_passes_list_pagination_respects_offset_and_limit_contract() {
+            temp_store("pagination").contract_list_pagination_respects_offset_and_limit();
+        }
+
+        #[test]
+        fn records_survive_reopening_the_same_database_file() {
+            let path = temp_db_path("durability");
+            let _ = std::fs::remove_file(&path);
+            {
+                let store = SqliteVectorStore::open(&path).expect("open should succeed");
+                store
+                    .insert(VectorRecord::new("rec-1", vec![1.0, 2.0, 3.0], HashMap::from([("user_id".to_string(), "alice".to_string())])))
+                    .expect("insert should succeed");
+            }
+            let reopened = SqliteVectorStore::open(&path).expect("reopen should succeed");
+            let record = reopened.get("rec-1").expect("get should succeed").expect("record should survive reopening the file");
+            assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
+            assert_eq!(record.payload.get("user_id"), Some(&"alice".to_string()));
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn open_creates_the_database_file_if_it_does_not_exist() {
+            let path = temp_db_path("create-on-open");
+            let _ = std::fs::remove_file(&path);
+            assert!(!path.exists(), "the file should not exist before open");
+            let _store = SqliteVectorStore::open(&path).expect("open should succeed");
+            assert!(path.exists(), "open should create the database file");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
