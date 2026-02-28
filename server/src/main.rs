@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::multiple_crate_versions)]
 
 mod auth_store;
 mod crypto;

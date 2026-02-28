@@ -22,7 +22,6 @@ pub fn generate_random_key(byte_len: usize) -> String {
 
 const HASH_LEN: usize = 32;
 const SALT_LEN: usize = 16;
-const PBKDF2_ITERATIONS: u32 = 600_000;
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; HASH_LEN] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
@@ -57,22 +56,7 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, output_
     output
 }
 
-pub fn hash_password(password: &str) -> String {
-    hash_password_with_iterations(password, PBKDF2_ITERATIONS)
-}
-
-pub fn hash_password_with_iterations(password: &str, iterations: u32) -> String {
-    let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt).expect("the OS random source is available");
-    let hash = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations, HASH_LEN);
-    format!(
-        "pbkdf2-sha256${iterations}${}${}",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, salt),
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash),
-    )
-}
-
-pub fn verify_password(password: &str, stored: &str) -> bool {
+fn verify_legacy_pbkdf2_password(password: &str, stored: &str) -> bool {
     let mut parts = stored.split('$');
     let (Some("pbkdf2-sha256"), Some(iterations_str), Some(salt_b64), Some(hash_b64), None) =
         (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
@@ -92,6 +76,33 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     crate::constant_time_eq(&actual_hash, &expected_hash)
 }
 
+fn hash_password_with_params(password: &str, t_cost: u32, m_cost: u32) -> String {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    let params = argon2::Params::new(m_cost, t_cost, argon2::Params::DEFAULT_P_COST, None).expect("valid argon2 params");
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    argon2.hash_password(password.as_bytes(), &salt).expect("hashing should succeed").to_string()
+}
+
+pub fn hash_password(password: &str) -> String {
+    hash_password_with_params(password, argon2::Params::DEFAULT_T_COST, argon2::Params::DEFAULT_M_COST)
+}
+
+pub fn hash_password_with_iterations(password: &str, iterations: u32) -> String {
+    hash_password_with_params(password, iterations.max(argon2::Params::MIN_T_COST), argon2::Params::MIN_M_COST)
+}
+
+pub fn verify_password(password: &str, stored: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    if stored.starts_with("pbkdf2-sha256$") {
+        return verify_legacy_pbkdf2_password(password, stored);
+    }
+    let Ok(parsed) = PasswordHash::new(stored) else {
+        return false;
+    };
+    argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum JwtError {
     Malformed,
@@ -100,47 +111,27 @@ pub enum JwtError {
     Expired,
 }
 
-fn base64url_encode(bytes: &[u8]) -> String {
-    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
-}
-
-fn base64url_decode(s: &str) -> Result<Vec<u8>, JwtError> {
-    base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, s).map_err(|_| JwtError::Malformed)
+fn map_jwt_error(err: &jsonwebtoken::errors::Error) -> JwtError {
+    use jsonwebtoken::errors::ErrorKind;
+    match err.kind() {
+        ErrorKind::InvalidSignature => JwtError::BadSignature,
+        ErrorKind::InvalidAlgorithm | ErrorKind::Json(_) => JwtError::UnsupportedAlgorithm,
+        _ => JwtError::Malformed,
+    }
 }
 
 pub fn encode_jwt(claims: &serde_json::Value, secret: &[u8]) -> String {
-    let header = serde_json::json!({"alg": "HS256", "typ": "JWT"});
-    let header_b64 = base64url_encode(&serde_json::to_vec(&header).expect("a static JSON object always serializes"));
-    let payload_b64 = base64url_encode(&serde_json::to_vec(claims).expect("caller-provided claims must be valid JSON"));
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    let signature = hmac_sha256(secret, signing_input.as_bytes());
-    let signature_b64 = base64url_encode(&signature);
-    format!("{signing_input}.{signature_b64}")
+    jsonwebtoken::encode(&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256), claims, &jsonwebtoken::EncodingKey::from_secret(secret))
+        .expect("encoding caller-provided JSON claims never fails")
 }
 
 pub fn decode_jwt(token: &str, secret: &[u8], now_unix: u64) -> Result<serde_json::Value, JwtError> {
-    let mut parts = token.split('.');
-    let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(JwtError::Malformed);
-    };
-
-    let header_bytes = base64url_decode(header_b64)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|_| JwtError::Malformed)?;
-    if header.get("alg").and_then(serde_json::Value::as_str) != Some("HS256") {
-        return Err(JwtError::UnsupportedAlgorithm);
-    }
-
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    let expected_signature = hmac_sha256(secret, signing_input.as_bytes());
-    let actual_signature = base64url_decode(signature_b64)?;
-    if !crate::constant_time_eq(&expected_signature, &actual_signature) {
-        return Err(JwtError::BadSignature);
-    }
-
-    let payload_bytes = base64url_decode(payload_b64)?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|_| JwtError::Malformed)?;
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = false;
+    validation.required_spec_claims = std::collections::HashSet::new();
+    let claims = jsonwebtoken::decode::<serde_json::Value>(token, &jsonwebtoken::DecodingKey::from_secret(secret), &validation)
+        .map_err(|err| map_jwt_error(&err))?
+        .claims;
     if let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_u64) {
         if exp < now_unix {
             return Err(JwtError::Expired);
@@ -239,13 +230,20 @@ mod tests {
         assert_eq!(output.len(), 64);
     }
 
-    const CHEAP_NON_PRODUCTION_ITERATIONS: u32 = 10;
+    const CHEAP_NON_PRODUCTION_ITERATIONS: u32 = 1;
 
     #[test]
-    fn hash_password_uses_the_real_production_iteration_count() {
+    fn hash_password_uses_real_production_argon2id_parameters() {
         let stored = hash_password("irrelevant");
-        let iterations_field = stored.split('$').nth(1).expect("stored hash has an iterations field");
-        assert_eq!(iterations_field, PBKDF2_ITERATIONS.to_string());
+        assert!(stored.starts_with("$argon2id$"), "got: {stored}");
+        assert!(stored.contains(&format!("m={}", argon2::Params::DEFAULT_M_COST)), "got: {stored}");
+        assert!(stored.contains(&format!("t={}", argon2::Params::DEFAULT_T_COST)), "got: {stored}");
+    }
+
+    #[test]
+    fn hash_password_with_iterations_uses_the_cheap_minimum_memory_cost() {
+        let stored = hash_password_with_iterations("irrelevant", CHEAP_NON_PRODUCTION_ITERATIONS);
+        assert!(stored.contains(&format!("m={}", argon2::Params::MIN_M_COST)), "got: {stored}");
     }
 
     #[test]
@@ -281,6 +279,16 @@ mod tests {
         assert!(!verify_password("anything", "not-a-real-hash"));
         assert!(!verify_password("anything", "pbkdf2-sha256$not-a-number$salt$hash"));
         assert!(!verify_password("anything", "pbkdf2-sha256$1$salt"));
+    }
+
+    #[test]
+    fn verify_password_still_verifies_a_real_legacy_pbkdf2_hash() {
+        let salt = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"0123456789abcdef");
+        let hash_bytes = pbkdf2_hmac_sha256(b"legacy password", b"0123456789abcdef", 10, HASH_LEN);
+        let hash = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &hash_bytes);
+        let stored = format!("pbkdf2-sha256$10${salt}${hash}");
+        assert!(verify_password("legacy password", &stored), "a pre-ADR-34 PBKDF2 hash must still verify");
+        assert!(!verify_password("wrong password", &stored));
     }
 
     #[test]
@@ -333,8 +341,10 @@ mod tests {
 
     #[test]
     fn decode_jwt_rejects_an_unsupported_algorithm() {
-        let alg_none_header = base64url_encode(br#"{"alg":"none","typ":"JWT"}"#);
-        let payload = base64url_encode(br#"{"sub":"x"}"#);
+        use base64::Engine as _;
+        let alg_none_header =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
         let token = format!("{alg_none_header}.{payload}.");
         assert_eq!(decode_jwt(&token, b"secret", 0), Err(JwtError::UnsupportedAlgorithm));
     }
