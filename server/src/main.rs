@@ -129,7 +129,6 @@ struct ParsedRequest {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
 }
 
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -974,23 +973,13 @@ where
     }
 }
 
-fn route<L, E, V>(memory: &Memory<L, E, V>, req: &ParsedRequest) -> (u16, Vec<u8>)
+fn route<L, E, V>(_memory: &Memory<L, E, V>, _req: &ParsedRequest) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let (path_only, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
-    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
-    match (req.method.as_str(), segments.as_slice()) {
-        ("POST", ["memories"]) => handle_create_memory(memory, &req.body),
-        ("POST", ["search"]) => handle_search_memory(memory, &req.body),
-        ("GET", ["memories"]) => handle_list_memory(memory, query),
-        ("GET", ["memories", id]) => handle_get_memory(memory, id),
-        ("PUT", ["memories", id]) => handle_update_memory(memory, id, &req.body),
-        ("DELETE", ["memories", id]) => handle_delete_memory(memory, id),
-        _ => (404, error_body("not found")),
-    }
+    (404, error_body("not found"))
 }
 
 fn is_successful_mutation(method: &str, path: &str, status: u16) -> bool {
@@ -1526,6 +1515,194 @@ where
     .await
 }
 
+fn query_string_from_raw(raw: Option<String>) -> String {
+    raw.unwrap_or_default()
+}
+
+async fn axum_handle_create_memory<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/memories".to_string(), request_headers, move |state| {
+        let result = handle_create_memory(&state.memory, &body);
+        if state.persist_json_snapshot && result.0 == 201 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_list_memory<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let query = query_string_from_raw(raw_query);
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/memories".to_string(), request_headers, move |state| {
+        handle_list_memory(&state.memory, &query)
+    })
+    .await
+}
+
+async fn axum_handle_get_memory<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let path = format!("/memories/{id}");
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), path, request_headers, move |state| handle_get_memory(&state.memory, &id)).await
+}
+
+async fn axum_handle_update_memory<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let path = format!("/memories/{id}");
+    wrap_handler(state, peer_addr.ip(), "PUT".to_string(), path, request_headers, move |state| {
+        let result = handle_update_memory(&state.memory, &id, &body);
+        if state.persist_json_snapshot && result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_delete_memory<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let path = format!("/memories/{id}");
+    wrap_handler(state, peer_addr.ip(), "DELETE".to_string(), path, request_headers, move |state| {
+        let result = handle_delete_memory(&state.memory, &id);
+        if state.persist_json_snapshot && result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_search_memory<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/search".to_string(), request_headers, move |state| {
+        handle_search_memory(&state.memory, &body)
+    })
+    .await
+}
+
+async fn axum_handle_get_history<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let path = format!("/memories/{id}/history");
+    let query = query_string_from_raw(raw_query);
+    wrap_handler(state, peer_addr.ip(), "GET".to_string(), path, request_headers, move |state| handle_get_history(&state.memory, &id, &query))
+        .await
+}
+
+async fn axum_handle_delete_all<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "DELETE".to_string(), "/memories".to_string(), request_headers.clone(), move |state| {
+        let result = handle_delete_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &request_headers, &state.memory, &body);
+        if state.persist_json_snapshot && result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        result
+    })
+    .await
+}
+
+async fn axum_handle_reset_all<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/reset".to_string(), request_headers.clone(), move |state| {
+        let result = handle_reset_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &request_headers, &state.memory);
+        if state.persist_json_snapshot && result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        result
+    })
+    .await
+}
+
 async fn legacy_fallback<L, E, V>(
     State(state): State<Arc<ServerState<L, E, V>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -1539,11 +1716,10 @@ where
     let method = req.method().to_string();
     let path = req.uri().path_and_query().map_or_else(|| req.uri().path().to_string(), |pq| pq.as_str().to_string());
     let headers = headers_from_map(req.headers());
-    let body = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(_) => return to_axum_response(413, error_body("request body too large")),
-    };
-    let parsed = ParsedRequest { method: method.clone(), path: path.clone(), headers: headers.clone(), body };
+    if axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await.is_err() {
+        return to_axum_response(413, error_body("request body too large"));
+    }
+    let parsed = ParsedRequest { method: method.clone(), path: path.clone(), headers: headers.clone() };
     wrap_handler(state, peer_addr.ip(), method, path, headers, move |state| dispatch_authorized_or_legacy(state, &parsed)).await
 }
 
@@ -1633,6 +1809,21 @@ where
         .route("/configure/providers", get(axum_handle_get_configure_providers::<L, E, V>))
         .route("/generate-instructions", post(axum_handle_generate_instructions::<L, E, V>))
         .route("/requests", get(axum_handle_get_requests::<L, E, V>))
+        .route(
+            "/memories",
+            post(axum_handle_create_memory::<L, E, V>)
+                .get(axum_handle_list_memory::<L, E, V>)
+                .delete(axum_handle_delete_all::<L, E, V>),
+        )
+        .route(
+            "/memories/{id}",
+            get(axum_handle_get_memory::<L, E, V>)
+                .put(axum_handle_update_memory::<L, E, V>)
+                .delete(axum_handle_delete_memory::<L, E, V>),
+        )
+        .route("/memories/{id}/history", get(axum_handle_get_history::<L, E, V>))
+        .route("/search", post(axum_handle_search_memory::<L, E, V>))
+        .route("/reset", post(axum_handle_reset_all::<L, E, V>))
         .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), auth_gate_middleware::<L, E, V>));
 
     Router::new()
@@ -1649,29 +1840,12 @@ where
         .with_state(state)
 }
 
-fn dispatch_authorized_routes<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest, segments: &[&str], query: &str) -> Option<(u16, Vec<u8>)>
+const fn dispatch_authorized_routes<L, E, V>(_state: &ServerState<L, E, V>, _req: &ParsedRequest, _segments: &[&str], _query: &str) -> Option<(u16, Vec<u8>)>
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    if let ("GET", ["memories", id, "history"]) = (req.method.as_str(), segments) {
-        return Some(handle_get_history(&state.memory, id, query));
-    }
-    if req.method == "DELETE" && segments == ["memories"] {
-        let result = handle_delete_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory, &req.body);
-        if state.persist_json_snapshot && result.0 == 200 {
-            let _ = save_store(&state.memory, &state.store_path);
-        }
-        return Some(result);
-    }
-    if req.method == "POST" && req.path == "/reset" {
-        let result = handle_reset_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers, &state.memory);
-        if state.persist_json_snapshot && result.0 == 200 {
-            let _ = save_store(&state.memory, &state.store_path);
-        }
-        return Some(result);
-    }
     None
 }
 
@@ -2989,50 +3163,6 @@ mod tests {
     }
 
     #[test]
-    fn route_dispatches_get_memories_id() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
-        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
-        let id = created.ids.first().expect("expected at least one id").clone();
-
-        let req = ParsedRequest { method: "GET".to_string(), path: format!("/memories/{id}"), headers: Vec::new(), body: Vec::new() };
-        let (status, _) = route(&memory, &req);
-        assert_eq!(status, 200);
-    }
-
-    #[test]
-    fn route_dispatches_post_search() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
-
-        let req = ParsedRequest {
-            method: "POST".to_string(),
-            path: "/search".to_string(),
-            headers: Vec::new(),
-            body: br#"{"query":"engineer","user_id":"alice"}"#.to_vec(),
-        };
-        let (status, _) = route(&memory, &req);
-        assert_eq!(status, 200);
-    }
-
-    #[test]
-    fn route_dispatches_put_memories_id() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
-        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
-        let id = created.ids.first().expect("expected at least one id").clone();
-
-        let req = ParsedRequest {
-            method: "PUT".to_string(),
-            path: format!("/memories/{id}"),
-            headers: Vec::new(),
-            body: br#"{"content":"updated"}"#.to_vec(),
-        };
-        let (status, _) = route(&memory, &req);
-        assert_eq!(status, 200);
-    }
-
-    #[test]
     fn handle_delete_memory_is_idempotent() {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
@@ -3366,46 +3496,9 @@ mod tests {
     }
 
     #[test]
-    fn route_dispatches_delete_memories_id() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
-        let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
-        let id = created.ids.first().expect("expected at least one id").clone();
-
-        let req = ParsedRequest { method: "DELETE".to_string(), path: format!("/memories/{id}"), headers: Vec::new(), body: Vec::new() };
-        let (status, _) = route(&memory, &req);
-        assert_eq!(status, 200);
-    }
-
-    #[test]
-    fn route_dispatches_get_memories_with_query_string() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
-
-        let req = ParsedRequest { method: "GET".to_string(), path: "/memories?offset=0&limit=10".to_string(), headers: Vec::new(), body: Vec::new() };
-        let (status, body) = route(&memory, &req);
-        assert_eq!(status, 200);
-        let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
-        assert!(!response.ids.is_empty());
-    }
-
-    #[test]
-    fn route_dispatches_post_memories() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let req = ParsedRequest {
-            method: "POST".to_string(),
-            path: "/memories".to_string(),
-            headers: Vec::new(),
-            body: br#"{"content":"Alice is an engineer.","user_id":"alice"}"#.to_vec(),
-        };
-        let (status, _) = route(&memory, &req);
-        assert_eq!(status, 201);
-    }
-
-    #[test]
     fn route_returns_404_for_unknown_path() {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let req = ParsedRequest { method: "GET".to_string(), path: "/nonexistent".to_string(), headers: Vec::new(), body: Vec::new() };
+        let req = ParsedRequest { method: "GET".to_string(), path: "/nonexistent".to_string(), headers: Vec::new() };
         let (status, _) = route(&memory, &req);
         assert_eq!(status, 404);
     }
