@@ -1083,6 +1083,7 @@ fn resolve_embedding_provider(
     provider_choice: Option<&str>,
     model: Option<String>,
     base_url: Option<String>,
+    fastembed_cache_dir: Option<String>,
 ) -> Result<(Box<dyn core::embedding::EmbeddingProvider + Send + Sync>, String), String> {
     match provider_choice.unwrap_or("local") {
         "local" => Ok((
@@ -1101,11 +1102,28 @@ fn resolve_embedding_provider(
             }
             #[cfg(not(feature = "ollama"))]
             {
-                let _ = (model, base_url);
+                let _ = (model, base_url, fastembed_cache_dir);
                 Err("MEMORIA_EMBEDDING_PROVIDER=ollama requires the server binary to be built with --features ollama".to_string())
             }
         }
-        other => Err(format!("unknown MEMORIA_EMBEDDING_PROVIDER value {other:?} (expected \"local\" or \"ollama\")")),
+        "fastembed" => {
+            #[cfg(feature = "fastembed")]
+            {
+                let model = model.unwrap_or_else(|| "all-MiniLM-L6-v2".to_string());
+                let config = core::embedding::EmbeddingConfig { model: model.clone(), base_url: None, api_key: None, dimensions: None };
+                let cache_dir = fastembed_cache_dir.clone().map(std::path::PathBuf::from);
+                let provider = core::embedding::FastEmbedEmbeddingProvider::from_config(&config, cache_dir).map_err(|err| err.to_string())?;
+                let cache_label = fastembed_cache_dir.unwrap_or_else(|| ".fastembed_cache (default)".to_string());
+                let label = format!("FastEmbedEmbeddingProvider (model={model}, cache_dir={cache_label}; see ADR-32)");
+                Ok((Box::new(provider), label))
+            }
+            #[cfg(not(feature = "fastembed"))]
+            {
+                let _ = (model, base_url, fastembed_cache_dir);
+                Err("MEMORIA_EMBEDDING_PROVIDER=fastembed requires the server binary to be built with --features fastembed".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_EMBEDDING_PROVIDER value {other:?} (expected \"local\", \"ollama\", or \"fastembed\")")),
     }
 }
 
@@ -1432,6 +1450,7 @@ fn main() {
         embedding_provider_choice.as_deref(),
         std::env::var("MEMORIA_EMBEDDING_MODEL").ok(),
         std::env::var("MEMORIA_EMBEDDING_BASE_URL").ok(),
+        std::env::var("MEMORIA_FASTEMBED_CACHE_DIR").ok(),
     ) {
         Ok(resolved) => resolved,
         Err(message) => {
@@ -1840,13 +1859,13 @@ mod tests {
 
     #[test]
     fn resolve_embedding_provider_defaults_to_local() {
-        let (_, label) = resolve_embedding_provider(None, None, None).expect("expected a provider");
+        let (_, label) = resolve_embedding_provider(None, None, None, None).expect("expected a provider");
         assert!(label.contains("LocalHashEmbeddingProvider"), "got: {label}");
     }
 
     #[test]
     fn resolve_embedding_provider_rejects_an_unknown_choice() {
-        assert!(resolve_embedding_provider(Some("bogus"), None, None).is_err());
+        assert!(resolve_embedding_provider(Some("bogus"), None, None, None).is_err());
     }
 
     #[cfg(feature = "ollama")]
@@ -1859,7 +1878,7 @@ mod tests {
     #[cfg(feature = "ollama")]
     #[test]
     fn resolve_embedding_provider_ollama_choice_builds_with_defaults() {
-        let (_, label) = resolve_embedding_provider(Some("ollama"), None, None).expect("expected a provider");
+        let (_, label) = resolve_embedding_provider(Some("ollama"), None, None, None).expect("expected a provider");
         assert!(label.contains("nomic-embed-text"), "got: {label}");
     }
 
@@ -1867,6 +1886,21 @@ mod tests {
     #[test]
     fn resolve_llm_provider_ollama_choice_fails_clearly_without_the_feature() {
         assert!(resolve_llm_provider(Some("ollama"), None, None).is_err());
+    }
+
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn resolve_embedding_provider_fastembed_choice_fails_clearly_without_the_feature() {
+        assert!(resolve_embedding_provider(Some("fastembed"), None, None, None).is_err());
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    #[ignore = "downloads a real ~188MB model + ONNX runtime on first run; needs real network access"]
+    fn resolve_embedding_provider_fastembed_choice_builds_with_defaults() {
+        let cache_dir = std::env::var("MEMORIA_TEST_FASTEMBED_CACHE_DIR").ok();
+        let (_, label) = resolve_embedding_provider(Some("fastembed"), None, None, cache_dir).expect("expected a provider");
+        assert!(label.contains("all-MiniLM-L6-v2"), "got: {label}");
     }
 
     #[test]
