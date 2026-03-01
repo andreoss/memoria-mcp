@@ -125,12 +125,6 @@ impl RateLimiter {
     }
 }
 
-struct ParsedRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-}
-
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 
 #[derive(serde::Deserialize)]
@@ -973,24 +967,6 @@ where
     }
 }
 
-fn route<L, E, V>(_memory: &Memory<L, E, V>, _req: &ParsedRequest) -> (u16, Vec<u8>)
-where
-    L: core::llm::LlmProvider,
-    E: core::embedding::EmbeddingProvider,
-    V: core::vector_store::VectorStore,
-{
-    (404, error_body("not found"))
-}
-
-fn is_successful_mutation(method: &str, path: &str, status: u16) -> bool {
-    let (path_only, _query) = path.split_once('?').unwrap_or((path, ""));
-    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
-    matches!(
-        (method, segments.as_slice(), status),
-        ("POST", ["memories"], 201) | ("PUT" | "DELETE", ["memories", _], 200)
-    )
-}
-
 fn resolve_cors_origin(env: Option<String>) -> Option<String> {
     env.filter(|origin| !origin.is_empty())
 }
@@ -1703,7 +1679,7 @@ where
     .await
 }
 
-async fn legacy_fallback<L, E, V>(
+async fn unknown_route_fallback<L, E, V>(
     State(state): State<Arc<ServerState<L, E, V>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
@@ -1719,29 +1695,14 @@ where
     if axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await.is_err() {
         return to_axum_response(413, error_body("request body too large"));
     }
-    let parsed = ParsedRequest { method: method.clone(), path: path.clone(), headers: headers.clone() };
-    wrap_handler(state, peer_addr.ip(), method, path, headers, move |state| dispatch_authorized_or_legacy(state, &parsed)).await
-}
-
-fn dispatch_authorized_or_legacy<L, E, V>(state: &ServerState<L, E, V>, req: &ParsedRequest) -> (u16, Vec<u8>)
-where
-    L: core::llm::LlmProvider,
-    E: core::embedding::EmbeddingProvider,
-    V: core::vector_store::VectorStore,
-{
-    if !is_authorized(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &req.headers) {
-        return (401, error_body("unauthorized"));
-    }
-    let (path_only, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
-    let segments: Vec<&str> = path_only.trim_matches('/').split('/').collect();
-    if let Some(result) = dispatch_authorized_routes(state, req, &segments, query) {
-        return result;
-    }
-    let result = route(&state.memory, req);
-    if state.persist_json_snapshot && is_successful_mutation(&req.method, &req.path, result.0) {
-        let _ = save_store(&state.memory, &state.store_path);
-    }
-    result
+    wrap_handler(state, peer_addr.ip(), method, path, headers.clone(), move |state| {
+        if is_authorized(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &headers) {
+            (404, error_body("not found"))
+        } else {
+            (401, error_body("unauthorized"))
+        }
+    })
+    .await
 }
 
 async fn cors_middleware<L, E, V>(State(state): State<Arc<ServerState<L, E, V>>>, req: axum::extract::Request, next: Next) -> Response
@@ -1834,19 +1795,10 @@ where
         .route("/auth/login", post(axum_handle_auth_login::<L, E, V>))
         .route("/auth/refresh", post(axum_handle_auth_refresh::<L, E, V>))
         .merge(authenticated_routes)
-        .fallback(legacy_fallback::<L, E, V>)
+        .fallback(unknown_route_fallback::<L, E, V>)
         .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), cors_middleware::<L, E, V>))
         .layer(axum::middleware::from_fn(body_size_limit_middleware))
         .with_state(state)
-}
-
-const fn dispatch_authorized_routes<L, E, V>(_state: &ServerState<L, E, V>, _req: &ParsedRequest, _segments: &[&str], _query: &str) -> Option<(u16, Vec<u8>)>
-where
-    L: core::llm::LlmProvider,
-    E: core::embedding::EmbeddingProvider,
-    V: core::vector_store::VectorStore,
-{
-    None
 }
 
 async fn serve<L, E, V>(listener: TcpListener, state: Arc<ServerState<L, E, V>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static)
@@ -2269,39 +2221,6 @@ mod tests {
     #[test]
     fn resolve_jwt_secret_with_an_empty_value_fails_closed() {
         assert!(resolve_jwt_secret(Some(String::new())).is_err(), "an empty MEMORIA_JWT_SECRET must not be treated as configured");
-    }
-
-    #[test]
-    fn is_successful_mutation_true_for_create() {
-        assert!(is_successful_mutation("POST", "/memories", 201));
-    }
-
-    #[test]
-    fn is_successful_mutation_true_for_update() {
-        assert!(is_successful_mutation("PUT", "/memories/rec-1", 200));
-    }
-
-    #[test]
-    fn is_successful_mutation_true_for_delete() {
-        assert!(is_successful_mutation("DELETE", "/memories/rec-1", 200));
-    }
-
-    #[test]
-    fn is_successful_mutation_false_for_search() {
-        assert!(!is_successful_mutation("POST", "/memories/search", 200));
-    }
-
-    #[test]
-    fn is_successful_mutation_false_for_get_and_list() {
-        assert!(!is_successful_mutation("GET", "/memories", 200));
-        assert!(!is_successful_mutation("GET", "/memories/rec-1", 200));
-    }
-
-    #[test]
-    fn is_successful_mutation_false_when_the_status_indicates_failure() {
-        assert!(!is_successful_mutation("POST", "/memories", 400));
-        assert!(!is_successful_mutation("PUT", "/memories/rec-1", 404));
-        assert!(!is_successful_mutation("DELETE", "/memories/rec-1", 500));
     }
 
     #[test]
@@ -3496,14 +3415,6 @@ mod tests {
     }
 
     #[test]
-    fn route_returns_404_for_unknown_path() {
-        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
-        let req = ParsedRequest { method: "GET".to_string(), path: "/nonexistent".to_string(), headers: Vec::new() };
-        let (status, _) = route(&memory, &req);
-        assert_eq!(status, 404);
-    }
-
-    #[test]
     fn server_handles_a_real_create_memory_request_over_tcp() {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         runtime.block_on(async {
@@ -3723,6 +3634,29 @@ mod tests {
             let response_text = String::from_utf8(response).expect("response should be valid utf8");
 
             assert!(response_text.starts_with("HTTP/1.1 404 Not Found\r\n"), "got: {response_text}");
+        });
+    }
+
+    #[test]
+    fn server_returns_401_not_404_over_tcp_for_an_unauthenticated_request_to_an_unknown_route_when_auth_is_configured() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind should succeed");
+            let addr = listener.local_addr().expect("local_addr should succeed");
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+            let state = test_state(memory, Some("secret".to_string()), RateLimiter::new(1000.0, 1000.0), None, test_store_path());
+            tokio::spawn(serve(listener, state, Box::pin(std::future::pending())));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect should succeed");
+            stream.write_all(b"GET /nonexistent HTTP/1.1\r\nContent-Length: 0\r\n\r\n").await.expect("write should succeed");
+
+            let response = read_http_response(&mut stream).await;
+            let response_text = String::from_utf8(response).expect("response should be valid utf8");
+
+            assert!(
+                response_text.starts_with("HTTP/1.1 401"),
+                "an unauthenticated request to an unknown path must never learn whether the path exists, got: {response_text}"
+            );
         });
     }
 
@@ -3978,6 +3912,7 @@ mod tests {
             let body = br#"{"content":"Alice is an engineer.","user_id":"alice"}"#;
             let request_head = format!("POST /memories HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
             stream.write_all(request_head.as_bytes()).await.expect("write should succeed");
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
             shutdown_tx.send(()).expect("shutdown receiver should still be alive");
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
