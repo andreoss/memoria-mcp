@@ -54,6 +54,24 @@ jobs:
       - name: Cargo Test (ollama feature, non-network cases only)
         run: cargo test -p memoria-core -p cli -p server --features ollama
 
+  coverage:
+    name: Code Coverage (core, all features, reported not gated)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --no-default-features
+
+      - name: Run Coverage (memoria-core, all features)
+        run: cargo tarpaulin -p memoria-core --lib --features ollama,sqlite,fastembed --exclude-files 'cli/*' 'server/*' --out Stdout
+
   smoke-test-server:
     name: Server Smoke Test
     runs-on: ubuntu-latest
