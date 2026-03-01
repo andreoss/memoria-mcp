@@ -5,6 +5,7 @@ pub mod error;
 pub mod filter;
 pub mod llm;
 pub mod memory;
+pub mod reranker;
 pub mod vector_store;
 
 pub use error::CoreError;

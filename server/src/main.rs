@@ -701,7 +701,7 @@ where
         None => None,
     };
 
-    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref()) {
+    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref(), false) {
         Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }

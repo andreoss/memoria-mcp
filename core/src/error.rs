@@ -1,5 +1,6 @@
 use crate::embedding::EmbeddingError;
 use crate::llm::LlmError;
+use crate::reranker::RerankError;
 use crate::vector_store::VectorStoreError;
 use std::fmt;
 
@@ -63,6 +64,15 @@ impl From<LlmError> for CoreError {
 
 impl From<EmbeddingError> for CoreError {
     fn from(err: EmbeddingError) -> Self {
+        Self::Provider {
+            message: err.to_string(),
+            source: Box::new(err),
+        }
+    }
+}
+
+impl From<RerankError> for CoreError {
+    fn from(err: RerankError) -> Self {
         Self::Provider {
             message: err.to_string(),
             source: Box::new(err),
@@ -172,6 +182,17 @@ mod tests {
         match err {
             CoreError::Provider { message, .. } => {
                 assert_eq!(message, "backend rejected credentials");
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rerank_backend_error_routes_to_provider() {
+        let err: CoreError = RerankError::Backend("boom".to_string()).into();
+        match err {
+            CoreError::Provider { message, .. } => {
+                assert_eq!(message, "backend error: boom");
             }
             other => panic!("expected Provider, got {other:?}"),
         }

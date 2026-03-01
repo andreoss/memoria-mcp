@@ -1,5 +1,6 @@
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::llm::{Completion, LlmError, LlmProvider, Message};
+use crate::reranker::{RerankError, Reranker};
 use crate::vector_store::{SearchResult, VectorRecord, VectorStore, VectorStoreError};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -257,5 +258,25 @@ impl VectorStore for VecVectorStore {
     fn reset(&self) -> Result<(), VectorStoreError> {
         self.records.lock().expect("lock poisoned").clear();
         Ok(())
+    }
+}
+
+pub struct FakeRerankerProvider {
+    fail_with_backend: bool,
+}
+
+impl FakeRerankerProvider {
+    #[must_use]
+    pub(crate) fn failing() -> Self {
+        Self { fail_with_backend: true }
+    }
+}
+
+impl Reranker for FakeRerankerProvider {
+    fn rerank(&self, query: &str, results: Vec<SearchResult>) -> Result<Vec<SearchResult>, RerankError> {
+        if self.fail_with_backend {
+            return Err(RerankError::Backend("fake backend failure".to_string()));
+        }
+        crate::reranker::LocalOverlapReranker::new().rerank(query, results).map_err(|_| RerankError::Backend("unreachable".to_string()))
     }
 }

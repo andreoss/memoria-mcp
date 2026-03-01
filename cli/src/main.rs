@@ -365,7 +365,7 @@ where
         }
         Command::Search { query, user_id, agent_id, run_id, top_k, threshold } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.search(&query, top_k, &scope, threshold, true, None) {
+            match memory.search(&query, top_k, &scope, threshold, true, None, false) {
                 Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");
