@@ -48,6 +48,23 @@ fn is_expired(payload: &HashMap<String, String>, today: &str) -> bool {
     payload.get("expiration_date").is_some_and(|expiration_date| expiration_date.as_str() < today)
 }
 
+fn combine_with_keyword_scores(results: &mut [crate::vector_store::SearchResult], keyword_results: &[crate::vector_store::SearchResult]) {
+    let semantic_min = results.iter().map(|r| r.score).fold(f32::INFINITY, f32::min);
+    let semantic_max = results.iter().map(|r| r.score).fold(f32::NEG_INFINITY, f32::max);
+    let keyword_min = keyword_results.iter().map(|r| r.score).fold(f32::INFINITY, f32::min);
+    let keyword_max = keyword_results.iter().map(|r| r.score).fold(f32::NEG_INFINITY, f32::max);
+    let keyword_scores: HashMap<&str, f32> = keyword_results.iter().map(|r| (r.id.as_str(), r.score)).collect();
+
+    for result in results.iter_mut() {
+        let normalized_semantic = crate::reranker::normalize_distance(result.score, semantic_min, semantic_max);
+        let normalized_keyword = keyword_scores
+            .get(result.id.as_str())
+            .map_or(1.0, |&score| crate::reranker::normalize_distance(score, keyword_min, keyword_max));
+        result.score = f32::midpoint(normalized_semantic, normalized_keyword);
+    }
+    results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum HistoryEvent {
@@ -181,6 +198,11 @@ where
         }
         if let Some(filters) = filters {
             results.retain(|r| crate::filter::evaluate(filters, &r.payload));
+        }
+        if let Some(keyword_results) = self.vector_store.keyword_search(query, usize::MAX, scope)? {
+            if !keyword_results.is_empty() {
+                combine_with_keyword_scores(&mut results, &keyword_results);
+            }
         }
         results.truncate(top_k);
         if rerank {
@@ -1082,6 +1104,68 @@ mod tests {
 
         let result = memory.search("engineer", 10, &scope(), None, true, None, false);
         assert!(result.is_ok(), "rerank=false must not invoke a configured reranker even if it would fail: {result:?}");
+    }
+
+    fn search_result_with_content(id: &str, distance: f32, content: &str, record_scope: &HashMap<String, String>) -> crate::vector_store::SearchResult {
+        let mut payload = record_scope.clone();
+        payload.insert("content".to_string(), content.to_string());
+        crate::vector_store::SearchResult { id: id.to_string(), score: distance, payload }
+    }
+
+    #[test]
+    fn combine_with_keyword_scores_promotes_a_semantically_middling_result_with_a_much_stronger_keyword_match() {
+        let mut results = vec![
+            search_result_with_content("best_semantic", 100.0, "a", &scope()),
+            search_result_with_content("best_keyword", 150.0, "b", &scope()),
+            search_result_with_content("worst_both", 200.0, "c", &scope()),
+        ];
+        let keyword_results = vec![
+            search_result_with_content("best_semantic", -1.0, "a", &scope()),
+            search_result_with_content("best_keyword", -10.0, "b", &scope()),
+            search_result_with_content("worst_both", -3.0, "c", &scope()),
+        ];
+        combine_with_keyword_scores(&mut results, &keyword_results);
+        assert_eq!(results[0].id, "best_keyword", "a strong enough keyword match should be able to promote a semantically-middling result above the semantically-best one, got: {results:?}");
+    }
+
+    #[test]
+    fn combine_with_keyword_scores_treats_an_unmatched_candidate_as_the_worst_case() {
+        let mut results = vec![
+            search_result_with_content("matched", 150.0, "matched", &scope()),
+            search_result_with_content("unmatched", 150.0, "unmatched", &scope()),
+        ];
+        let keyword_results = vec![search_result_with_content("matched", -3.0, "matched", &scope())];
+        combine_with_keyword_scores(&mut results, &keyword_results);
+        assert_eq!(results[0].id, "matched", "a real keyword match should outrank a candidate with no keyword match at all, given equal semantic scores");
+    }
+
+    #[test]
+    fn test_search_combines_keyword_results_when_the_vector_store_supports_it() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let keyword_results = vec![search_result_with_content("b", -5.0, "rust programming", &scope())];
+        let store = crate::test_support::FixedKeywordSearchVectorStore::new(keyword_results);
+        let memory = Memory::new(llm, embedding, store);
+        memory.add(&[Message::new(Role::User, "irrelevant content here")], scope(), false).expect("add should succeed");
+        memory.add(&[Message::new(Role::User, "rust programming")], scope(), false).expect("add should succeed");
+
+        let results = memory.search("query", 10, &scope(), None, true, None, false).expect("search should succeed");
+        let rust_result = results.iter().find(|r| r.payload.get("content") == Some(&"rust programming".to_string())).expect("expected the rust programming record");
+        let other_result = results.iter().find(|r| r.payload.get("content") == Some(&"irrelevant content here".to_string())).expect("expected the irrelevant record");
+        assert!(rust_result.score < other_result.score, "the record with a real keyword match should have a better (lower) combined score, got: {results:?}");
+    }
+
+    #[test]
+    fn test_search_is_unaffected_when_keyword_search_returns_an_empty_result() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = crate::test_support::FixedKeywordSearchVectorStore::new(Vec::new());
+        let memory = Memory::new(llm, embedding, store);
+        memory.add(&[Message::new(Role::User, "some content")], scope(), false).expect("add should succeed");
+
+        let results = memory.search("query", 10, &scope(), None, true, None, false).expect("search should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score > 1.0, "an empty keyword_search result must not trigger normalization/combination at all; expected the raw, unnormalized semantic distance, got {}", results[0].score);
     }
 
     #[test]

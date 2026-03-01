@@ -261,6 +261,52 @@ impl VectorStore for VecVectorStore {
     }
 }
 
+pub struct FixedKeywordSearchVectorStore {
+    inner: crate::vector_store::InMemoryVectorStore,
+    keyword_results: Vec<SearchResult>,
+}
+
+impl FixedKeywordSearchVectorStore {
+    #[must_use]
+    pub(crate) fn new(keyword_results: Vec<SearchResult>) -> Self {
+        Self { inner: crate::vector_store::InMemoryVectorStore::new(), keyword_results }
+    }
+}
+
+impl VectorStore for FixedKeywordSearchVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.inner.insert(record)
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>, threshold: Option<f32>) -> Result<Vec<SearchResult>, VectorStoreError> {
+        self.inner.search(vector, top_k, filters, threshold)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        self.inner.get(id)
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.inner.update(record)
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        self.inner.delete(id)
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        self.inner.list(offset, limit)
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.inner.reset()
+    }
+
+    fn keyword_search(&self, _query: &str, _top_k: usize, _filters: &HashMap<String, String>) -> Result<Option<Vec<SearchResult>>, VectorStoreError> {
+        Ok(Some(self.keyword_results.clone()))
+    }
+}
+
 pub struct FakeRerankerProvider {
     fail_with_backend: bool,
 }

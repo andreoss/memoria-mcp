@@ -62,7 +62,7 @@ impl Default for LocalOverlapReranker {
     }
 }
 
-fn normalize_distance(score: f32, min_score: f32, max_score: f32) -> f32 {
+pub(crate) fn normalize_distance(score: f32, min_score: f32, max_score: f32) -> f32 {
     let range = max_score - min_score;
     if range > 0.0 {
         (score - min_score) / range
