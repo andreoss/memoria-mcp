@@ -564,10 +564,15 @@ where
 struct ConfigureResponse {
     llm_provider: String,
     embedding_provider: String,
+    reranker: Option<String>,
 }
 
-fn handle_get_configure(llm_label: &str, embedding_label: &str) -> (u16, Vec<u8>) {
-    let response = ConfigureResponse { llm_provider: llm_label.to_string(), embedding_provider: embedding_label.to_string() };
+fn handle_get_configure(llm_label: &str, embedding_label: &str, reranker_label: Option<&str>) -> (u16, Vec<u8>) {
+    let response = ConfigureResponse {
+        llm_provider: llm_label.to_string(),
+        embedding_provider: embedding_label.to_string(),
+        reranker: reranker_label.map(ToString::to_string),
+    };
     (200, serde_json::to_vec(&response).unwrap_or_default())
 }
 
@@ -575,12 +580,14 @@ fn handle_get_configure(llm_label: &str, embedding_label: &str) -> (u16, Vec<u8>
 struct ConfigureProvidersResponse {
     llm_providers: Vec<String>,
     embedding_providers: Vec<String>,
+    rerankers: Vec<String>,
 }
 
 fn handle_get_configure_providers() -> (u16, Vec<u8>) {
     let response = ConfigureProvidersResponse {
         llm_providers: vec!["local".to_string(), "ollama".to_string()],
         embedding_providers: vec!["local".to_string(), "ollama".to_string()],
+        rerankers: vec!["local".to_string()],
     };
     (200, serde_json::to_vec(&response).unwrap_or_default())
 }
@@ -590,14 +597,15 @@ struct GenerateInstructionsResponse {
     instructions: String,
 }
 
-fn handle_generate_instructions(llm_label: &str, embedding_label: &str, auth_required: bool) -> (u16, Vec<u8>) {
+fn handle_generate_instructions(llm_label: &str, embedding_label: &str, reranker_label: Option<&str>, auth_required: bool) -> (u16, Vec<u8>) {
     let auth_line = if auth_required {
         "This server requires authentication: register the first account with POST /auth/register, then log in with POST /auth/login."
     } else {
         "This server has no authentication configured (MEMORIA_ALLOW_NO_AUTH=1) -- every route is open."
     };
+    let reranker_line = reranker_label.map_or_else(String::new, |label| format!("\nReranker: {label}"));
     let instructions = format!(
-        "Welcome to memoria.\n\nLLM provider: {llm_label}\nEmbedding provider: {embedding_label}\n\n{auth_line}\n\nCreate a memory with POST /memories, search with POST /search, and see docs/overview.md for the full API surface."
+        "Welcome to memoria.\n\nLLM provider: {llm_label}\nEmbedding provider: {embedding_label}{reranker_line}\n\n{auth_line}\n\nCreate a memory with POST /memories, search with POST /search, and see docs/overview.md for the full API surface."
     );
     (200, serde_json::to_vec(&GenerateInstructionsResponse { instructions }).unwrap_or_default())
 }
@@ -672,6 +680,7 @@ struct SearchMemoryRequest {
     threshold: Option<f32>,
     show_expired: Option<bool>,
     filters: Option<serde_json::Value>,
+    rerank: Option<bool>,
 }
 
 const fn default_top_k() -> usize {
@@ -695,13 +704,14 @@ where
     };
     let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
     let show_expired = request.show_expired.unwrap_or(false);
+    let rerank = request.rerank.unwrap_or(false);
     let filters = match request.filters.as_ref().map(core::filter::parse_filter_expr) {
         Some(Ok(filters)) => Some(filters),
         Some(Err(err)) => return (400, error_body(format!("malformed filters: {err}"))),
         None => None,
     };
 
-    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref(), false) {
+    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref(), rerank) {
         Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -1049,6 +1059,19 @@ fn resolve_embedding_provider(
     }
 }
 
+type RerankerResolution = Result<Option<(Box<dyn core::reranker::Reranker + Send + Sync>, String)>, String>;
+
+fn resolve_reranker(choice: Option<&str>) -> RerankerResolution {
+    match choice {
+        None => Ok(None),
+        Some("local") => Ok(Some((
+            Box::new(core::reranker::LocalOverlapReranker::new()),
+            "LocalOverlapReranker (local, non-AI; see ADR-36)".to_string(),
+        ))),
+        Some(other) => Err(format!("unknown MEMORIA_RERANKER value {other:?} (expected \"local\")")),
+    }
+}
+
 fn resolve_vector_store(
     choice: Option<&str>,
     json_snapshot_path: &Path,
@@ -1112,6 +1135,7 @@ where
     cors_origin: Option<String>,
     llm_label: String,
     embedding_label: String,
+    reranker_label: Option<String>,
     store_path: PathBuf,
     persist_json_snapshot: bool,
     auth_store: auth_store::AuthStore,
@@ -1437,7 +1461,7 @@ where
     V: core::vector_store::VectorStore + Send + Sync + 'static,
 {
     wrap_handler(state, peer_addr.ip(), "GET".to_string(), "/configure".to_string(), headers_from_map(&headers), |state| {
-        handle_get_configure(&state.llm_label, &state.embedding_label)
+        handle_get_configure(&state.llm_label, &state.embedding_label, state.reranker_label.as_deref())
     })
     .await
 }
@@ -1469,7 +1493,7 @@ where
     V: core::vector_store::VectorStore + Send + Sync + 'static,
 {
     wrap_handler(state, peer_addr.ip(), "POST".to_string(), "/generate-instructions".to_string(), headers_from_map(&headers), |state| {
-        handle_generate_instructions(&state.llm_label, &state.embedding_label, state.token.is_some())
+        handle_generate_instructions(&state.llm_label, &state.embedding_label, state.reranker_label.as_deref(), state.token.is_some())
     })
     .await
 }
@@ -1811,6 +1835,7 @@ where
     axum::serve(listener, app).with_graceful_shutdown(shutdown).await.expect("server should not fail while serving");
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let api_key_env = std::env::var("MEMORIA_API_KEY").ok();
     let allow_no_auth_env = std::env::var("MEMORIA_ALLOW_NO_AUTH").ok();
@@ -1857,6 +1882,19 @@ fn main() {
     eprintln!("llm provider: {llm_label}");
     eprintln!("embedding provider: {embedding_label}");
 
+    let reranker_choice = std::env::var("MEMORIA_RERANKER").ok();
+    let reranker = match resolve_reranker(reranker_choice.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    let reranker_label = reranker.as_ref().map(|(_, label)| label.clone());
+    if let Some(label) = &reranker_label {
+        eprintln!("reranker: {label}");
+    }
+
     let jwt_secret = match resolve_jwt_secret(std::env::var("MEMORIA_JWT_SECRET").ok()) {
         Ok(secret) => secret,
         Err(message) => {
@@ -1887,7 +1925,10 @@ fn main() {
     let auth_store = auth_store::AuthStore::load(&auth_store_path);
 
     let rate_limiter = RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC);
-    let memory = Memory::new(llm_provider, embedding_provider, vector_store);
+    let mut memory = Memory::new(llm_provider, embedding_provider, vector_store);
+    if let Some((reranker, _)) = reranker {
+        memory = memory.with_reranker(reranker);
+    }
     let state_outliving_the_runtime = Arc::new(ServerState {
         memory,
         token,
@@ -1895,6 +1936,7 @@ fn main() {
         cors_origin,
         llm_label,
         embedding_label,
+        reranker_label,
         store_path,
         persist_json_snapshot,
         auth_store,
@@ -1959,6 +2001,7 @@ mod tests {
             cors_origin,
             llm_label: "test-llm".to_string(),
             embedding_label: "test-embedding".to_string(),
+            reranker_label: None,
             store_path,
             persist_json_snapshot: true,
             auth_store: auth_store::AuthStore::new(),
@@ -2265,6 +2308,23 @@ mod tests {
     #[test]
     fn resolve_embedding_provider_rejects_an_unknown_choice() {
         assert!(resolve_embedding_provider(Some("bogus"), None, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_reranker_with_nothing_set_resolves_to_none() {
+        let resolved = resolve_reranker(None).expect("expected a resolution");
+        assert!(resolved.is_none(), "no MEMORIA_RERANKER should mean no reranker is configured, not a default one");
+    }
+
+    #[test]
+    fn resolve_reranker_local_choice_resolves_to_a_real_reranker() {
+        let (_, label) = resolve_reranker(Some("local")).expect("expected a resolution").expect("expected a reranker");
+        assert!(label.contains("LocalOverlapReranker"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_reranker_rejects_an_unknown_choice() {
+        assert!(resolve_reranker(Some("bogus")).is_err());
     }
 
     #[cfg(feature = "ollama")]
@@ -2756,11 +2816,20 @@ mod tests {
 
     #[test]
     fn handle_get_configure_reports_the_real_active_providers() {
-        let (status, body) = handle_get_configure("OllamaLlmProvider", "OllamaEmbeddingProvider");
+        let (status, body) = handle_get_configure("OllamaLlmProvider", "OllamaEmbeddingProvider", None);
         assert_eq!(status, 200);
         let response: ConfigureResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert_eq!(response.llm_provider, "OllamaLlmProvider");
         assert_eq!(response.embedding_provider, "OllamaEmbeddingProvider");
+        assert_eq!(response.reranker, None);
+    }
+
+    #[test]
+    fn handle_get_configure_reports_the_reranker_when_configured() {
+        let (status, body) = handle_get_configure("local", "local", Some("LocalOverlapReranker"));
+        assert_eq!(status, 200);
+        let response: ConfigureResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(response.reranker, Some("LocalOverlapReranker".to_string()));
     }
 
     #[test]
@@ -2772,11 +2841,12 @@ mod tests {
         assert!(response.llm_providers.contains(&"ollama".to_string()));
         assert!(response.embedding_providers.contains(&"local".to_string()));
         assert!(response.embedding_providers.contains(&"ollama".to_string()));
+        assert!(response.rerankers.contains(&"local".to_string()));
     }
 
     #[test]
     fn handle_generate_instructions_mentions_the_real_active_providers() {
-        let (status, body) = handle_generate_instructions("LocalSentenceLlmProvider", "LocalHashEmbeddingProvider", true);
+        let (status, body) = handle_generate_instructions("LocalSentenceLlmProvider", "LocalHashEmbeddingProvider", None, true);
         assert_eq!(status, 200);
         let response: GenerateInstructionsResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert!(response.instructions.contains("LocalSentenceLlmProvider"));
@@ -2785,8 +2855,22 @@ mod tests {
     }
 
     #[test]
+    fn handle_generate_instructions_mentions_the_reranker_when_configured() {
+        let (_, body) = handle_generate_instructions("local", "local", Some("LocalOverlapReranker"), true);
+        let response: GenerateInstructionsResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.instructions.contains("LocalOverlapReranker"), "got: {}", response.instructions);
+    }
+
+    #[test]
+    fn handle_generate_instructions_omits_the_reranker_line_when_not_configured() {
+        let (_, body) = handle_generate_instructions("local", "local", None, true);
+        let response: GenerateInstructionsResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(!response.instructions.contains("Reranker:"), "got: {}", response.instructions);
+    }
+
+    #[test]
     fn handle_generate_instructions_reflects_no_auth_mode() {
-        let (_, body) = handle_generate_instructions("local", "local", false);
+        let (_, body) = handle_generate_instructions("local", "local", None, false);
         let response: GenerateInstructionsResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert!(response.instructions.contains("no authentication"));
     }
@@ -2996,6 +3080,37 @@ mod tests {
         assert_eq!(status, 200);
         let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert!(!response.results.is_empty());
+    }
+
+    #[test]
+    fn handle_search_memory_rejects_rerank_when_no_reranker_is_configured() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, _) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice","rerank":true}"#);
+        assert_eq!(status, 400, "rerank=true with no configured reranker must be a clear error, not a silent no-op");
+    }
+
+    #[test]
+    fn handle_search_memory_with_rerank_true_uses_the_configured_reranker() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new())
+            .with_reranker(core::reranker::LocalOverlapReranker::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice","rerank":true}"#);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(!response.results.is_empty());
+    }
+
+    #[test]
+    fn handle_search_memory_defaults_rerank_to_false() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new())
+            .with_reranker(core::reranker::LocalOverlapReranker::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, _) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice"}"#);
+        assert_eq!(status, 200, "omitting rerank must not require a reranker or fail");
     }
 
     #[test]

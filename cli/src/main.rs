@@ -50,6 +50,8 @@ enum Command {
         top_k: usize,
         #[arg(long, help = "Exclude results whose score exceeds this value")]
         threshold: Option<f32>,
+        #[arg(long, help = "Rerank results using the configured reranker (MEMORIA_RERANKER)")]
+        rerank: bool,
     },
     #[command(about = "Fetch a single memory by id")]
     Get {
@@ -218,6 +220,7 @@ struct WhoamiInfo {
     store: String,
     llm_provider: String,
     embedding_provider: String,
+    reranker: Option<String>,
 }
 
 fn resolve_llm_provider(
@@ -298,6 +301,19 @@ fn resolve_embedding_provider(
     }
 }
 
+type RerankerResolution = Result<Option<(Box<dyn core::reranker::Reranker + Send + Sync>, String)>, String>;
+
+fn resolve_reranker(choice: Option<&str>) -> RerankerResolution {
+    match choice {
+        None => Ok(None),
+        Some("local") => Ok(Some((
+            Box::new(core::reranker::LocalOverlapReranker::new()),
+            "LocalOverlapReranker (local, non-AI; see ADR-36)".to_string(),
+        ))),
+        Some(other) => Err(format!("unknown MEMORIA_RERANKER value {other:?} (expected \"local\")")),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Command::Completions { shell } = &cli.command {
@@ -338,12 +354,26 @@ fn main() {
         }
     };
 
-    let memory = Memory::new(llm_provider, embedding_provider, store);
+    let reranker_choice = std::env::var("MEMORIA_RERANKER").ok();
+    let reranker = match resolve_reranker(reranker_choice.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    let reranker_label = reranker.as_ref().map(|(_, label)| label.clone());
 
-    run(cli.command, &memory, &path, json, quiet, &llm_label, &embedding_label);
+    let mut memory = Memory::new(llm_provider, embedding_provider, store);
+    if let Some((reranker, _)) = reranker {
+        memory = memory.with_reranker(reranker);
+    }
+
+    run(cli.command, &memory, &path, json, quiet, &llm_label, &embedding_label, reranker_label.as_deref());
 }
 
-fn run<L, E, V>(command: Command, memory: &Memory<L, E, V>, path: &Path, json: bool, quiet: bool, llm_label: &str, embedding_label: &str)
+#[allow(clippy::too_many_arguments)]
+fn run<L, E, V>(command: Command, memory: &Memory<L, E, V>, path: &Path, json: bool, quiet: bool, llm_label: &str, embedding_label: &str, reranker_label: Option<&str>)
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
@@ -363,9 +393,9 @@ where
                 }
             }
         }
-        Command::Search { query, user_id, agent_id, run_id, top_k, threshold } => {
+        Command::Search { query, user_id, agent_id, run_id, top_k, threshold, rerank } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.search(&query, top_k, &scope, threshold, true, None, false) {
+            match memory.search(&query, top_k, &scope, threshold, true, None, rerank) {
                 Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -420,6 +450,7 @@ where
                     store: path.display().to_string(),
                     llm_provider: llm_label.to_string(),
                     embedding_provider: embedding_label.to_string(),
+                    reranker: reranker_label.map(ToString::to_string),
                 };
                 if json {
                     println!("{}", serde_json::to_string(&info).unwrap_or_default());
@@ -427,6 +458,9 @@ where
                     println!("store: {}", info.store);
                     println!("llm provider: {}", info.llm_provider);
                     println!("embedding provider: {}", info.embedding_provider);
+                    if let Some(reranker) = &info.reranker {
+                        println!("reranker: {reranker}");
+                    }
                 }
             }
         }
@@ -471,6 +505,23 @@ mod tests {
     fn resolve_embedding_provider_rejects_an_unknown_choice() {
         let result = resolve_embedding_provider(Some("bogus"), None, None, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_reranker_with_nothing_set_resolves_to_none() {
+        let resolved = resolve_reranker(None).expect("expected a resolution");
+        assert!(resolved.is_none(), "no MEMORIA_RERANKER should mean no reranker is configured, not a default one");
+    }
+
+    #[test]
+    fn resolve_reranker_local_choice_resolves_to_a_real_reranker() {
+        let (_, label) = resolve_reranker(Some("local")).expect("expected a resolution").expect("expected a reranker");
+        assert!(label.contains("LocalOverlapReranker"), "got: {label}");
+    }
+
+    #[test]
+    fn resolve_reranker_rejects_an_unknown_choice() {
+        assert!(resolve_reranker(Some("bogus")).is_err());
     }
 
     #[cfg(feature = "ollama")]
