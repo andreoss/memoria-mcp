@@ -98,6 +98,11 @@ pub trait VectorStore {
 
     #[allow(clippy::missing_errors_doc)]
     fn reset(&self) -> Result<(), VectorStoreError>;
+
+    #[allow(clippy::missing_errors_doc)]
+    fn keyword_search(&self, _query: &str, _top_k: usize, _filters: &HashMap<String, String>) -> Result<Option<Vec<SearchResult>>, VectorStoreError> {
+        Ok(None)
+    }
 }
 
 impl<T: VectorStore + ?Sized> VectorStore for Box<T> {
@@ -133,6 +138,10 @@ impl<T: VectorStore + ?Sized> VectorStore for Box<T> {
 
     fn reset(&self) -> Result<(), VectorStoreError> {
         self.as_ref().reset()
+    }
+
+    fn keyword_search(&self, query: &str, top_k: usize, filters: &HashMap<String, String>) -> Result<Option<Vec<SearchResult>>, VectorStoreError> {
+        self.as_ref().keyword_search(query, top_k, filters)
     }
 }
 
@@ -539,7 +548,26 @@ impl SqliteVectorStore {
             [],
         )
         .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(id UNINDEXED, content)", [])
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    fn sync_fts(conn: &rusqlite::Connection, id: &str, content: &str) -> Result<(), VectorStoreError> {
+        conn.execute("DELETE FROM records_fts WHERE id = ?1", rusqlite::params![id]).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        if !content.is_empty() {
+            conn.execute("INSERT INTO records_fts (id, content) VALUES (?1, ?2)", rusqlite::params![id, content])
+                .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn fts_match_expression(query: &str) -> String {
+        query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ")
     }
 
     fn decode_record(id: String, vector_json: &str, payload_json: &str) -> Result<VectorRecord, VectorStoreError> {
@@ -593,8 +621,11 @@ impl VectorStore for SqliteVectorStore {
             )
             .map(|_| ())
             .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        result?;
+        let content = record.payload.get("content").map_or("", String::as_str);
+        let fts_result = Self::sync_fts(&conn, &record.id, content);
         drop(conn);
-        result
+        fts_result
     }
 
     fn search(
@@ -647,18 +678,23 @@ impl VectorStore for SqliteVectorStore {
         let affected = conn
             .execute("UPDATE records SET vector = ?2, payload = ?3 WHERE id = ?1", rusqlite::params![record.id, vector_json, payload_json])
             .map_err(|err| VectorStoreError::Backend(err.to_string()));
-        drop(conn);
         if affected? == 0 {
+            drop(conn);
             return Err(VectorStoreError::NotFound);
         }
-        Ok(())
+        let content = record.payload.get("content").map_or("", String::as_str);
+        let fts_result = Self::sync_fts(&conn, &record.id, content);
+        drop(conn);
+        fts_result
     }
 
     fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
         let conn = self.conn.lock().expect("lock poisoned");
         let result = conn.execute("DELETE FROM records WHERE id = ?1", rusqlite::params![id]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()));
+        result?;
+        let fts_result = conn.execute("DELETE FROM records_fts WHERE id = ?1", rusqlite::params![id]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()));
         drop(conn);
-        result
+        fts_result
     }
 
     fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
@@ -683,19 +719,73 @@ impl VectorStore for SqliteVectorStore {
     fn reset(&self) -> Result<(), VectorStoreError> {
         let conn = self.conn.lock().expect("lock poisoned");
         let result = conn.execute("DELETE FROM records", []).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()));
+        result?;
+        let fts_result = conn.execute("DELETE FROM records_fts", []).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()));
         drop(conn);
-        result
+        fts_result
+    }
+
+    fn keyword_search(&self, query: &str, top_k: usize, filters: &HashMap<String, String>) -> Result<Option<Vec<SearchResult>>, VectorStoreError> {
+        let match_expression = Self::fts_match_expression(query);
+        if match_expression.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT id, bm25(records_fts) FROM records_fts WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts)")
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_expression], |row| {
+                let id: String = row.get(0)?;
+                let score: f64 = row.get(1)?;
+                Ok((id, score))
+            })
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let mut matches = Vec::new();
+        for row in rows {
+            matches.push(row.map_err(|err| VectorStoreError::Backend(err.to_string()))?);
+        }
+        drop(stmt);
+
+        let mut results = Vec::new();
+        for (id, score) in matches {
+            let record_row: Option<String> = conn
+                .query_row("SELECT payload FROM records WHERE id = ?1", rusqlite::params![id], |row| row.get(0))
+                .optional()
+                .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+            let Some(payload_json) = record_row else { continue };
+            let payload: HashMap<String, String> = serde_json::from_str(&payload_json).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+            if !filters.iter().all(|(k, v)| payload.get(k).is_some_and(|pv| pv == v)) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let score = score as f32;
+            results.push(SearchResult { id, score, payload });
+            if results.len() >= top_k {
+                break;
+            }
+        }
+        drop(conn);
+        Ok(Some(results))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InMemoryVectorStore, VectorStoreConfig, VectorStoreContractTests};
+    use super::{InMemoryVectorStore, VectorStore, VectorStoreConfig, VectorStoreContractTests};
     use crate::test_support::VecVectorStore;
+    use std::collections::HashMap;
 
     #[test]
     fn in_memory_store_passes_insert_then_get_contract() {
         InMemoryVectorStore::new().contract_insert_then_get_round_trips();
+    }
+
+    #[test]
+    fn in_memory_store_keyword_search_is_not_supported_by_default() {
+        let store = InMemoryVectorStore::new();
+        let result = store.keyword_search("anything", 10, &HashMap::new()).expect("the default keyword_search must not error");
+        assert!(result.is_none(), "InMemoryVectorStore has no native full-text engine");
     }
 
     #[test]
@@ -1036,6 +1126,117 @@ mod tests {
             assert!(!path.exists(), "the file should not exist before open");
             let _store = SqliteVectorStore::open(&path).expect("open should succeed");
             assert!(path.exists(), "open should create the database file");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        fn record_with_content(id: &str, content: &str, scope: &[(&str, &str)]) -> VectorRecord {
+            let mut payload: HashMap<String, String> = scope.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+            payload.insert("content".to_string(), content.to_string());
+            VectorRecord::new(id, vec![0.0], payload)
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_finds_a_real_match_by_content() {
+            let store = temp_store("keyword-match");
+            store.insert(record_with_content("a", "the quick brown fox jumps", &[])).expect("insert should succeed");
+            store.insert(record_with_content("b", "a lazy dog sleeps all day", &[])).expect("insert should succeed");
+
+            let results = store.keyword_search("fox", 10, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["a"], "only the record containing the query term should match");
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_ranks_the_better_match_first() {
+            let store = temp_store("keyword-rank");
+            store.insert(record_with_content("weak", "rust is mentioned once here", &[])).expect("insert should succeed");
+            store.insert(record_with_content("strong", "rust rust rust programming in rust", &[])).expect("insert should succeed");
+
+            let results = store.keyword_search("rust", 10, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            assert_eq!(results[0].id, "strong", "the record with stronger term frequency should rank first, got: {results:?}");
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_respects_filters() {
+            let store = temp_store("keyword-filters");
+            store.insert(record_with_content("alice-rec", "engineer working on rust", &[("user_id", "alice")])).expect("insert should succeed");
+            store.insert(record_with_content("bob-rec", "engineer working on rust", &[("user_id", "bob")])).expect("insert should succeed");
+
+            let filters = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+            let results = store.keyword_search("engineer", 10, &filters).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["alice-rec"], "keyword_search must respect the same scope filters as search");
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_respects_top_k() {
+            let store = temp_store("keyword-top-k");
+            for i in 0..5 {
+                store.insert(record_with_content(&format!("rec-{i}"), "rust rust rust", &[])).expect("insert should succeed");
+            }
+            let results = store.keyword_search("rust", 2, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            assert_eq!(results.len(), 2);
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_treats_special_characters_as_literal_terms_not_fts5_syntax() {
+            let store = temp_store("keyword-special-chars");
+            store.insert(record_with_content("a", "rust programming language", &[])).expect("insert should succeed");
+
+            let result = store.keyword_search("rust\" OR \"*", 10, &HashMap::new());
+            assert!(result.is_ok(), "special FTS5 syntax characters in the query must never cause a backend error, got: {result:?}");
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_stays_in_sync_after_update() {
+            let store = temp_store("keyword-sync-update");
+            let record = record_with_content("a", "original content about gardening", &[]);
+            store.insert(record.clone()).expect("insert should succeed");
+
+            let mut updated = record;
+            updated.payload.insert("content".to_string(), "updated content about astronomy".to_string());
+            store.update(updated).expect("update should succeed");
+
+            let old_term_results = store.keyword_search("gardening", 10, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            assert!(old_term_results.is_empty(), "the old content's term must no longer match after an update");
+
+            let new_term_results = store.keyword_search("astronomy", 10, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            assert_eq!(new_term_results.len(), 1, "the updated content's term must match");
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_stays_in_sync_after_delete() {
+            let store = temp_store("keyword-sync-delete");
+            store.insert(record_with_content("a", "ephemeral content", &[])).expect("insert should succeed");
+            store.delete("a").expect("delete should succeed");
+
+            let results = store.keyword_search("ephemeral", 10, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            assert!(results.is_empty(), "a deleted record must not appear in keyword_search results");
+        }
+
+        #[test]
+        fn sqlite_store_keyword_search_stays_in_sync_after_reset() {
+            let store = temp_store("keyword-sync-reset");
+            store.insert(record_with_content("a", "content before reset", &[])).expect("insert should succeed");
+            store.reset().expect("reset should succeed");
+
+            let results = store.keyword_search("content", 10, &HashMap::new()).expect("keyword_search should succeed").expect("sqlite store must support keyword_search");
+            assert!(results.is_empty(), "reset must clear the keyword index too");
+        }
+
+        #[test]
+        fn boxed_dyn_vector_store_forwards_keyword_search_to_the_real_sqlite_implementation() {
+            let path = temp_db_path("keyword-box-forward");
+            let _ = std::fs::remove_file(&path);
+            let store = SqliteVectorStore::open(&path).expect("open should succeed");
+            store.insert(record_with_content("a", "boxed dyn dispatch test", &[])).expect("insert should succeed");
+            let boxed: Box<dyn VectorStore> = Box::new(store);
+
+            let results = boxed.keyword_search("dispatch", 10, &HashMap::new()).expect("keyword_search should succeed");
+            assert!(results.is_some(), "Box<dyn VectorStore> must forward to the real implementation, not silently fall back to the default None");
+            assert_eq!(results.expect("checked above").len(), 1);
+
+            drop(boxed);
             let _ = std::fs::remove_file(&path);
         }
     }
