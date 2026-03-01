@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use core::embedding::LocalHashEmbeddingProvider;
 use core::llm::{LocalSentenceLlmProvider, Message, Role};
 use core::memory::Memory;
@@ -82,6 +83,17 @@ enum Command {
     Whoami,
     #[command(about = "Check that every provider is reachable")]
     Status,
+    #[command(about = "Print a shell completion script to stdout")]
+    Completions {
+        #[arg(help = "Which shell to generate the completion script for")]
+        shell: Shell,
+    },
+}
+
+fn write_completions(shell: Shell, writer: &mut dyn std::io::Write) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, writer);
 }
 
 #[derive(serde::Deserialize)]
@@ -288,6 +300,10 @@ fn resolve_embedding_provider(
 
 fn main() {
     let cli = Cli::parse();
+    if let Command::Completions { shell } = &cli.command {
+        write_completions(*shell, &mut std::io::stdout());
+        return;
+    }
     let json = cli.json;
     let quiet = cli.quiet;
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -425,6 +441,7 @@ where
                 std::process::exit(1);
             }
         },
+        Command::Completions { .. } => unreachable!("main() handles and returns on Command::Completions before run() is ever called"),
     }
 }
 
@@ -606,5 +623,26 @@ mod tests {
         assert_eq!(config.store_path, Some("/custom/store.json".to_string()));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_completions_for_bash_mentions_every_real_subcommand() {
+        let mut buf = Vec::new();
+        write_completions(Shell::Bash, &mut buf);
+        let script = String::from_utf8(buf).expect("completion script should be valid utf8");
+
+        assert!(script.contains("memoria"), "got: {script}");
+        for subcommand in ["add", "search", "get", "list", "update", "delete", "init", "whoami", "status", "completions"] {
+            assert!(script.contains(subcommand), "bash completion script should mention {subcommand:?}, got: {script}");
+        }
+    }
+
+    #[test]
+    fn write_completions_covers_every_real_shell_clap_complete_supports() {
+        for shell in [Shell::Bash, Shell::Elvish, Shell::Fish, Shell::PowerShell, Shell::Zsh] {
+            let mut buf = Vec::new();
+            write_completions(shell, &mut buf);
+            assert!(!buf.is_empty(), "{shell} completion script should not be empty");
+        }
     }
 }
