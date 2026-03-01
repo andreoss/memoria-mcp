@@ -587,7 +587,7 @@ fn handle_get_configure_providers() -> (u16, Vec<u8>) {
     let response = ConfigureProvidersResponse {
         llm_providers: vec!["local".to_string(), "ollama".to_string()],
         embedding_providers: vec!["local".to_string(), "ollama".to_string()],
-        rerankers: vec!["local".to_string()],
+        rerankers: vec!["local".to_string(), "llm".to_string()],
     };
     (200, serde_json::to_vec(&response).unwrap_or_default())
 }
@@ -1061,14 +1061,19 @@ fn resolve_embedding_provider(
 
 type RerankerResolution = Result<Option<(Box<dyn core::reranker::Reranker + Send + Sync>, String)>, String>;
 
-fn resolve_reranker(choice: Option<&str>) -> RerankerResolution {
+fn resolve_reranker(choice: Option<&str>, llm_choice: Option<&str>, llm_model: Option<String>, llm_base_url: Option<String>) -> RerankerResolution {
     match choice {
         None => Ok(None),
         Some("local") => Ok(Some((
             Box::new(core::reranker::LocalOverlapReranker::new()),
             "LocalOverlapReranker (local, non-AI; see ADR-36)".to_string(),
         ))),
-        Some(other) => Err(format!("unknown MEMORIA_RERANKER value {other:?} (expected \"local\")")),
+        Some("llm") => {
+            let (llm_provider, llm_label) = resolve_llm_provider(llm_choice, llm_model, llm_base_url)?;
+            let label = format!("LlmReranker (llm={llm_label}; see ADR-36)");
+            Ok(Some((Box::new(core::reranker::LlmReranker::new(llm_provider)), label)))
+        }
+        Some(other) => Err(format!("unknown MEMORIA_RERANKER value {other:?} (expected \"local\" or \"llm\")")),
     }
 }
 
@@ -1883,7 +1888,12 @@ fn main() {
     eprintln!("embedding provider: {embedding_label}");
 
     let reranker_choice = std::env::var("MEMORIA_RERANKER").ok();
-    let reranker = match resolve_reranker(reranker_choice.as_deref()) {
+    let reranker = match resolve_reranker(
+        reranker_choice.as_deref(),
+        llm_provider_choice.as_deref(),
+        std::env::var("MEMORIA_LLM_MODEL").ok(),
+        std::env::var("MEMORIA_LLM_BASE_URL").ok(),
+    ) {
         Ok(resolved) => resolved,
         Err(message) => {
             eprintln!("{message}");
@@ -2312,19 +2322,32 @@ mod tests {
 
     #[test]
     fn resolve_reranker_with_nothing_set_resolves_to_none() {
-        let resolved = resolve_reranker(None).expect("expected a resolution");
+        let resolved = resolve_reranker(None, None, None, None).expect("expected a resolution");
         assert!(resolved.is_none(), "no MEMORIA_RERANKER should mean no reranker is configured, not a default one");
     }
 
     #[test]
     fn resolve_reranker_local_choice_resolves_to_a_real_reranker() {
-        let (_, label) = resolve_reranker(Some("local")).expect("expected a resolution").expect("expected a reranker");
+        let (_, label) = resolve_reranker(Some("local"), None, None, None).expect("expected a resolution").expect("expected a reranker");
         assert!(label.contains("LocalOverlapReranker"), "got: {label}");
     }
 
     #[test]
+    fn resolve_reranker_llm_choice_resolves_to_a_real_reranker() {
+        let (_, label) = resolve_reranker(Some("llm"), None, None, None).expect("expected a resolution").expect("expected a reranker");
+        assert!(label.contains("LlmReranker"), "got: {label}");
+    }
+
+    #[cfg(feature = "ollama")]
+    #[test]
+    fn resolve_reranker_llm_choice_honors_the_underlying_llm_provider_choice() {
+        let (_, label) = resolve_reranker(Some("llm"), Some("ollama"), None, None).expect("expected a resolution").expect("expected a reranker");
+        assert!(label.contains("OllamaLlmProvider"), "got: {label}");
+    }
+
+    #[test]
     fn resolve_reranker_rejects_an_unknown_choice() {
-        assert!(resolve_reranker(Some("bogus")).is_err());
+        assert!(resolve_reranker(Some("bogus"), None, None, None).is_err());
     }
 
     #[cfg(feature = "ollama")]
@@ -2842,6 +2865,7 @@ mod tests {
         assert!(response.embedding_providers.contains(&"local".to_string()));
         assert!(response.embedding_providers.contains(&"ollama".to_string()));
         assert!(response.rerankers.contains(&"local".to_string()));
+        assert!(response.rerankers.contains(&"llm".to_string()));
     }
 
     #[test]
