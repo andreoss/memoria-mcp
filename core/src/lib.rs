@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod embedding;
 pub mod error;

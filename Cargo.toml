@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "server"]
+members = ["core", "cli", "server", "mcp"]
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

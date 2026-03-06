@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::multiple_crate_versions)]
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
