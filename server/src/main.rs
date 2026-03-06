@@ -532,32 +532,22 @@ struct EntitiesResponse {
     entities: Vec<EntityItem>,
 }
 
-const ENTITY_SCOPE_FIELDS: [&str; 3] = ["user_id", "agent_id", "run_id"];
-
 fn handle_list_entities<L, E, V>(memory: &Memory<L, E, V>) -> (u16, Vec<u8>)
 where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let ids = memory.list(0, usize::MAX, true, None).unwrap_or_default();
-    let mut counts: HashMap<(String, String), usize> = HashMap::new();
-    for id in ids {
-        let Ok(Some(record)) = memory.get(&id) else {
-            continue;
-        };
-        for field in ENTITY_SCOPE_FIELDS {
-            if let Some(value) = record.payload.get(field) {
-                *counts.entry((field.to_string(), value.clone())).or_insert(0) += 1;
-            }
+    match memory.list_entities() {
+        Ok(summaries) => {
+            let entities: Vec<EntityItem> = summaries
+                .into_iter()
+                .map(|s| EntityItem { entity_type: s.entity_type, entity_id: s.entity_id, memory_count: s.memory_count })
+                .collect();
+            (200, serde_json::to_vec(&EntitiesResponse { entities }).unwrap_or_default())
         }
+        Err(err) => error_response(&err),
     }
-    let mut entities: Vec<EntityItem> = counts
-        .into_iter()
-        .map(|((entity_type, entity_id), memory_count)| EntityItem { entity_type, entity_id, memory_count })
-        .collect();
-    entities.sort_by(|a, b| (&a.entity_type, &a.entity_id).cmp(&(&b.entity_type, &b.entity_id)));
-    (200, serde_json::to_vec(&EntitiesResponse { entities }).unwrap_or_default())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

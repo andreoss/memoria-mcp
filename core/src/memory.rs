@@ -79,6 +79,16 @@ pub struct HistoryEntry {
     pub content: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EntitySummary {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub memory_count: usize,
+}
+
+const ENTITY_SCOPE_FIELDS: [&str; 3] = ["user_id", "agent_id", "run_id"];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryConfig {
     pub llm: LlmConfig,
@@ -313,6 +323,28 @@ where
     pub fn history(&self, id: &str, offset: usize, limit: usize) -> Result<Vec<HistoryEntry>, crate::CoreError> {
         let entries = self.history.lock().expect("lock poisoned").get(id).cloned().unwrap_or_default();
         Ok(entries.into_iter().skip(offset).take(limit).collect())
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn list_entities(&self) -> Result<Vec<EntitySummary>, crate::CoreError> {
+        let ids = self.list(0, usize::MAX, true, None)?;
+        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+        for id in ids {
+            let Some(record) = self.get(&id)? else {
+                continue;
+            };
+            for field in ENTITY_SCOPE_FIELDS {
+                if let Some(value) = record.payload.get(field) {
+                    *counts.entry((field.to_string(), value.clone())).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut entities: Vec<EntitySummary> = counts
+            .into_iter()
+            .map(|((entity_type, entity_id), memory_count)| EntitySummary { entity_type, entity_id, memory_count })
+            .collect();
+        entities.sort_by(|a, b| (&a.entity_type, &a.entity_id).cmp(&(&b.entity_type, &b.entity_id)));
+        Ok(entities)
     }
 
     #[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value, clippy::missing_panics_doc)]
@@ -1477,6 +1509,77 @@ mod tests {
         for id in &ids {
             assert!(memory.vector_store.get(id).expect("get should succeed").is_some(), "unrelated scope's records should be untouched");
         }
+    }
+
+    #[test]
+    fn test_list_entities_groups_real_records_by_scope_field() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        memory
+            .add(
+                &[Message::new(Role::User, "Alice is an engineer.")],
+                HashMap::from([("user_id".to_string(), "alice".to_string())]),
+                false,
+            )
+            .expect("add should succeed");
+        memory
+            .add(
+                &[Message::new(Role::User, "Alice likes tea.")],
+                HashMap::from([("user_id".to_string(), "alice".to_string())]),
+                false,
+            )
+            .expect("add should succeed");
+        memory
+            .add(
+                &[Message::new(Role::User, "Bob is a designer.")],
+                HashMap::from([("user_id".to_string(), "bob".to_string())]),
+                false,
+            )
+            .expect("add should succeed");
+        memory
+            .add(&[Message::new(Role::User, "Task one.")], HashMap::from([("run_id".to_string(), "run-1".to_string())]), false)
+            .expect("add should succeed");
+
+        let entities = memory.list_entities().expect("list_entities should succeed");
+        let alice = entities.iter().find(|e| e.entity_type == "user_id" && e.entity_id == "alice").expect("alice entity");
+        assert_eq!(alice.memory_count, 2);
+        let bob = entities.iter().find(|e| e.entity_type == "user_id" && e.entity_id == "bob").expect("bob entity");
+        assert_eq!(bob.memory_count, 1);
+        let run = entities.iter().find(|e| e.entity_type == "run_id" && e.entity_id == "run-1").expect("run entity");
+        assert_eq!(run.memory_count, 1);
+    }
+
+    #[test]
+    fn test_list_entities_with_no_records_is_empty() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let entities = memory.list_entities().expect("list_entities should succeed");
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn test_list_entities_is_sorted_by_type_then_id() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        memory
+            .add(&[Message::new(Role::User, "one")], HashMap::from([("user_id".to_string(), "zed".to_string())]), false)
+            .expect("add should succeed");
+        memory
+            .add(&[Message::new(Role::User, "two")], HashMap::from([("user_id".to_string(), "alice".to_string())]), false)
+            .expect("add should succeed");
+
+        let entities = memory.list_entities().expect("list_entities should succeed");
+        assert_eq!(entities[0].entity_id, "alice");
+        assert_eq!(entities[1].entity_id, "zed");
     }
 
     #[test]
