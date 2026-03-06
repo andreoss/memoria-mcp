@@ -23,6 +23,37 @@ jobs:
       - name: Run Changelog Check
         run: bash scripts/check-changelog.sh "${GITHUB_BASE_REF:-origin/master}" "${GITHUB_HEAD_REF:-HEAD}"
 
+  verify-checker-scripts:
+    name: Verify the Checker Scripts Themselves
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Configure Git Identity (required by the scripts below, which make temporary commits)
+        run: |
+          git config user.email "ci@memoria.invalid"
+          git config user.name "memoria CI"
+
+      - name: Run Verify-Check-Docs
+        run: bash scripts/verify-check-docs.sh
+
+      - name: Run Verify-Check-Changelog
+        run: bash scripts/verify-check-changelog.sh
+
+      - name: Warm Cargo Cache (verify-smoke-test-server.sh builds --offline)
+        run: cargo build -p server
+
+      - name: Run Verify-Smoke-Test-Server
+        run: bash scripts/verify-smoke-test-server.sh
+
   build-clippy-test:
     name: Build, Clippy, and Test (Workspace)
     runs-on: ubuntu-latest
