@@ -105,6 +105,16 @@ jobs:
         if: always()
         run: kill "$(cat server.pid)" 2>/dev/null || true
 
+  docker-nonroot:
+    name: Docker Non-Root and Reachability Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Docker Non-Root/Reachability Test
+        run: bash scripts/test-docker-nonroot.sh
+
   smoke-test-server-ollama:
     name: Server Smoke Test (real Ollama, optional)
     runs-on: ubuntu-latest
