@@ -1958,7 +1958,7 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     runtime.block_on(async {
         let state = Arc::clone(&state_outliving_the_runtime);
-        let listener = TcpListener::bind("127.0.0.1:8080").await.expect("failed to bind to 127.0.0.1:8080");
+        let listener = TcpListener::bind("0.0.0.0:8080").await.expect("failed to bind to 0.0.0.0:8080");
         let shutdown = Box::pin(async {
             let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("failed to install SIGTERM handler");

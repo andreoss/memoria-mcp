@@ -20,6 +20,23 @@ ENV MEMORIA_FASTEMBED_CACHE_DIR=/opt/fastembed-cache
 USER memoria
 ENTRYPOINT ["/usr/local/bin/server"]
 
+FROM rust:1-slim-bookworm AS build-sqlite
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY core ./core
+COPY cli ./cli
+COPY server ./server
+RUN cargo test -p memoria-core --features sqlite --release
+RUN cargo build --release -p server --features sqlite
+
+FROM debian:bookworm-slim AS runtime-sqlite
+RUN useradd --system --no-create-home --uid 10001 memoria \
+    && mkdir -p /home/memoria \
+    && chown memoria:memoria /home/memoria
+COPY --from=build-sqlite /workspace/target/release/server /usr/local/bin/server
+USER memoria
+ENTRYPOINT ["/usr/local/bin/server"]
+
 FROM rust:1-slim-bookworm AS build
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
