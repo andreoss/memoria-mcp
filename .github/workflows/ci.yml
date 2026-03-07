@@ -77,13 +77,13 @@ jobs:
         run: cargo test --workspace
 
       - name: Cargo Build (ollama feature)
-        run: cargo build -p memoria-core -p cli -p server --features ollama
+        run: cargo build -p memoria-core -p cli -p server -p mcp --features ollama
 
       - name: Cargo Clippy (ollama feature, All Targets, Deny Warnings)
-        run: cargo clippy -p memoria-core -p cli -p server --features ollama --all-targets -- -D warnings
+        run: cargo clippy -p memoria-core -p cli -p server -p mcp --features ollama --all-targets -- -D warnings
 
       - name: Cargo Test (ollama feature, non-network cases only)
-        run: cargo test -p memoria-core -p cli -p server --features ollama
+        run: cargo test -p memoria-core -p cli -p server -p mcp --features ollama
 
   coverage:
     name: Code Coverage (core, all features, reported not gated)
