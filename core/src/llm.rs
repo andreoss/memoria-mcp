@@ -285,6 +285,146 @@ impl LlmProvider for OllamaLlmProvider {
     }
 }
 
+#[cfg(feature = "candle")]
+const CANDLE_MODEL_NAME: &str = "qwen2.5-0.5b-instruct-q4_0";
+#[cfg(feature = "candle")]
+const CANDLE_MODEL_REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+#[cfg(feature = "candle")]
+const CANDLE_GGUF_FILENAME: &str = "qwen2.5-0.5b-instruct-q4_0.gguf";
+#[cfg(feature = "candle")]
+const CANDLE_TOKENIZER_REPO: &str = "Qwen/Qwen2.5-0.5B-Instruct";
+#[cfg(feature = "candle")]
+const CANDLE_EOS_TOKEN: &str = "<|im_end|>";
+#[cfg(feature = "candle")]
+const CANDLE_MAX_NEW_TOKENS: usize = 256;
+#[cfg(feature = "candle")]
+const CANDLE_SEED: u64 = 42;
+
+#[cfg(feature = "candle")]
+fn candle_chat_prompt(messages: &[Message]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(message.role.as_str());
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
+#[cfg(feature = "candle")]
+struct CandleGeneration {
+    model: candle_transformers::models::quantized_qwen2::ModelWeights,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+#[cfg(feature = "candle")]
+pub struct CandleLlmProvider {
+    generation: std::sync::Mutex<CandleGeneration>,
+    temperature: Option<f32>,
+    eos_token_id: u32,
+}
+
+#[cfg(feature = "candle")]
+impl CandleLlmProvider {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn from_config(config: &LlmConfig, cache_dir: Option<std::path::PathBuf>) -> Result<Self, crate::CoreError> {
+        config.validate()?;
+        if config.model != CANDLE_MODEL_NAME {
+            return Err(crate::CoreError::Config(format!(
+                "unsupported candle model {:?}: only {CANDLE_MODEL_NAME:?} is supported",
+                config.model
+            )));
+        }
+
+        let mut api_builder = hf_hub::api::sync::ApiBuilder::from_env();
+        if let Some(cache_dir) = cache_dir {
+            api_builder = api_builder.with_cache_dir(cache_dir);
+        }
+        let api = api_builder.build().map_err(|err| crate::CoreError::Config(format!("hf-hub api init failed: {err}")))?;
+
+        let model_path = api
+            .model(CANDLE_MODEL_REPO.to_string())
+            .get(CANDLE_GGUF_FILENAME)
+            .map_err(|err| crate::CoreError::Config(format!("candle model download failed: {err}")))?;
+        let tokenizer_path = api
+            .model(CANDLE_TOKENIZER_REPO.to_string())
+            .get("tokenizer.json")
+            .map_err(|err| crate::CoreError::Config(format!("candle tokenizer download failed: {err}")))?;
+
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|err| crate::CoreError::Config(format!("candle tokenizer load failed: {err}")))?;
+        let eos_token_id = tokenizer
+            .token_to_id(CANDLE_EOS_TOKEN)
+            .ok_or_else(|| crate::CoreError::Config(format!("candle tokenizer is missing the {CANDLE_EOS_TOKEN:?} token")))?;
+
+        let device = candle_core::Device::Cpu;
+        let mut file = std::fs::File::open(&model_path).map_err(|err| crate::CoreError::Config(format!("candle model file open failed: {err}")))?;
+        let content =
+            candle_core::quantized::gguf_file::Content::read(&mut file).map_err(|err| crate::CoreError::Config(format!("candle gguf parse failed: {err}")))?;
+        let model = candle_transformers::models::quantized_qwen2::ModelWeights::from_gguf(content, &mut file, &device)
+            .map_err(|err| crate::CoreError::Config(format!("candle model load failed: {err}")))?;
+
+        Ok(Self {
+            generation: std::sync::Mutex::new(CandleGeneration { model, tokenizer }),
+            temperature: config.temperature,
+            eos_token_id,
+        })
+    }
+}
+
+#[cfg(feature = "candle")]
+impl LlmProvider for CandleLlmProvider {
+    #[allow(clippy::significant_drop_tightening)]
+    fn complete(&self, messages: &[Message]) -> Result<Completion, LlmError> {
+        if messages.is_empty() {
+            return Err(LlmError::EmptyMessages);
+        }
+        let prompt = candle_chat_prompt(messages);
+        let mut generation = self.generation.lock().expect("lock poisoned");
+        let CandleGeneration { model, tokenizer } = &mut *generation;
+
+        let prompt_tokens = tokenizer
+            .encode(prompt, true)
+            .map_err(|err| LlmError::Backend(err.to_string()))?
+            .get_ids()
+            .to_vec();
+        if prompt_tokens.is_empty() {
+            return Err(LlmError::Malformed("tokenizer produced no tokens for a non-empty prompt".to_string()));
+        }
+
+        let device = candle_core::Device::Cpu;
+        let mut all_tokens = prompt_tokens.clone();
+        let input = candle_core::Tensor::new(prompt_tokens.as_slice(), &device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(|err| LlmError::Backend(err.to_string()))?;
+        let mut logits = model.forward(&input, 0).and_then(|t| t.squeeze(0)).map_err(|err| LlmError::Backend(err.to_string()))?;
+
+        let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(CANDLE_SEED, self.temperature.map(f64::from), None);
+        let mut generated = Vec::new();
+        for _ in 0..CANDLE_MAX_NEW_TOKENS {
+            let next_token = logits_processor.sample(&logits).map_err(|err| LlmError::Backend(err.to_string()))?;
+            if next_token == self.eos_token_id {
+                break;
+            }
+            generated.push(next_token);
+            all_tokens.push(next_token);
+            let input = candle_core::Tensor::new(&[next_token], &device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|err| LlmError::Backend(err.to_string()))?;
+            logits = model
+                .forward(&input, all_tokens.len() - 1)
+                .and_then(|t| t.squeeze(0))
+                .map_err(|err| LlmError::Backend(err.to_string()))?;
+        }
+
+        let content = tokenizer.decode(&generated, true).map_err(|err| LlmError::Malformed(err.to_string()))?;
+        Ok(Completion::new(content))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, LocalSentenceLlmProvider, Message, Role};
@@ -598,6 +738,37 @@ mod tests {
             };
             let provider = OllamaLlmProvider::from_config(config).expect("valid config should construct");
             provider.contract_happy_path();
+        }
+    }
+
+    #[cfg(feature = "candle")]
+    mod candle_tests {
+        use super::super::CandleLlmProvider;
+        use super::*;
+
+        fn valid_config() -> LlmConfig {
+            LlmConfig { model: "qwen2.5-0.5b-instruct-q4_0".to_string(), base_url: None, api_key: None, temperature: None }
+        }
+
+        #[test]
+        fn from_config_rejects_an_invalid_config_before_touching_the_model() {
+            let config = LlmConfig { model: String::new(), base_url: None, api_key: None, temperature: None };
+            assert!(matches!(CandleLlmProvider::from_config(&config, None), Err(crate::CoreError::Config(_))));
+        }
+
+        #[test]
+        fn from_config_rejects_an_unsupported_model_name_before_touching_the_model() {
+            let config = LlmConfig { model: "some-other-model".to_string(), base_url: None, api_key: None, temperature: None };
+            assert!(matches!(CandleLlmProvider::from_config(&config, None), Err(crate::CoreError::Config(_))));
+        }
+
+        #[test]
+        #[ignore = "downloads a real ~430MB GGUF model + tokenizer on first run; needs real network access"]
+        fn real_candle_model_produces_a_real_completion() {
+            let cache_dir = std::env::var("MEMORIA_TEST_CANDLE_CACHE_DIR").ok().map(std::path::PathBuf::from);
+            let provider = CandleLlmProvider::from_config(&valid_config(), cache_dir).expect("valid config should construct");
+            provider.contract_happy_path();
+            provider.contract_rejects_empty_messages();
         }
     }
 }

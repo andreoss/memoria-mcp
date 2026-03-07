@@ -25,3 +25,4 @@ argon2 = "0.5"
 ollama = ["core/ollama"]
 fastembed = ["core/fastembed"]
 sqlite = ["core/sqlite"]
+candle = ["core/candle"]

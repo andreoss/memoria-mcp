@@ -485,7 +485,12 @@ fn resolve_sqlite_path(env_override: Option<&str>, home: &str) -> PathBuf {
     env_override.map_or_else(|| Path::new(home).join(".memoria").join("mcp-store.db"), PathBuf::from)
 }
 
-fn resolve_llm_provider(provider_choice: Option<&str>, model: Option<String>, base_url: Option<String>) -> Result<(BoxedLlm, String), String> {
+fn resolve_llm_provider(
+    provider_choice: Option<&str>,
+    model: Option<String>,
+    base_url: Option<String>,
+    candle_cache_dir: Option<String>,
+) -> Result<(BoxedLlm, String), String> {
     match provider_choice.unwrap_or("local") {
         "local" => Ok((Box::new(LocalSentenceLlmProvider::new()), "LocalSentenceLlmProvider (local, non-AI; see ADR-12)".to_string())),
         "ollama" => {
@@ -500,11 +505,27 @@ fn resolve_llm_provider(provider_choice: Option<&str>, model: Option<String>, ba
             }
             #[cfg(not(feature = "ollama"))]
             {
-                let _ = (model, base_url);
+                let _ = (model, base_url, candle_cache_dir);
                 Err("MEMORIA_LLM_PROVIDER=ollama requires the mcp binary to be built with --features ollama".to_string())
             }
         }
-        other => Err(format!("unknown MEMORIA_LLM_PROVIDER value {other:?} (expected \"local\" or \"ollama\")")),
+        "candle" => {
+            #[cfg(feature = "candle")]
+            {
+                let model = model.unwrap_or_else(|| "qwen2.5-0.5b-instruct-q4_0".to_string());
+                let config = memoria_core::llm::LlmConfig { model: model.clone(), base_url, api_key: None, temperature: None };
+                let cache_dir = candle_cache_dir.map(PathBuf::from);
+                let provider = memoria_core::llm::CandleLlmProvider::from_config(&config, cache_dir).map_err(|err| err.to_string())?;
+                let label = format!("CandleLlmProvider (model={model}; see ADR-40)");
+                Ok((Box::new(provider), label))
+            }
+            #[cfg(not(feature = "candle"))]
+            {
+                let _ = (model, base_url, candle_cache_dir);
+                Err("MEMORIA_LLM_PROVIDER=candle requires the mcp binary to be built with --features candle".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_LLM_PROVIDER value {other:?} (expected \"local\", \"ollama\", or \"candle\")")),
     }
 }
 
@@ -580,6 +601,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         llm_provider_choice.as_deref(),
         std::env::var("MEMORIA_LLM_MODEL").ok(),
         std::env::var("MEMORIA_LLM_BASE_URL").ok(),
+        std::env::var("MEMORIA_CANDLE_CACHE_DIR").ok(),
     )
     .map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
 
@@ -952,7 +974,22 @@ mod tests {
 
     #[test]
     fn resolve_llm_provider_unknown_choice_is_a_clear_error() {
-        assert!(resolve_llm_provider(Some("bogus"), None, None).is_err());
+        assert!(resolve_llm_provider(Some("bogus"), None, None, None).is_err());
+    }
+
+    #[cfg(not(feature = "candle"))]
+    #[test]
+    fn resolve_llm_provider_candle_choice_fails_clearly_without_the_feature() {
+        assert!(resolve_llm_provider(Some("candle"), None, None, None).is_err());
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    #[ignore = "downloads a real ~430MB GGUF model + tokenizer on first run; needs real network access"]
+    fn resolve_llm_provider_candle_choice_builds_with_defaults() {
+        let cache_dir = std::env::var("MEMORIA_TEST_CANDLE_CACHE_DIR").ok();
+        let (_, label) = resolve_llm_provider(Some("candle"), None, None, cache_dir).expect("expected a provider");
+        assert!(label.contains("qwen2.5-0.5b-instruct-q4_0"), "got: {label}");
     }
 
     #[test]
