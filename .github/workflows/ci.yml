@@ -136,6 +136,26 @@ jobs:
         if: always()
         run: kill "$(cat server.pid)" 2>/dev/null || true
 
+  smoke-test-mcp:
+    name: MCP Server Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build MCP Server (Release)
+        run: cargo build --release -p mcp
+
+      - name: Run Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_MCP_BIN: ./target/release/mcp
+        run: bash scripts/smoke-test-mcp.sh
+
   docker-nonroot:
     name: Docker Non-Root and Reachability Check
     runs-on: ubuntu-latest

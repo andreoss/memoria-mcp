@@ -10,7 +10,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
-use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,26 +58,14 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn check_secret(configured: Option<&str>, provided: Option<&str>) -> Result<(), McpError> {
+fn check_secret(configured: Option<&str>, provided: Option<&str>) -> Result<(), String> {
     configured.map_or(Ok(()), |expected| {
         if provided.is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes())) {
             Ok(())
         } else {
-            Err(McpError::invalid_params(
-                "missing or incorrect secret (MEMORIA_MCP_SECRET is configured on this server; see ADR-38)",
-                None,
-            ))
+            Err("missing or incorrect secret (MEMORIA_MCP_SECRET is configured on this server; see ADR-38)".to_string())
         }
     })
-}
-
-fn core_error_to_mcp(err: &memoria_core::CoreError) -> McpError {
-    match err {
-        memoria_core::CoreError::NotFound(message) | memoria_core::CoreError::Validation(message) => {
-            McpError::invalid_params(message.clone(), None)
-        }
-        other => McpError::internal_error(other.to_string(), None),
-    }
 }
 
 const fn default_top_k() -> usize {
@@ -344,34 +332,34 @@ impl MemoriaMcpServer {
     }
 
     #[tool(description = "Search memories with a semantic query, optionally scoped to a user, agent, or run")]
-    async fn search_memories(&self, Parameters(request): Parameters<SearchMemoriesRequest>) -> Result<Json<Vec<MemoryResult>>, McpError> {
+    async fn search_memories(&self, Parameters(request): Parameters<SearchMemoriesRequest>) -> Result<Json<Vec<MemoryResult>>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let results = self
             .memory
             .search(&request.query, request.top_k, &scope, request.threshold, request.show_expired, None, false)
-            .map_err(|err| core_error_to_mcp(&err))?;
+            .map_err(|err| err.to_string())?;
         Ok(Json(results.into_iter().map(MemoryResult::from).collect()))
     }
 
     #[tool(description = "Fetch a single memory by id")]
-    async fn get_memory(&self, Parameters(request): Parameters<GetMemoryRequest>) -> Result<Json<MemoryRecord>, McpError> {
+    async fn get_memory(&self, Parameters(request): Parameters<GetMemoryRequest>) -> Result<Json<MemoryRecord>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        match self.memory.get(&request.id).map_err(|err| core_error_to_mcp(&err))? {
+        match self.memory.get(&request.id).map_err(|err| err.to_string())? {
             Some(record) => Ok(Json(MemoryRecord::from(record))),
-            None => Err(McpError::invalid_params(format!("no memory found with id {}", request.id), None)),
+            None => Err(format!("no memory found with id {}", request.id)),
         }
     }
 
     #[tool(description = "List memories, optionally scoped to a user, agent, or run")]
-    async fn get_memories(&self, Parameters(request): Parameters<GetMemoriesRequest>) -> Result<Json<Vec<MemoryRecord>>, McpError> {
+    async fn get_memories(&self, Parameters(request): Parameters<GetMemoriesRequest>) -> Result<Json<Vec<MemoryRecord>>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let filter = scope_filter(&scope);
         let ids = self
             .memory
             .list(request.offset, request.limit, request.show_expired, filter.as_ref())
-            .map_err(|err| core_error_to_mcp(&err))?;
+            .map_err(|err| err.to_string())?;
         let records = ids
             .into_iter()
             .filter_map(|id| self.memory.get(&id).ok().flatten())
@@ -381,65 +369,64 @@ impl MemoriaMcpServer {
     }
 
     #[tool(description = "Fetch the change history (add/delete events) for a single memory")]
-    async fn memory_history(&self, Parameters(request): Parameters<MemoryHistoryRequest>) -> Result<Json<Vec<HistoryEntry>>, McpError> {
+    async fn memory_history(&self, Parameters(request): Parameters<MemoryHistoryRequest>) -> Result<Json<Vec<HistoryEntry>>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let entries = self
             .memory
             .history(&request.id, request.offset, request.limit)
-            .map_err(|err| core_error_to_mcp(&err))?;
+            .map_err(|err| err.to_string())?;
         Ok(Json(entries.into_iter().map(HistoryEntry::from).collect()))
     }
 
     #[tool(description = "Extract facts from a message and store them under a scope (or store content verbatim if infer=false)")]
-    async fn add_memory(&self, Parameters(request): Parameters<AddMemoryRequest>) -> Result<Json<Vec<String>>, McpError> {
+    async fn add_memory(&self, Parameters(request): Parameters<AddMemoryRequest>) -> Result<Json<Vec<String>>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let ids = self
             .memory
             .add(&[Message::new(Role::User, &request.content)], scope, request.infer)
-            .map_err(|err| core_error_to_mcp(&err))?;
+            .map_err(|err| err.to_string())?;
         self.save_if_json_snapshot();
         Ok(Json(ids))
     }
 
     #[tool(description = "Update a memory's content and/or metadata")]
-    async fn update_memory(&self, Parameters(request): Parameters<UpdateMemoryRequest>) -> Result<Json<MemoryRecord>, McpError> {
+    async fn update_memory(&self, Parameters(request): Parameters<UpdateMemoryRequest>) -> Result<Json<MemoryRecord>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        self.memory.update(&request.id, request.content.as_deref(), request.metadata).map_err(|err| core_error_to_mcp(&err))?;
+        self.memory.update(&request.id, request.content.as_deref(), request.metadata).map_err(|err| err.to_string())?;
         self.save_if_json_snapshot();
-        match self.memory.get(&request.id).map_err(|err| core_error_to_mcp(&err))? {
+        match self.memory.get(&request.id).map_err(|err| err.to_string())? {
             Some(record) => Ok(Json(MemoryRecord::from(record))),
-            None => Err(McpError::invalid_params(format!("no memory found with id {}", request.id), None)),
+            None => Err(format!("no memory found with id {}", request.id)),
         }
     }
 
     #[tool(description = "Delete a single memory by id")]
-    async fn delete_memory(&self, Parameters(request): Parameters<DeleteMemoryRequest>) -> Result<Json<bool>, McpError> {
+    async fn delete_memory(&self, Parameters(request): Parameters<DeleteMemoryRequest>) -> Result<Json<bool>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        self.memory.delete(&request.id).map_err(|err| core_error_to_mcp(&err))?;
+        self.memory.delete(&request.id).map_err(|err| err.to_string())?;
         self.save_if_json_snapshot();
         Ok(Json(true))
     }
 
     #[tool(description = "Delete every memory matching a scope (user, agent, and/or run) -- at least one is required")]
-    async fn delete_all_memories(&self, Parameters(request): Parameters<DeleteAllMemoriesRequest>) -> Result<Json<DeleteAllResult>, McpError> {
+    async fn delete_all_memories(&self, Parameters(request): Parameters<DeleteAllMemoriesRequest>) -> Result<Json<DeleteAllResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         if scope.is_empty() {
-            return Err(McpError::invalid_params(
-                "delete_all_memories requires at least one of user_id, agent_id, or run_id -- server has no separate admin tier to gate an unscoped wipe the way the REST API does",
-                None,
-            ));
+            return Err(
+                "delete_all_memories requires at least one of user_id, agent_id, or run_id -- server has no separate admin tier to gate an unscoped wipe the way the REST API does".to_string(),
+            );
         }
-        let deleted = self.memory.reset(&scope, None).map_err(|err| core_error_to_mcp(&err))?;
+        let deleted = self.memory.reset(&scope, None).map_err(|err| err.to_string())?;
         self.save_if_json_snapshot();
         Ok(Json(DeleteAllResult { deleted }))
     }
 
     #[tool(description = "List distinct users, agents, and runs with a memory count for each")]
-    async fn list_entities(&self, Parameters(request): Parameters<ListEntitiesRequest>) -> Result<Json<Vec<EntitySummary>>, McpError> {
+    async fn list_entities(&self, Parameters(request): Parameters<ListEntitiesRequest>) -> Result<Json<Vec<EntitySummary>>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let entities = self.memory.list_entities().map_err(|err| core_error_to_mcp(&err))?;
+        let entities = self.memory.list_entities().map_err(|err| err.to_string())?;
         Ok(Json(entities.into_iter().map(EntitySummary::from).collect()))
     }
 }
