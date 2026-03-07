@@ -55,6 +55,10 @@ check "update exits 0" "0" "${update_status}"
 get_after_update_output="$("${cli_bin}" --json get "${record_id}")"
 check "a fresh process sees the update a prior process made" "true" "$(contains "${get_after_update_output}" "Alice is a senior backend engineer.")"
 
+history_output="$("${cli_bin}" --json history "${record_id}")"
+check "history exits 0" "0" "$?"
+check "a fresh process sees the real added event a prior process recorded" "true" "$(contains "${history_output}" "Added")"
+
 whoami_output="$("${cli_bin}" --json whoami)"
 check "whoami exits 0" "0" "$?"
 check "whoami reports the real store path" "true" "$(contains "${whoami_output}" "${MEMORIA_STORE_PATH}")"
@@ -74,6 +78,9 @@ delete_status=$?
 check "delete exits 0" "0" "${delete_status}"
 "${cli_bin}" get "${record_id}" >/dev/null 2>&1
 check "a fresh process confirms the deleted record is really gone" "1" "$?"
+
+history_after_delete_output="$("${cli_bin}" --json history "${record_id}")"
+check "a fresh process sees both the added and deleted events after the record is gone" "true" "$(contains "${history_after_delete_output}" "Deleted")"
 
 if [[ "${failures}" -gt 0 ]]; then
   echo "SMOKE TEST FAILED: ${failures} check(s) failed."

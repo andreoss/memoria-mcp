@@ -80,6 +80,15 @@ enum Command {
         #[arg(help = "The memory's id")]
         id: String,
     },
+    #[command(about = "Show the add/delete change log for a single memory")]
+    History {
+        #[arg(help = "The memory's id")]
+        id: String,
+        #[arg(long, default_value_t = 0, help = "Number of entries to skip")]
+        offset: usize,
+        #[arg(long, default_value_t = 100, help = "Maximum number of entries to return")]
+        limit: usize,
+    },
     #[command(about = "Create the local store file if it doesn't exist yet")]
     Init,
     #[command(about = "Show the active store path and providers")]
@@ -236,6 +245,23 @@ fn print_record(record: &VectorRecord, json: bool, quiet: bool) {
     } else {
         let content = record.payload.get("content").map_or("", String::as_str);
         println!("{}\t{content}", record.id);
+    }
+}
+
+fn print_history(entries: &[core::memory::HistoryEntry], json: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if json {
+        println!("{}", serde_json::to_string(entries).unwrap_or_default());
+    } else {
+        for entry in entries {
+            let event = match entry.event {
+                core::memory::HistoryEvent::Added => "added",
+                core::memory::HistoryEvent::Deleted => "deleted",
+            };
+            println!("{event}\t{}", entry.content);
+        }
     }
 }
 
@@ -482,6 +508,13 @@ fn run<L, E, V>(
                 save_store(memory, path);
                 save_history(memory, history_path);
             }
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Command::History { id, offset, limit } => match memory.history(&id, offset, limit) {
+            Ok(entries) => print_history(&entries, json, quiet),
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(1);
@@ -802,7 +835,7 @@ mod tests {
         let script = String::from_utf8(buf).expect("completion script should be valid utf8");
 
         assert!(script.contains("memoria"), "got: {script}");
-        for subcommand in ["add", "search", "get", "list", "update", "delete", "init", "whoami", "status", "completions"] {
+        for subcommand in ["add", "search", "get", "list", "update", "delete", "history", "init", "whoami", "status", "completions"] {
             assert!(script.contains(subcommand), "bash completion script should mention {subcommand:?}, got: {script}");
         }
     }
