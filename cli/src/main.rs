@@ -157,6 +157,29 @@ where
     let _ = fs::write(path, data);
 }
 
+fn resolve_history_path(store_path: &Path) -> PathBuf {
+    store_path.with_file_name("history.json")
+}
+
+fn load_history(path: &Path) -> HashMap<String, Vec<core::memory::HistoryEntry>> {
+    fs::read_to_string(path).ok().and_then(|data| serde_json::from_str(&data).ok()).unwrap_or_default()
+}
+
+fn save_history<L, E, V>(memory: &Memory<L, E, V>, path: &Path)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let Ok(data) = serde_json::to_string_pretty(&memory.history_snapshot()) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, data);
+}
+
 fn parse_key_value(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -379,13 +402,24 @@ fn main() {
     if let Some((reranker, _)) = reranker {
         memory = memory.with_reranker(reranker);
     }
+    let history_path = resolve_history_path(&path);
+    memory.load_history_snapshot(load_history(&history_path));
 
-    run(cli.command, &memory, &path, json, quiet, &llm_label, &embedding_label, reranker_label.as_deref());
+    run(cli.command, &memory, &path, &history_path, json, quiet, &llm_label, &embedding_label, reranker_label.as_deref());
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run<L, E, V>(command: Command, memory: &Memory<L, E, V>, path: &Path, json: bool, quiet: bool, llm_label: &str, embedding_label: &str, reranker_label: Option<&str>)
-where
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run<L, E, V>(
+    command: Command,
+    memory: &Memory<L, E, V>,
+    path: &Path,
+    history_path: &Path,
+    json: bool,
+    quiet: bool,
+    llm_label: &str,
+    embedding_label: &str,
+    reranker_label: Option<&str>,
+) where
     L: core::llm::LlmProvider,
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
@@ -397,6 +431,7 @@ where
                 Ok(ids) => {
                     print_ids(&ids, json, quiet);
                     save_store(memory, path);
+                    save_history(memory, history_path);
                 }
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -443,7 +478,10 @@ where
             }
         }
         Command::Delete { id } => match memory.delete(&id) {
-            Ok(()) => save_store(memory, path),
+            Ok(()) => {
+                save_store(memory, path);
+                save_history(memory, history_path);
+            }
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(1);
@@ -621,6 +659,63 @@ mod tests {
 
         let record = loaded.get("rec-1").expect("get should succeed").expect("record should round-trip");
         assert_eq!(record.payload.get("content"), Some(&"Alice is an engineer.".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_history_path_is_a_sibling_of_the_store_path() {
+        let path = resolve_history_path(&PathBuf::from("/home/alice/.memoria/store.json"));
+        assert_eq!(path, PathBuf::from("/home/alice/.memoria/history.json"));
+    }
+
+    #[test]
+    fn load_history_for_a_missing_file_is_empty_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-history-test-missing-{}", std::process::id()));
+        let history = load_history(&dir.join("never-created.json"));
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_history_round_trips_real_add_and_delete_events() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-history-test-{}", std::process::id()));
+        let history_path = dir.join("history.json");
+
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let ids = memory
+            .add(&[Message::new(Role::User, "Alice is an engineer.")], HashMap::from([("user_id".to_string(), "alice".to_string())]), false)
+            .expect("add should succeed");
+        let id = ids.first().expect("expected an id");
+        memory.delete(id).expect("delete should succeed");
+
+        save_history(&memory, &history_path);
+        let loaded = load_history(&history_path);
+
+        let entries = loaded.get(id).expect("expected history for this id");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event, core::memory::HistoryEvent::Added);
+        assert_eq!(entries[1].event, core::memory::HistoryEvent::Deleted);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_memory_loaded_from_a_real_history_snapshot_reports_the_same_history() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-history-test-crossproc-{}", std::process::id()));
+        let history_path = dir.join("history.json");
+
+        let first = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let ids = first
+            .add(&[Message::new(Role::User, "Bob likes tea.")], HashMap::from([("user_id".to_string(), "bob".to_string())]), false)
+            .expect("add should succeed");
+        let id = ids.first().expect("expected an id").clone();
+        save_history(&first, &history_path);
+
+        let second = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        second.load_history_snapshot(load_history(&history_path));
+        let entries = second.history(&id, 0, usize::MAX).expect("history should succeed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, core::memory::HistoryEvent::Added);
 
         let _ = fs::remove_dir_all(&dir);
     }

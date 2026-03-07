@@ -77,7 +77,7 @@ missing_secret_line="$(response_for_id "${round2_output}" 16)"
 check "a fresh process sees the record a prior process persisted" "true" "$(contains "${get_line}" "${record_id}")"
 check "update_memory succeeds and reflects the new content" "true" "$(contains "${update_line}" 'Alice is a senior backend engineer.')"
 check "search_memories finds the updated record within scope" "true" "$(contains "${search_line}" "${record_id}")"
-check "memory_history is empty in a fresh process (history does not persist across restarts)" "true" "$(contains "${history_line}" '"structuredContent":[]')"
+check "a fresh process sees the added event in history (history now persists across restarts)" "true" "$(contains "${history_line}" '\"event\":\"added\"')"
 check "list_entities reports the smoke user" "true" "$(contains "${entities_line}" '\"entity_id\":\"smoke\"')"
 check "a tool call with a missing secret is rejected" "true" "$(contains "${missing_secret_line}" '"isError":true')"
 

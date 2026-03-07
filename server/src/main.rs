@@ -93,6 +93,24 @@ where
     write_atomically(path, &data)
 }
 
+fn resolve_history_path(store_path: &Path) -> PathBuf {
+    store_path.with_file_name("history.json")
+}
+
+fn load_history(path: &Path) -> HashMap<String, Vec<core::memory::HistoryEntry>> {
+    std::fs::read_to_string(path).ok().and_then(|data| serde_json::from_str(&data).ok()).unwrap_or_default()
+}
+
+fn save_history<L, E, V>(memory: &Memory<L, E, V>, path: &Path) -> std::io::Result<()>
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    let data = serde_json::to_vec(&memory.history_snapshot()).unwrap_or_default();
+    write_atomically(path, &data)
+}
+
 struct RateLimitBucket {
     tokens: f64,
     last_refill: Instant,
@@ -1132,6 +1150,7 @@ where
     embedding_label: String,
     reranker_label: Option<String>,
     store_path: PathBuf,
+    history_path: PathBuf,
     persist_json_snapshot: bool,
     auth_store: auth_store::AuthStore,
     auth_store_path: PathBuf,
@@ -1530,6 +1549,7 @@ where
         let result = handle_create_memory(&state.memory, &body);
         if state.persist_json_snapshot && result.0 == 201 {
             let _ = save_store(&state.memory, &state.store_path);
+            let _ = save_history(&state.memory, &state.history_path);
         }
         result
     })
@@ -1612,6 +1632,7 @@ where
         let result = handle_delete_memory(&state.memory, &id);
         if state.persist_json_snapshot && result.0 == 200 {
             let _ = save_store(&state.memory, &state.store_path);
+            let _ = save_history(&state.memory, &state.history_path);
         }
         result
     })
@@ -1671,6 +1692,7 @@ where
         let result = handle_delete_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &request_headers, &state.memory, &body);
         if state.persist_json_snapshot && result.0 == 200 {
             let _ = save_store(&state.memory, &state.store_path);
+            let _ = save_history(&state.memory, &state.history_path);
         }
         result
     })
@@ -1692,6 +1714,7 @@ where
         let result = handle_reset_all(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &request_headers, &state.memory);
         if state.persist_json_snapshot && result.0 == 200 {
             let _ = save_store(&state.memory, &state.store_path);
+            let _ = save_history(&state.memory, &state.history_path);
         }
         result
     })
@@ -1924,11 +1947,15 @@ fn main() {
     eprintln!("auth store: {}", auth_store_path.display());
     let auth_store = auth_store::AuthStore::load(&auth_store_path);
 
+    let history_path = resolve_history_path(&store_path);
+    eprintln!("history: {}", history_path.display());
+
     let rate_limiter = RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC);
     let mut memory = Memory::new(llm_provider, embedding_provider, vector_store);
     if let Some((reranker, _)) = reranker {
         memory = memory.with_reranker(reranker);
     }
+    memory.load_history_snapshot(load_history(&history_path));
     let state_outliving_the_runtime = Arc::new(ServerState {
         memory,
         token,
@@ -1938,6 +1965,7 @@ fn main() {
         embedding_label,
         reranker_label,
         store_path,
+        history_path,
         persist_json_snapshot,
         auth_store,
         auth_store_path,
@@ -1994,6 +2022,7 @@ mod tests {
         E: core::embedding::EmbeddingProvider,
         V: core::vector_store::VectorStore,
     {
+        let history_path = resolve_history_path(&store_path);
         Arc::new(ServerState {
             memory,
             token,
@@ -2003,6 +2032,7 @@ mod tests {
             embedding_label: "test-embedding".to_string(),
             reranker_label: None,
             store_path,
+            history_path,
             persist_json_snapshot: true,
             auth_store: auth_store::AuthStore::new(),
             auth_store_path: test_auth_store_path(),
@@ -2284,6 +2314,65 @@ mod tests {
         save_store(&memory, &path).expect("save should succeed");
         let reloaded = load_store(&path);
         assert_eq!(reloaded.list(0, usize::MAX).expect("list should succeed").len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_history_path_is_a_sibling_of_the_store_path() {
+        let path = resolve_history_path(&PathBuf::from("/home/alice/.memoria/server-store.json"));
+        assert_eq!(path, PathBuf::from("/home/alice/.memoria/history.json"));
+    }
+
+    #[test]
+    fn load_history_with_no_file_present_is_empty() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-history-load-test-{}", std::process::id()));
+        let history = load_history(&dir.join("does-not-exist.json"));
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_history_round_trips_real_add_and_delete_events() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-history-roundtrip-test-{}", std::process::id()));
+        let history_path = dir.join("history.json");
+        let memory = Arc::new(Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()));
+        let ids = memory
+            .add(&[Message::new(Role::User, "Alice is an engineer.".to_string())], scope_from_optional(Some("alice".to_string()), None, None), true)
+            .expect("add should succeed");
+        let id = ids.first().expect("expected an id");
+        memory.delete(id).expect("delete should succeed");
+
+        save_history(&memory, &history_path).expect("save should succeed");
+        let reloaded = load_history(&history_path);
+        let entries = reloaded.get(id).expect("expected history for this id");
+        assert_eq!(entries.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_persists_history_across_a_real_restart_when_json_snapshot_is_active() {
+        let dir = std::env::temp_dir().join(format!("memoria-server-history-restart-test-{}", std::process::id()));
+        let store_path = dir.join("store.json");
+
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let state = test_state(memory, Some("token".to_string()), RateLimiter::new(1000.0, 1000.0), None, store_path.clone());
+        let create_body = br#"{"content":"Bob likes tea.","user_id":"bob"}"#;
+        let (status, body) = handle_create_memory(&state.memory, create_body);
+        assert_eq!(status, 201);
+        save_store(&state.memory, &state.store_path).expect("save should succeed");
+        save_history(&state.memory, &state.history_path).expect("save should succeed");
+        let created: CreateMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        let id = created.ids.first().expect("expected an id").clone();
+
+        let restored_store = load_store(&store_path);
+        let restored_memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), restored_store);
+        restored_memory.load_history_snapshot(load_history(&resolve_history_path(&store_path)));
+        let (status, body) = handle_get_history(&restored_memory, &id, "");
+        assert_eq!(status, 200);
+        let response: HistoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].event, core::memory::HistoryEvent::Added);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

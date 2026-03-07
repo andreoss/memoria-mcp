@@ -325,6 +325,17 @@ where
         Ok(entries.into_iter().skip(offset).take(limit).collect())
     }
 
+    #[allow(clippy::missing_panics_doc)]
+    #[must_use]
+    pub fn history_snapshot(&self) -> HashMap<String, Vec<HistoryEntry>> {
+        self.history.lock().expect("lock poisoned").clone()
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    pub fn load_history_snapshot(&self, snapshot: HashMap<String, Vec<HistoryEntry>>) {
+        *self.history.lock().expect("lock poisoned") = snapshot;
+    }
+
     #[allow(clippy::missing_errors_doc)]
     pub fn list_entities(&self) -> Result<Vec<EntitySummary>, crate::CoreError> {
         let ids = self.list(0, usize::MAX, true, None)?;
@@ -1561,6 +1572,64 @@ mod tests {
 
         let entities = memory.list_entities().expect("list_entities should succeed");
         assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn test_history_snapshot_is_empty_for_a_fresh_memory() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        assert!(memory.history_snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_history_snapshot_reflects_real_added_and_deleted_entries() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Alice is an engineer.")], scope(), true).expect("add should succeed");
+        let id = ids.first().expect("expected at least one id");
+        memory.delete(id).expect("delete should succeed");
+
+        let snapshot = memory.history_snapshot();
+        assert_eq!(snapshot.get(id).expect("expected an entry for this id").len(), 2);
+    }
+
+    #[test]
+    fn test_load_history_snapshot_replaces_existing_state_and_history_reads_it_back() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let mut snapshot = HashMap::new();
+        snapshot.insert("restored-id".to_string(), vec![HistoryEntry { event: HistoryEvent::Added, content: "restored content".to_string() }]);
+        memory.load_history_snapshot(snapshot);
+
+        let entries = memory.history("restored-id", 0, usize::MAX).expect("history should succeed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "restored content");
+    }
+
+    #[test]
+    fn test_load_history_snapshot_round_trips_through_history_snapshot() {
+        let llm = FakeLlmProvider::with_facts("Bob likes tea.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let source = Memory::new(llm, embedding, store);
+        source.add(&[Message::new(Role::User, "Bob likes tea.")], scope(), true).expect("add should succeed");
+
+        let llm2 = FakeLlmProvider::new();
+        let embedding2 = FakeEmbeddingProvider::new();
+        let store2 = InMemoryVectorStore::new();
+        let restored = Memory::new(llm2, embedding2, store2);
+        restored.load_history_snapshot(source.history_snapshot());
+
+        assert_eq!(restored.history_snapshot(), source.history_snapshot());
     }
 
     #[test]

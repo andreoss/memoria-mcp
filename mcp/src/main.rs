@@ -310,24 +310,47 @@ where
     write_atomically(path, &data)
 }
 
+fn resolve_history_path(store_path: &Path) -> PathBuf {
+    store_path.with_file_name("history.json")
+}
+
+fn load_history(path: &Path) -> HashMap<String, Vec<memoria_core::memory::HistoryEntry>> {
+    std::fs::read_to_string(path).ok().and_then(|data| serde_json::from_str(&data).ok()).unwrap_or_default()
+}
+
+fn save_history<L, E, V>(memory: &Memory<L, E, V>, path: &Path) -> std::io::Result<()>
+where
+    L: LlmProvider,
+    E: EmbeddingProvider,
+    V: VectorStore,
+{
+    let data = serde_json::to_vec(&memory.history_snapshot()).unwrap_or_default();
+    write_atomically(path, &data)
+}
+
 #[derive(Clone)]
 struct MemoriaMcpServer {
     memory: SharedMemory,
     mcp_secret: Option<String>,
     store_path: PathBuf,
+    history_path: PathBuf,
     persist_json_snapshot: bool,
+    persist_history: bool,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MemoriaMcpServer {
-    fn new(memory: SharedMemory, mcp_secret: Option<String>, store_path: PathBuf, persist_json_snapshot: bool) -> Self {
-        Self { memory, mcp_secret, store_path, persist_json_snapshot, tool_router: Self::tool_router() }
+    fn new(memory: SharedMemory, mcp_secret: Option<String>, store_path: PathBuf, history_path: PathBuf, persist_json_snapshot: bool) -> Self {
+        Self { memory, mcp_secret, store_path, history_path, persist_json_snapshot, persist_history: true, tool_router: Self::tool_router() }
     }
 
-    fn save_if_json_snapshot(&self) {
+    fn persist_after_mutation(&self) {
         if self.persist_json_snapshot {
             let _ = save_store(&self.memory, &self.store_path);
+        }
+        if self.persist_history {
+            let _ = save_history(&self.memory, &self.history_path);
         }
     }
 
@@ -386,7 +409,7 @@ impl MemoriaMcpServer {
             .memory
             .add(&[Message::new(Role::User, &request.content)], scope, request.infer)
             .map_err(|err| err.to_string())?;
-        self.save_if_json_snapshot();
+        self.persist_after_mutation();
         Ok(Json(ids))
     }
 
@@ -394,7 +417,7 @@ impl MemoriaMcpServer {
     async fn update_memory(&self, Parameters(request): Parameters<UpdateMemoryRequest>) -> Result<Json<MemoryRecord>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         self.memory.update(&request.id, request.content.as_deref(), request.metadata).map_err(|err| err.to_string())?;
-        self.save_if_json_snapshot();
+        self.persist_after_mutation();
         match self.memory.get(&request.id).map_err(|err| err.to_string())? {
             Some(record) => Ok(Json(MemoryRecord::from(record))),
             None => Err(format!("no memory found with id {}", request.id)),
@@ -405,7 +428,7 @@ impl MemoriaMcpServer {
     async fn delete_memory(&self, Parameters(request): Parameters<DeleteMemoryRequest>) -> Result<Json<bool>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         self.memory.delete(&request.id).map_err(|err| err.to_string())?;
-        self.save_if_json_snapshot();
+        self.persist_after_mutation();
         Ok(Json(true))
     }
 
@@ -419,7 +442,7 @@ impl MemoriaMcpServer {
             );
         }
         let deleted = self.memory.reset(&scope, None).map_err(|err| err.to_string())?;
-        self.save_if_json_snapshot();
+        self.persist_after_mutation();
         Ok(Json(DeleteAllResult { deleted }))
     }
 
@@ -581,10 +604,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if persist_json_snapshot {
         eprintln!("store: {}", store_path.display());
     }
+    let history_path = resolve_history_path(&store_path);
+    eprintln!("history: {}", history_path.display());
 
     let memory = Arc::new(Memory::new(llm_provider, embedding_provider, vector_store));
+    memory.load_history_snapshot(load_history(&history_path));
     let mcp_secret = std::env::var("MEMORIA_MCP_SECRET").ok().filter(|value| !value.is_empty());
-    let server = MemoriaMcpServer::new(memory, mcp_secret, store_path, persist_json_snapshot);
+    let server = MemoriaMcpServer::new(memory, mcp_secret, store_path, history_path, persist_json_snapshot);
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
@@ -611,7 +637,9 @@ mod tests {
     }
 
     fn test_server(memory: SharedMemory, mcp_secret: Option<String>) -> MemoriaMcpServer {
-        MemoriaMcpServer::new(memory, mcp_secret, PathBuf::from("/dev/null"), false)
+        let mut server = MemoriaMcpServer::new(memory, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
+        server.persist_history = false;
+        server
     }
 
     #[test]
@@ -846,8 +874,9 @@ mod tests {
     async fn add_memory_persists_a_json_snapshot_when_configured() {
         let dir = std::env::temp_dir().join(format!("memoria-mcp-snapshot-test-{}", std::process::id()));
         let store_path = dir.join("store.json");
+        let history_path = dir.join("history.json");
         let memory = test_memory();
-        let server = MemoriaMcpServer::new(memory, None, store_path.clone(), true);
+        let server = MemoriaMcpServer::new(memory, None, store_path.clone(), history_path, true);
         let request =
             AddMemoryRequest { content: "Kim leads the platform team.".to_string(), user_id: Some("kim".to_string()), agent_id: None, run_id: None, infer: false, secret: None };
         server.add_memory(Parameters(request)).await.expect("add should succeed");
@@ -862,6 +891,43 @@ mod tests {
         let (_, persist_json_snapshot, label) = resolve_vector_store(None, &dir.join("unused.json"), &dir.join("default.db")).expect("expected a store");
         assert!(!persist_json_snapshot, "the sqlite default persists itself; it must not also write a JSON snapshot");
         assert!(label.contains("SqliteVectorStore"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_history_path_is_a_sibling_of_the_store_path() {
+        let path = resolve_history_path(&PathBuf::from("/home/alice/.memoria/mcp-store.json"));
+        assert_eq!(path, PathBuf::from("/home/alice/.memoria/history.json"));
+    }
+
+    #[test]
+    fn load_history_with_no_file_present_is_empty() {
+        let dir = std::env::temp_dir().join(format!("memoria-mcp-history-load-test-{}", std::process::id()));
+        assert!(load_history(&dir.join("does-not-exist.json")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_memory_and_delete_memory_persist_history_when_configured() {
+        let dir = std::env::temp_dir().join(format!("memoria-mcp-history-test-{}", std::process::id()));
+        let history_path = dir.join("history.json");
+        let memory = test_memory();
+        let server = MemoriaMcpServer::new(memory, None, PathBuf::from("/dev/null"), history_path.clone(), false);
+
+        let add_request =
+            AddMemoryRequest { content: "Liam manages infrastructure.".to_string(), user_id: Some("liam".to_string()), agent_id: None, run_id: None, infer: false, secret: None };
+        let Json(ids) = server.add_memory(Parameters(add_request)).await.expect("add should succeed");
+        let id = ids.into_iter().next().expect("expected an id");
+        server.delete_memory(Parameters(DeleteMemoryRequest { id: id.clone(), secret: None })).await.expect("delete should succeed");
+
+        let saved = load_history(&history_path);
+        let entries = saved.get(&id).expect("expected history for this id");
+        assert_eq!(entries.len(), 2);
+
+        let fresh_memory = test_memory();
+        fresh_memory.load_history_snapshot(saved);
+        let restored_entries = fresh_memory.history(&id, 0, usize::MAX).expect("history should succeed");
+        assert_eq!(restored_entries.len(), 2);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
