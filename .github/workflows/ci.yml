@@ -103,6 +103,26 @@ jobs:
       - name: Run Coverage (memoria-core, all features)
         run: cargo tarpaulin -p memoria-core --lib --features ollama,sqlite,fastembed --exclude-files 'cli/*' 'server/*' --out Stdout
 
+  smoke-test-cli:
+    name: CLI Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build CLI (Release)
+        run: cargo build --release -p cli
+
+      - name: Run Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_CLI_BIN: ./target/release/cli
+        run: bash scripts/smoke-test-cli.sh
+
   smoke-test-server:
     name: Server Smoke Test
     runs-on: ubuntu-latest
