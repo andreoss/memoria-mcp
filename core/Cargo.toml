@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = true
 description = "Self-hosted memory engine for AI agents: providers, vector storage, and the core Memory API."
+readme = "../README.md"
+keywords = ["memory", "ai-agents", "llm", "embeddings", "rag"]
+categories = ["database", "data-structures"]
 
 [lints]
 workspace = true
