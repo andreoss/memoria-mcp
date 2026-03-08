@@ -54,7 +54,7 @@ check "POST /memories with a malformed body" 400 \
 check "DELETE /memories/:id with a valid token" 200 \
   "$(status_of -H "Authorization: Bearer ${api_key}" -X DELETE "${base_url}/memories/${record_id}")"
 
-bulk_response="$(curl -s -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/memories" -d '{"content":"smoke bulk-delete target.","user_id":"smoke"}')"
+bulk_response="$(curl -s -H "Authorization: Bearer ${api_key}" -X POST "${base_url}/memories" -d '{"content":"smoke bulk-delete target.","user_id":"smoke","infer":false}')"
 bulk_id="$(printf '%s' "${bulk_response}" | grep -o '"[^"]*"' | sed -n '2p' | tr -d '"')"
 check "POST /memories for the bulk-delete target" "true" \
   "$([[ -n "${bulk_id}" ]] && echo true || echo false)"

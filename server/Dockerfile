@@ -5,6 +5,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY core ./core
 COPY cli ./cli
 COPY server ./server
+COPY mcp ./mcp
 RUN cargo build --release -p server --features fastembed
 RUN MEMORIA_TEST_FASTEMBED_CACHE_DIR=/opt/fastembed-cache \
     cargo test -p memoria-core --features fastembed --release \
@@ -26,6 +27,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY core ./core
 COPY cli ./cli
 COPY server ./server
+COPY mcp ./mcp
 RUN cargo test -p memoria-core --features sqlite --release
 RUN cargo build --release -p server --features sqlite
 
@@ -43,6 +45,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY core ./core
 COPY cli ./cli
 COPY server ./server
+COPY mcp ./mcp
 RUN cargo build --release -p server
 
 FROM debian:bookworm-slim AS runtime
