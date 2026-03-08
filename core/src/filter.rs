@@ -362,6 +362,29 @@ mod tests {
     }
 
     #[test]
+    fn eq_never_matches_a_number_against_a_non_numeric_payload_string() {
+        let field = payload(&[("priority", "unspecified")]);
+        assert!(
+            !evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Eq(FilterValue::Number(10.0))), &field),
+            "a numeric filter value must not spuriously match a non-numeric payload string"
+        );
+    }
+
+    #[test]
+    fn ordering_against_a_non_numeric_payload_string_falls_back_to_lexicographic_comparison_not_numeric() {
+        let field = payload(&[("priority", "unspecified")]);
+        assert!(
+            evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Gt(FilterValue::Number(5.0))), &field),
+            "the fallback is a real string comparison, not a numeric one: \"unspecified\" sorts after \"5\" in ASCII \
+             (letters sort after digits), so Gt(5) is true here even though no numeric relationship holds"
+        );
+        assert!(
+            !evaluate(&FilterExpr::Field("priority".to_string(), FilterOp::Lt(FilterValue::Number(5.0))), &field),
+            "Lt must be the strict inverse of this same lexicographic fallback"
+        );
+    }
+
+    #[test]
     fn contains_matches_a_real_substring() {
         let expr = FilterExpr::Field("content".to_string(), FilterOp::Contains("engineer".to_string()));
         assert!(evaluate(&expr, &payload(&[("content", "Alice is an engineer.")])));
