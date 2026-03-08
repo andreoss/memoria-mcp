@@ -85,6 +85,33 @@ jobs:
       - name: Cargo Test (ollama feature, non-network cases only)
         run: cargo test -p memoria-core -p cli -p server -p mcp --features ollama
 
+      - name: Cargo Build (fastembed feature)
+        run: cargo build -p memoria-core -p cli -p server -p mcp --features fastembed
+
+      - name: Cargo Clippy (fastembed feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p cli -p server -p mcp --features fastembed --all-targets -- -D warnings
+
+      - name: Cargo Test (fastembed feature, non-network cases only)
+        run: cargo test -p memoria-core -p cli -p server -p mcp --features fastembed
+
+      - name: Cargo Build (sqlite feature)
+        run: cargo build -p memoria-core -p server -p mcp --features sqlite
+
+      - name: Cargo Clippy (sqlite feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p server -p mcp --features sqlite --all-targets -- -D warnings
+
+      - name: Cargo Test (sqlite feature, non-network cases only)
+        run: cargo test -p memoria-core -p server -p mcp --features sqlite
+
+      - name: Cargo Build (candle feature)
+        run: cargo build -p memoria-core -p cli -p server -p mcp --features candle
+
+      - name: Cargo Clippy (candle feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p cli -p server -p mcp --features candle --all-targets -- -D warnings
+
+      - name: Cargo Test (candle feature, non-network cases only)
+        run: cargo test -p memoria-core -p cli -p server -p mcp --features candle
+
   coverage:
     name: Code Coverage (core, all features, reported not gated)
     runs-on: ubuntu-latest
