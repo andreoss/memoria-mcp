@@ -167,7 +167,7 @@ jobs:
 
       - name: Start Server
         run: |
-          MEMORIA_API_KEY=ci-smoke-test-key ./target/release/server &
+          MEMORIA_API_KEY=ci-smoke-test-key MEMORIA_JWT_SECRET=ci-smoke-test-jwt-secret ./target/release/server &
           echo $! > server.pid
           for _ in $(seq 1 20); do
             curl -s -o /dev/null http://127.0.0.1:8080/health && break
@@ -242,6 +242,7 @@ jobs:
       - name: Start Server
         env:
           MEMORIA_API_KEY: ci-smoke-test-key
+          MEMORIA_JWT_SECRET: ci-smoke-test-jwt-secret
           MEMORIA_LLM_PROVIDER: ollama
           MEMORIA_EMBEDDING_PROVIDER: ollama
           MEMORIA_LLM_BASE_URL: http://127.0.0.1:11434
@@ -252,6 +253,82 @@ jobs:
           for _ in $(seq 1 40); do
             curl -s -o /dev/null http://127.0.0.1:8080/health && break
             sleep 1
+          done
+
+      - name: Run Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_API_KEY: ci-smoke-test-key
+        run: bash scripts/smoke-test-server.sh
+
+      - name: Stop Server
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  smoke-test-server-fastembed:
+    name: Server Smoke Test (real fastembed, optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build Server (Release, fastembed feature)
+        run: cargo build --release -p server --features fastembed
+
+      - name: Start Server
+        env:
+          MEMORIA_API_KEY: ci-smoke-test-key
+          MEMORIA_JWT_SECRET: ci-smoke-test-jwt-secret
+          MEMORIA_EMBEDDING_PROVIDER: fastembed
+        run: |
+          ./target/release/server &
+          echo $! > server.pid
+          for _ in $(seq 1 120); do
+            curl -s -o /dev/null http://127.0.0.1:8080/health && break
+            sleep 2
+          done
+
+      - name: Run Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_API_KEY: ci-smoke-test-key
+        run: bash scripts/smoke-test-server.sh
+
+      - name: Stop Server
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  smoke-test-server-candle:
+    name: Server Smoke Test (real candle, optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Build Server (Release, candle feature)
+        run: cargo build --release -p server --features candle
+
+      - name: Start Server
+        env:
+          MEMORIA_API_KEY: ci-smoke-test-key
+          MEMORIA_JWT_SECRET: ci-smoke-test-jwt-secret
+          MEMORIA_LLM_PROVIDER: candle
+        run: |
+          ./target/release/server &
+          echo $! > server.pid
+          for _ in $(seq 1 120); do
+            curl -s -o /dev/null http://127.0.0.1:8080/health && break
+            sleep 2
           done
 
       - name: Run Smoke Test
