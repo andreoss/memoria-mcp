@@ -59,8 +59,14 @@ enum Command {
         #[arg(help = "The memory's id")]
         id: String,
     },
-    #[command(about = "List stored memory ids")]
+    #[command(about = "List stored memory ids within a scope")]
     List {
+        #[arg(long, help = "List within a user's scope")]
+        user_id: Option<String>,
+        #[arg(long, help = "List within an agent's scope")]
+        agent_id: Option<String>,
+        #[arg(long, help = "List within a run's scope")]
+        run_id: Option<String>,
         #[arg(long, default_value_t = 0, help = "Number of ids to skip")]
         offset: usize,
         #[arg(long, default_value_t = 100, help = "Maximum number of ids to return")]
@@ -153,7 +159,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let Ok(ids) = memory.list(0, usize::MAX, true, None) else {
+    let Ok(ids) = memory.list_all(0, usize::MAX, true, None) else {
         return;
     };
     let records: Vec<VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
@@ -512,13 +518,16 @@ fn run<L, E, V>(
                 std::process::exit(1);
             }
         },
-        Command::List { offset, limit } => match memory.list(offset, limit, true, None) {
-            Ok(ids) => print_ids(&ids, json, quiet),
-            Err(err) => {
-                eprintln!("error: {err}");
-                std::process::exit(1);
+        Command::List { user_id, agent_id, run_id, offset, limit } => {
+            let scope = build_scope(user_id, agent_id, run_id);
+            match memory.list(&scope, offset, limit, true, None) {
+                Ok(ids) => print_ids(&ids, json, quiet),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Command::Update { id, content, set } => {
             let metadata = if set.is_empty() { None } else { Some(set.into_iter().collect::<HashMap<_, _>>()) };
             match memory.update(&id, content.as_deref(), metadata) {

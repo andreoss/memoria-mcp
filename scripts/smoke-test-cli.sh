@@ -46,8 +46,11 @@ check "get returns the real content" "true" "$(contains "${get_output}" "Alice i
 search_output="$("${cli_bin}" --json search "engineer" --user-id smoke)"
 check "search finds the record within scope" "true" "$(contains "${search_output}" "${record_id}")"
 
-list_output="$("${cli_bin}" --json list)"
+list_output="$("${cli_bin}" --json list --user-id smoke)"
 check "list includes the record id" "true" "$(contains "${list_output}" "${record_id}")"
+
+check "list without a scope is rejected" 1 \
+  "$("${cli_bin}" list > /dev/null 2>&1; echo $?)"
 
 "${cli_bin}" update "${record_id}" --content "Alice is a senior backend engineer." --set role=engineer >/dev/null
 update_status=$?

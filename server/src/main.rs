@@ -87,7 +87,7 @@ where
     E: core::embedding::EmbeddingProvider,
     V: core::vector_store::VectorStore,
 {
-    let ids = memory.list(0, usize::MAX, true, None).unwrap_or_default();
+    let ids = memory.list_all(0, usize::MAX, true, None).unwrap_or_default();
     let records: Vec<VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
     let data = serde_json::to_vec(&records).unwrap_or_default();
     write_atomically(path, &data)
@@ -978,8 +978,9 @@ where
     let offset = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100);
     let show_expired = params.get("show_expired").is_some_and(|v| v == "true");
+    let scope = scope_from_optional(params.get("user_id").cloned(), params.get("agent_id").cloned(), params.get("run_id").cloned());
 
-    match memory.list(offset, limit, show_expired, None) {
+    match memory.list(&scope, offset, limit, show_expired, None) {
         Ok(ids) => (200, serde_json::to_vec(&ListMemoryResponse { ids }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -3177,7 +3178,7 @@ mod tests {
         let created: CreateMemoryResponse = serde_json::from_slice(&create_response).expect("expected valid JSON");
         let expired_id = created.ids.first().expect("expected an id");
 
-        let (_, response_body) = handle_list_memory(&memory, "");
+        let (_, response_body) = handle_list_memory(&memory, "user_id=alice");
         let response: ListMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
         assert!(!response.ids.contains(expired_id));
     }
@@ -3190,7 +3191,7 @@ mod tests {
         let created: CreateMemoryResponse = serde_json::from_slice(&create_response).expect("expected valid JSON");
         let expired_id = created.ids.first().expect("expected an id");
 
-        let (_, response_body) = handle_list_memory(&memory, "show_expired=true");
+        let (_, response_body) = handle_list_memory(&memory, "user_id=alice&show_expired=true");
         let response: ListMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
         assert!(response.ids.contains(expired_id));
     }
@@ -3404,7 +3405,7 @@ mod tests {
         assert_eq!(status, 200);
         let response: DeleteAllResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
         assert_eq!(response.deleted, 1);
-        let remaining = memory.list(0, 100, true, None).expect("list should succeed");
+        let remaining = memory.list_all(0, 100, true, None).expect("list should succeed");
         assert_eq!(remaining.len(), 1);
     }
 
@@ -3428,7 +3429,7 @@ mod tests {
         assert_eq!(status, 200);
         let response: DeleteAllResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
         assert_eq!(response.deleted, 2);
-        let remaining = memory.list(0, 100, true, None).expect("list should succeed");
+        let remaining = memory.list_all(0, 100, true, None).expect("list should succeed");
         assert!(remaining.is_empty());
     }
 
@@ -3654,7 +3655,7 @@ mod tests {
         let (_, create_body) = handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
         let created: CreateMemoryResponse = serde_json::from_slice(&create_body).expect("expected valid JSON");
 
-        let (status, body) = handle_list_memory(&memory, "");
+        let (status, body) = handle_list_memory(&memory, "user_id=alice");
         assert_eq!(status, 200);
         let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         for id in &created.ids {
@@ -3667,10 +3668,37 @@ mod tests {
         let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
         handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
 
-        let (status, body) = handle_list_memory(&memory, "limit=0");
+        let (status, body) = handle_list_memory(&memory, "user_id=alice&limit=0");
         assert_eq!(status, 200);
         let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert!(response.ids.is_empty(), "limit=0 should return nothing, not error");
+    }
+
+    #[test]
+    fn handle_list_memory_without_a_scope_is_rejected() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, _) = handle_list_memory(&memory, "");
+        assert_eq!(status, 400, "listing with no user_id/agent_id/run_id must be rejected, not return every record unscoped");
+    }
+
+    #[test]
+    fn handle_list_memory_scopes_results_to_the_requested_user_via_query_param() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let (_, alice_body) = handle_create_memory(&memory, br#"{"content":"Alice's fact.","user_id":"alice","infer":false}"#);
+        let (_, bob_body) = handle_create_memory(&memory, br#"{"content":"Bob's fact.","user_id":"bob","infer":false}"#);
+        let alice: CreateMemoryResponse = serde_json::from_slice(&alice_body).expect("expected valid JSON");
+        let bob: CreateMemoryResponse = serde_json::from_slice(&bob_body).expect("expected valid JSON");
+
+        let (status, body) = handle_list_memory(&memory, "user_id=alice");
+        assert_eq!(status, 200);
+        let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.ids.contains(alice.ids.first().expect("expected an id")));
+        assert!(
+            !response.ids.contains(bob.ids.first().expect("expected an id")),
+            "listing alice's scope via the user_id query param must not surface bob's record"
+        );
     }
 
     #[test]

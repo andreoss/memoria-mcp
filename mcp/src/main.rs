@@ -2,7 +2,6 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use memoria_core::embedding::{EmbeddingProvider, LocalHashEmbeddingProvider};
-use memoria_core::filter::{FilterExpr, FilterOp, FilterValue};
 use memoria_core::llm::{LlmProvider, LocalSentenceLlmProvider, Message, Role};
 use memoria_core::memory::Memory;
 use memoria_core::vector_store::{InMemoryVectorStore, VectorStore};
@@ -33,18 +32,6 @@ fn scope_from_optional(user_id: Option<String>, agent_id: Option<String>, run_id
         scope.insert("run_id".to_string(), v);
     }
     scope
-}
-
-fn scope_filter(scope: &HashMap<String, String>) -> Option<FilterExpr> {
-    let mut clauses: Vec<FilterExpr> = scope
-        .iter()
-        .map(|(key, value)| FilterExpr::Field(key.clone(), FilterOp::Eq(FilterValue::String(value.clone()))))
-        .collect();
-    match clauses.len() {
-        0 => None,
-        1 => clauses.pop(),
-        _ => Some(FilterExpr::And(clauses)),
-    }
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -304,7 +291,7 @@ where
     E: EmbeddingProvider,
     V: VectorStore,
 {
-    let ids = memory.list(0, usize::MAX, true, None).unwrap_or_default();
+    let ids = memory.list_all(0, usize::MAX, true, None).unwrap_or_default();
     let records: Vec<memoria_core::vector_store::VectorRecord> = ids.iter().filter_map(|id| memory.get(id).ok().flatten()).collect();
     let data = serde_json::to_vec(&records).unwrap_or_default();
     write_atomically(path, &data)
@@ -378,11 +365,7 @@ impl MemoriaMcpServer {
     async fn get_memories(&self, Parameters(request): Parameters<GetMemoriesRequest>) -> Result<Json<Vec<MemoryRecord>>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
-        let filter = scope_filter(&scope);
-        let ids = self
-            .memory
-            .list(request.offset, request.limit, request.show_expired, filter.as_ref())
-            .map_err(|err| err.to_string())?;
+        let ids = self.memory.list(&scope, request.offset, request.limit, request.show_expired, None).map_err(|err| err.to_string())?;
         let records = ids
             .into_iter()
             .filter_map(|id| self.memory.get(&id).ok().flatten())
@@ -672,23 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn scope_filter_is_none_for_an_empty_scope() {
-        assert_eq!(scope_filter(&HashMap::new()), None);
-    }
-
-    #[test]
-    fn scope_filter_combines_multiple_keys_with_and() {
-        let mut scope = HashMap::new();
-        scope.insert("user_id".to_string(), "alice".to_string());
-        scope.insert("agent_id".to_string(), "assistant".to_string());
-        let filter = scope_filter(&scope).expect("expected a filter");
-        match filter {
-            FilterExpr::And(clauses) => assert_eq!(clauses.len(), 2),
-            other => panic!("expected FilterExpr::And, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn check_secret_passes_when_none_is_configured() {
         assert!(check_secret(None, None).is_ok());
     }
@@ -778,6 +744,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_memories_without_a_scope_is_rejected() {
+        let memory = test_memory();
+        add_fact(&memory, "Alice is an engineer.", "alice");
+        let server = test_server(memory, None);
+        let request = GetMemoriesRequest { user_id: None, agent_id: None, run_id: None, offset: 0, limit: 50, show_expired: false, secret: None };
+        let result = server.get_memories(Parameters(request)).await;
+        assert!(result.is_err(), "get_memories with no user_id/agent_id/run_id must be rejected, not return every record unscoped");
+    }
+
+    #[tokio::test]
     async fn memory_history_reports_real_add_and_delete_events_in_order() {
         let memory = test_memory();
         let id = add_fact(&memory, "Dana runs marathons.", "dana");
@@ -864,7 +840,7 @@ mod tests {
         let request = DeleteAllMemoriesRequest { user_id: Some("henry".to_string()), agent_id: None, run_id: None, secret: None };
         let Json(result) = server.delete_all_memories(Parameters(request)).await.expect("delete_all should succeed");
         assert_eq!(result.deleted, 2);
-        let remaining = server.memory.list(0, usize::MAX, true, None).expect("list should succeed");
+        let remaining = server.memory.list_all(0, usize::MAX, true, None).expect("list should succeed");
         assert_eq!(remaining.len(), 1);
     }
 

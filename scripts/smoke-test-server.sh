@@ -37,6 +37,9 @@ check "GET /memories/:id with a valid token" 200 \
   "$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories/${record_id}")"
 
 check "GET /memories with a valid token" 200 \
+  "$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories?user_id=smoke")"
+
+check "GET /memories with no scope is rejected" 400 \
   "$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories")"
 
 check "PUT /memories/:id with a valid token" 200 \
@@ -71,7 +74,7 @@ check "POST /reset with an admin token" 200 \
 echo "-- burst: 25 rapid requests, expect at least one 429 --"
 saw_429=false
 for _ in $(seq 1 25); do
-  code="$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories")"
+  code="$(status_of -H "Authorization: Bearer ${api_key}" "${base_url}/memories?user_id=smoke")"
   if [[ "${code}" == "429" ]]; then
     saw_429=true
   fi

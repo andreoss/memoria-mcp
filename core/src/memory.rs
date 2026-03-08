@@ -254,17 +254,14 @@ where
         self.vector_store.get(id).map_err(From::from)
     }
 
-    #[allow(clippy::missing_errors_doc)]
-    pub fn list(
+    fn list_ids(
         &self,
+        scope: Option<&HashMap<String, String>>,
         offset: usize,
         limit: usize,
         show_expired: bool,
         filters: Option<&crate::filter::FilterExpr>,
     ) -> Result<Vec<String>, crate::CoreError> {
-        if show_expired && filters.is_none() {
-            return self.vector_store.list(offset, limit).map_err(From::from);
-        }
         let today = today_ymd_string();
         let all_ids = self.vector_store.list(0, usize::MAX)?;
         let surviving: Vec<String> = all_ids
@@ -273,11 +270,39 @@ where
                 let Some(record) = self.vector_store.get(id).ok().flatten() else {
                     return true;
                 };
-                (show_expired || !is_expired(&record.payload, &today))
+                let scope_matches = scope.is_none_or(|s| s.iter().all(|(k, v)| record.payload.get(k) == Some(v)));
+                scope_matches
+                    && (show_expired || !is_expired(&record.payload, &today))
                     && filters.is_none_or(|f| crate::filter::evaluate(f, &record.payload))
             })
             .collect();
         Ok(surviving.into_iter().skip(offset).take(limit).collect())
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn list(
+        &self,
+        scope: &HashMap<String, String>,
+        offset: usize,
+        limit: usize,
+        show_expired: bool,
+        filters: Option<&crate::filter::FilterExpr>,
+    ) -> Result<Vec<String>, crate::CoreError> {
+        if !has_scope_id(scope) {
+            return Err(crate::CoreError::Validation("scope must contain user_id, agent_id, or run_id".to_string()));
+        }
+        self.list_ids(Some(scope), offset, limit, show_expired, filters)
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn list_all(
+        &self,
+        offset: usize,
+        limit: usize,
+        show_expired: bool,
+        filters: Option<&crate::filter::FilterExpr>,
+    ) -> Result<Vec<String>, crate::CoreError> {
+        self.list_ids(None, offset, limit, show_expired, filters)
     }
 
     #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
@@ -338,7 +363,7 @@ where
 
     #[allow(clippy::missing_errors_doc)]
     pub fn list_entities(&self) -> Result<Vec<EntitySummary>, crate::CoreError> {
-        let ids = self.list(0, usize::MAX, true, None)?;
+        let ids = self.list_all(0, usize::MAX, true, None)?;
         let mut counts: HashMap<(String, String), usize> = HashMap::new();
         for id in ids {
             let Some(record) = self.get(&id)? else {
@@ -565,7 +590,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "An expired fact.")], expired_scope, false).expect("add should succeed");
         let expired_id = ids.first().expect("expected an id").clone();
 
-        let listed = memory.list(0, 100, false, None).expect("list should succeed");
+        let listed = memory.list(&scope(), 0, 100, false, None).expect("list should succeed");
         assert!(!listed.contains(&expired_id), "an expired record must not appear in list results by default");
     }
 
@@ -581,7 +606,7 @@ mod tests {
         let ids = memory.add(&[Message::new(Role::User, "An expired fact.")], expired_scope, false).expect("add should succeed");
         let expired_id = ids.first().expect("expected an id").clone();
 
-        let listed = memory.list(0, 100, true, None).expect("list should succeed");
+        let listed = memory.list(&scope(), 0, 100, true, None).expect("list should succeed");
         assert!(listed.contains(&expired_id), "show_expired=true must still surface an expired record in list");
     }
 
@@ -655,7 +680,7 @@ mod tests {
         let sales_ids = memory.add(&[Message::new(Role::User, "A sales fact.")], sales_scope, false).expect("add should succeed");
 
         let filter = FilterExpr::Field("category".to_string(), FilterOp::Eq(FilterValue::String("engineering".to_string())));
-        let listed = memory.list(0, 100, true, Some(&filter)).expect("list should succeed");
+        let listed = memory.list(&scope(), 0, 100, true, Some(&filter)).expect("list should succeed");
         assert!(listed.contains(engineering_ids.first().expect("expected an id")));
         assert!(!listed.contains(sales_ids.first().expect("expected an id")));
     }
@@ -2327,7 +2352,7 @@ mod tests {
 
         let ids = memory.add(&[Message::new(Role::User, "Two facts.")], scope(), true).expect("add should succeed");
 
-        let listed = memory.list(0, usize::MAX, true, None).expect("list should succeed");
+        let listed = memory.list(&scope(), 0, usize::MAX, true, None).expect("list should succeed");
         for id in &ids {
             assert!(listed.contains(id), "list should include every id add returned");
         }
@@ -2340,8 +2365,42 @@ mod tests {
         let store = InMemoryVectorStore::new();
         let memory = Memory::new(llm, embedding, store);
 
-        let listed = memory.list(0, 0, true, None).expect("list should succeed");
+        let listed = memory.list(&scope(), 0, 0, true, None).expect("list should succeed");
         assert!(listed.is_empty(), "a zero limit should return nothing, not error");
+    }
+
+    #[test]
+    fn test_list_without_a_scope_id_is_rejected() {
+        let llm = FakeLlmProvider::new();
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let result = memory.list(&HashMap::new(), 0, usize::MAX, true, None);
+        assert!(
+            matches!(result, Err(crate::CoreError::Validation(_))),
+            "list with no user_id/agent_id/run_id must be rejected, not return every record unscoped"
+        );
+    }
+
+    #[test]
+    fn test_list_only_returns_records_within_the_requested_scope() {
+        let llm = FakeLlmProvider::with_facts("irrelevant");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let alice_scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let bob_scope = HashMap::from([("user_id".to_string(), "bob".to_string())]);
+        let alice_ids = memory.add(&[Message::new(Role::User, "Alice's fact.")], alice_scope.clone(), false).expect("add should succeed");
+        let bob_ids = memory.add(&[Message::new(Role::User, "Bob's fact.")], bob_scope, false).expect("add should succeed");
+
+        let listed = memory.list(&alice_scope, 0, usize::MAX, true, None).expect("list should succeed");
+        assert!(listed.contains(alice_ids.first().expect("expected an id")));
+        assert!(
+            !listed.contains(bob_ids.first().expect("expected an id")),
+            "listing alice's scope must not surface bob's record"
+        );
     }
 
     #[test]
