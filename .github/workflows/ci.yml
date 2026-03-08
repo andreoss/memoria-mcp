@@ -339,3 +339,24 @@ jobs:
       - name: Stop Server
         if: always()
         run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  test-real-pipeline:
+    name: Real Hybrid Search + Rerank Pipeline Test (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Run Real Pipeline Test (sqlite hybrid search + candle-backed LlmReranker, real fastembed embeddings)
+        env:
+          MEMORIA_TEST_FASTEMBED_CACHE_DIR: ${{ runner.temp }}/fastembed-model-cache
+          MEMORIA_TEST_CANDLE_CACHE_DIR: ${{ runner.temp }}/candle-model-cache
+        run: |
+          cargo test -p memoria-core --release --features sqlite,fastembed,candle -- \
+            --ignored real_hybrid_search_and_real_rerank_surface_the_genuinely_relevant_record_first

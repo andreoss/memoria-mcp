@@ -2354,4 +2354,68 @@ mod tests {
             "an id generated after the in-process counter resets to 0 (simulating a fresh process loading a persisted store) must not collide with one generated before the reset"
         );
     }
+
+    #[cfg(all(feature = "sqlite", feature = "fastembed", feature = "candle"))]
+    mod real_pipeline_tests {
+        use super::*;
+        use crate::llm::{CandleLlmProvider, LocalSentenceLlmProvider};
+        use crate::reranker::LlmReranker;
+        use crate::vector_store::SqliteVectorStore;
+
+        struct TempDbPath(std::path::PathBuf);
+
+        impl Drop for TempDbPath {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        fn temp_store() -> (SqliteVectorStore, TempDbPath) {
+            let path = std::env::temp_dir()
+                .join(format!("memoria-real-pipeline-test-{}.db", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let store = SqliteVectorStore::open(&path).expect("open should succeed");
+            (store, TempDbPath(path))
+        }
+
+        #[test]
+        #[ignore = "downloads a real ~188MB fastembed model and a real ~430MB candle GGUF model on first run; needs real network access"]
+        fn real_hybrid_search_and_real_rerank_surface_the_genuinely_relevant_record_first() {
+            let embedding_cache = std::env::var("MEMORIA_TEST_FASTEMBED_CACHE_DIR").ok().map(std::path::PathBuf::from);
+            let embedding_config =
+                EmbeddingConfig { model: "all-MiniLM-L6-v2".to_string(), base_url: None, api_key: None, dimensions: None };
+            let embedding = crate::embedding::FastEmbedEmbeddingProvider::from_config(&embedding_config, embedding_cache)
+                .expect("valid embedding config should construct");
+
+            let llm_cache = std::env::var("MEMORIA_TEST_CANDLE_CACHE_DIR").ok().map(std::path::PathBuf::from);
+            let llm_config = LlmConfig { model: "qwen2.5-0.5b-instruct-q4_0".to_string(), base_url: None, api_key: None, temperature: None };
+            let reranker_llm =
+                CandleLlmProvider::from_config(&llm_config, llm_cache).expect("valid llm config should construct");
+
+            let (store, _temp_db_path) = temp_store();
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), embedding, store)
+                .with_reranker(LlmReranker::new(reranker_llm));
+
+            memory
+                .add(
+                    &[Message::new(Role::User, "The cloud division's quarterly revenue exceeded expectations.")],
+                    scope(),
+                    false,
+                )
+                .expect("add should succeed");
+            memory
+                .add(&[Message::new(Role::User, "Bob prefers tea over coffee in the mornings.")], scope(), false)
+                .expect("add should succeed");
+
+            let results = memory
+                .search("cloud division quarterly revenue", 2, &scope(), None, false, None, true)
+                .expect("search should succeed");
+
+            assert_eq!(results.len(), 2, "both records should be returned");
+            assert!(
+                results[0].payload.get("content").is_some_and(|c| c.contains("cloud division")),
+                "the genuinely relevant record, surfaced through real sqlite hybrid search and re-scored by a real candle-backed LlmReranker, should rank first, got: {results:?}"
+            );
+        }
+    }
 }
