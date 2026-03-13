@@ -1,5 +1,5 @@
 use crate::embedding::{EmbeddingConfig, EmbeddingProvider};
-use crate::llm::{extract_facts, summarize_procedure, LlmConfig, LlmProvider, Message, Role};
+use crate::llm::{describe_image, extract_facts, summarize_procedure, LlmConfig, LlmProvider, Message, Role};
 use crate::vector_store::{VectorRecord, VectorStore, VectorStoreConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -401,6 +401,17 @@ where
                 )));
             }
         }
+        let resolved_messages: Vec<Message> = messages
+            .iter()
+            .map(|message| {
+                if message.images.is_empty() {
+                    Ok(message.clone())
+                } else {
+                    describe_image(&self.llm, message.images.clone()).map(|description| Message::new(message.role, description))
+                }
+            })
+            .collect::<Result<Vec<Message>, crate::llm::LlmError>>()?;
+        let messages = resolved_messages.as_slice();
         for message in messages {
             if message.content.is_empty() {
                 return Err(crate::CoreError::Validation("message content must not be empty".to_string()));
@@ -806,6 +817,41 @@ mod tests {
             record.payload.get("content"),
             Some(&"Alice is an engineer.".to_string()),
             "without agent_id, memory_type=procedural_memory must not trigger summarization"
+        );
+    }
+
+    #[test]
+    fn test_add_with_an_image_message_describes_it_via_the_llm_before_storage() {
+        let llm = FakeLlmProvider::with_response("A photo of a red bicycle.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::with_images(Role::User, "", vec!["base64imagedata".to_string()])];
+        let ids = memory.add(&messages, scope(), false).expect("add should succeed");
+        assert_eq!(ids.len(), 1);
+        let record = memory.vector_store.get(&ids[0]).unwrap().unwrap();
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"A photo of a red bicycle.".to_string()),
+            "an image-bearing message's content must be replaced by the LLM's real description before storage"
+        );
+    }
+
+    #[test]
+    fn test_add_with_a_text_only_message_never_calls_describe_image() {
+        let llm = FakeLlmProvider::with_response("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let ids = memory.add(&messages, scope(), false).expect("add should succeed");
+        let record = memory.vector_store.get(&ids[0]).unwrap().unwrap();
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"Alice is an engineer.".to_string()),
+            "a message with no images must be stored as-is, not routed through image description"
         );
     }
 

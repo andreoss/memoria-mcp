@@ -22,6 +22,7 @@ impl Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    pub images: Vec<String>,
 }
 
 impl Message {
@@ -30,6 +31,16 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_images(role: Role, content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            images,
         }
     }
 }
@@ -167,6 +178,17 @@ pub fn summarize_procedure(provider: &impl LlmProvider, conversation: &[Message]
     Ok(completion.content.trim().to_string())
 }
 
+#[allow(clippy::missing_errors_doc)]
+pub fn describe_image(provider: &impl LlmProvider, images: Vec<String>) -> Result<String, LlmError> {
+    let message = Message::with_images(
+        Role::User,
+        "A user is providing an image. Provide a high level description of the image and do not include any additional text.",
+        images,
+    );
+    let completion = provider.complete(&[message])?;
+    Ok(completion.content.trim().to_string())
+}
+
 pub struct LocalSentenceLlmProvider;
 
 impl LocalSentenceLlmProvider {
@@ -262,10 +284,16 @@ impl OllamaLlmProvider {
 fn build_chat_request(model: &str, messages: &[Message]) -> serde_json::Value {
     serde_json::json!({
         "model": model,
-        "messages": messages.iter().map(|m| serde_json::json!({
-            "role": m.role.as_str(),
-            "content": m.content,
-        })).collect::<Vec<_>>(),
+        "messages": messages.iter().map(|m| {
+            let mut message = serde_json::json!({
+                "role": m.role.as_str(),
+                "content": m.content,
+            });
+            if !m.images.is_empty() {
+                message["images"] = serde_json::json!(m.images);
+            }
+            message
+        }).collect::<Vec<_>>(),
         "stream": false,
     })
 }
@@ -707,6 +735,20 @@ mod tests {
             assert_eq!(request["messages"][0]["content"], "be terse");
             assert_eq!(request["messages"][1]["role"], "user");
             assert_eq!(request["messages"][1]["content"], "hello");
+        }
+
+        #[test]
+        fn build_chat_request_threads_images_through_for_a_message_that_has_them() {
+            let messages = [Message::with_images(Role::User, "describe this", vec!["base64data".to_string()])];
+            let request = build_chat_request("llava", &messages);
+            assert_eq!(request["messages"][0]["images"], serde_json::json!(["base64data"]));
+        }
+
+        #[test]
+        fn build_chat_request_omits_images_for_a_message_that_has_none() {
+            let messages = [Message::new(Role::User, "hello")];
+            let request = build_chat_request("qwen2.5:0.5b", &messages);
+            assert!(request["messages"][0].get("images").is_none());
         }
 
         #[test]
