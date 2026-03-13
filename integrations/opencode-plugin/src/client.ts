@@ -63,4 +63,14 @@ export class MemoriaClient {
     const data = (await response.json()) as { results: MemoriaSearchResult[] };
     return data.results;
   }
+
+  async countMemories(scope: MemoriaScope): Promise<number> {
+    const params = new URLSearchParams({ ...scopeBody(scope), limit: "10000" });
+    const response = await fetch(`${this.baseUrl}/memories?${params.toString()}`, { headers: this.headers() });
+    if (!response.ok) {
+      throw new Error(`memoria get_memories failed: ${response.status} ${await response.text()}`);
+    }
+    const data = (await response.json()) as { ids: string[] };
+    return data.ids.length;
+  }
 }

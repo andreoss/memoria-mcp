@@ -35,6 +35,8 @@ Read from the environment:
 | `MEMORIA_SERVER_URL` | `http://127.0.0.1:8080` | Base URL of the running `server` |
 | `MEMORIA_API_KEY` | unset | Sent as `Authorization: Bearer <value>` on every request |
 | `MEMORIA_OPENCODE_USER_ID` | the OS username | Overrides automatic user identity resolution |
+| `MEMORIA_OPENCODE_MCP_NAME` | `memoria` | The key this plugin's own `mcp` server is registered under in `opencode.json`'s `mcp` block — used to build the real, prefixed tool names (`<name>_add_memory`, etc.) consolidation instructs the agent to call |
+| `MEMORIA_DREAM` | unset | Set to `false`/`0`/`no`/`off` to disable consolidation regardless of `~/.memoria/opencode-plugin/dream-config.json` |
 
 Project identity (memoria's `agent_id`) is derived automatically: the git remote's `owner-repo`, falling back to the repo root directory name, then the working directory name — the same fallback chain used by every real prior-art OpenCode memory plugin this design was compared against.
 
@@ -42,13 +44,25 @@ Project identity (memoria's `agent_id`) is derived automatically: the git remote
 
 - **`shell.env`** — exports the resolved `MEMORIA_OPENCODE_USER_ID`/`MEMORIA_OPENCODE_PROJECT_ID` into every shell command the agent runs.
 - **`event`** (on a real `session.idle` event) — fetches the session's recent user messages via the OpenCode SDK client and stores them with `POST /memories` (`infer: true`, so whichever LLM provider `server` is configured with does the real fact extraction).
-- **`chat.message`** — searches memoria (`POST /search`) for context relevant to the incoming message.
-- **`experimental.chat.messages.transform`** — injects that search's results into the message actually sent to the model, wrapped in a `<memoria-context>` block and marked `synthetic: true`.
+- **`chat.message`** — searches memoria (`POST /search`) for context relevant to the incoming message, and on the first message of a session, checks whether memory consolidation should run (see below).
+- **`experimental.chat.messages.transform`** — injects search results (and, when triggered, the consolidation protocol) into the message actually sent to the model, marked `synthetic: true`.
+- **`tool.execute.after`** — during a consolidation-triggered session, watches for the agent actually calling `<name>_add_memory`/`<name>_update_memory`/`<name>_delete_memory` to confirm real work happened before recording completion.
+- **`dispose`** — if a consolidation was triggered and a real write was observed, records completion (resetting the gates); otherwise releases the lock so a future session can retry.
 
-## What it deliberately does not do (yet)
+## Memory consolidation ("dream")
 
-Memory consolidation ("dream" — merging duplicates, dropping stale entries on a schedule) is `ADR-42` Increment 2b, a separate, not-yet-built piece with its own gating/state-file surface.
+Requires Increment 1 (the `mcp` binary registered as a local MCP server, under the key named by `MEMORIA_OPENCODE_MCP_NAME`) also be configured — this plugin has no native tools of its own, so consolidation only works if the agent actually has memory-management tools available to call.
+
+Gated by real thresholds (defaults: 24 hours since the last consolidation, 5 distinct sessions since, 20+ stored memories in scope), plus a filesystem lock so two concurrent sessions can't consolidate at once. When every gate passes, the plugin does not call an LLM itself — it injects a consolidation-protocol instruction into the agent's own next turn, asking it to review memories in scope, then delete/merge/rewrite as appropriate using its own already-available tools and credentials.
+
+Tune the thresholds with `~/.memoria/opencode-plugin/dream-config.json`:
+
+```json
+{ "enabled": true, "minHours": 24, "minSessions": 5, "minMemories": 20 }
+```
+
+Or disable entirely with `MEMORIA_DREAM=false`.
 
 ## Verification
 
-Real, not simulated: verified against an actually-installed OpenCode instance (`opencode mcp list` / `opencode run`), a real local Ollama-backed provider, and a real running `server` — confirmed `POST /search` and `POST /memories` both fire for real, and the session-idle capture path actually stores a real record scoped to the resolved user/project identity. See `Backlog.adoc` Sprint 139 for the full account, including a real bug this verification caught and fixed (`extractUserText` crashed on a non-array `parts` value the type signature claimed could never occur).
+Real, not simulated: verified against an actually-installed OpenCode instance (`opencode mcp list` / `opencode run`), a real local Ollama-backed provider, and a real running `server`. Confirmed `POST /search` and `POST /memories` both fire for real from the auto-capture and recall hooks; confirmed the consolidation gate's `GET /memories` call fires and session counting/lock acquire/release behaves correctly across real, separate `opencode run` invocations — including the lock being correctly released (not converted to a completion record) when no real write was observed. See `Backlog.adoc` Sprint 139 for the one real bug live verification caught and fixed there (`extractUserText`'s crash on non-array input).

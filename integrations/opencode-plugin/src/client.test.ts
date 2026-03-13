@@ -45,3 +45,20 @@ describe("MemoriaClient.searchMemories", () => {
     expect(results).toEqual([{ id: "rec-1", score: 0.1, payload: { content: "hi" } }]);
   });
 });
+
+describe("MemoriaClient.countMemories", () => {
+  test("gets /memories with the real scope query params and returns the id count", async () => {
+    let capturedUrl = "";
+    globalThis.fetch = (async (url: string) => {
+      capturedUrl = url;
+      return new Response(JSON.stringify({ ids: ["rec-1", "rec-2"] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const client = new MemoriaClient({ baseUrl: "http://127.0.0.1:8080" });
+    const count = await client.countMemories({ userId: "alice" });
+
+    expect(count).toBe(2);
+    expect(capturedUrl).toContain("user_id=alice");
+    expect(capturedUrl).toContain("limit=10000");
+  });
+});
