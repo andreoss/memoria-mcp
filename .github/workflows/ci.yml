@@ -384,3 +384,51 @@ jobs:
 
       - name: Test
         run: bun test
+
+  opencode-plugin-e2e:
+    name: OpenCode Plugin Real End-to-End Test (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install OpenCode
+        run: |
+          bun install -g opencode-ai
+          opencode --version
+
+      - name: Pull Ollama Model
+        run: curl -s -X POST http://127.0.0.1:11434/api/pull -d '{"name":"qwen2.5:0.5b","stream":false}'
+
+      - name: Build Server and MCP (Release)
+        run: cargo build --release -p server -p mcp
+
+      - name: Build Plugin
+        working-directory: integrations/opencode-plugin
+        run: |
+          bun install --omit=peer --frozen-lockfile
+          bun run build
+
+      - name: Run Real End-to-End Smoke Test
+        env:
+          MEMORIA_SMOKE_TEST_SERVER_BIN: ${{ github.workspace }}/target/release/server
+          MEMORIA_SMOKE_TEST_MCP_BIN: ${{ github.workspace }}/target/release/mcp
+          MEMORIA_SMOKE_TEST_PLUGIN_DIST: ${{ github.workspace }}/integrations/opencode-plugin/dist/index.js
+          MEMORIA_SMOKE_TEST_OLLAMA_MODEL: qwen2.5:0.5b
+        run: bash scripts/smoke-test-opencode-plugin.sh
