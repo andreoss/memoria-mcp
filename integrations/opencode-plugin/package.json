@@ -1,0 +1,39 @@
+{
+  "name": "@memoria/opencode-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "memoria persistent memory plugin for OpenCode — automatic capture, pre-prompt recall, and identity export across sessions",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "private": true,
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm --entry-naming index.[ext] && tsc --emitDeclarationOnly --outDir dist --declaration",
+    "type-check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "opencode": {
+    "type": "plugin",
+    "hooks": [
+      "event",
+      "chat.message",
+      "experimental.chat.messages.transform",
+      "shell.env"
+    ]
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.23"
+  },
+  "devDependencies": {
+    "bun-types": ">=1.3.13",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "bun": ">=1.0.0"
+  }
+}
