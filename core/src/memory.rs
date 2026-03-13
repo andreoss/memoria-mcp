@@ -1,5 +1,5 @@
 use crate::embedding::{EmbeddingConfig, EmbeddingProvider};
-use crate::llm::{extract_facts, LlmConfig, LlmProvider, Message, Role};
+use crate::llm::{extract_facts, summarize_procedure, LlmConfig, LlmProvider, Message, Role};
 use crate::vector_store::{VectorRecord, VectorStore, VectorStoreConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -414,6 +414,22 @@ where
                 }
             }
         }
+        if scope.get("memory_type").map(String::as_str) == Some("procedural_memory") && scope.contains_key("agent_id") {
+            let summary = summarize_procedure(&self.llm, messages)?;
+            let vector = self.embedding.embed(&summary)?;
+            let id = next_record_id();
+            let mut payload = scope;
+            payload.insert("content".to_string(), summary.clone());
+            let record = VectorRecord::new(id.clone(), vector, payload);
+            self.vector_store.insert(record)?;
+            self.history
+                .lock()
+                .expect("lock poisoned")
+                .entry(id.clone())
+                .or_default()
+                .push(HistoryEntry { event: HistoryEvent::Added, content: summary });
+            return Ok(vec![id]);
+        }
         let items: Vec<(String, Option<Role>)> = if infer {
             extract_facts(&self.llm, messages)?.into_iter().map(|fact| (fact, None)).collect()
         } else {
@@ -750,6 +766,47 @@ mod tests {
         let messages = [Message::new(Role::User, "First message."), Message::new(Role::User, "Second message.")];
         let ids = memory.add(&messages, scope(), false).expect("add should succeed");
         assert_eq!(ids.len(), 2, "infer=false must produce exactly one record per input message");
+    }
+
+    #[test]
+    fn test_add_with_procedural_memory_type_and_agent_id_creates_one_summarized_record() {
+        let llm = FakeLlmProvider::with_response("1. Called the API. Result: 200 OK.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Call the API."), Message::new(Role::Assistant, "Called it, got 200 OK.")];
+        let mut scope = HashMap::new();
+        scope.insert("agent_id".to_string(), "agent-1".to_string());
+        scope.insert("memory_type".to_string(), "procedural_memory".to_string());
+
+        let ids = memory.add(&messages, scope, true).expect("add should succeed");
+        assert_eq!(ids.len(), 1, "procedural memory must always produce exactly one summarized record, not one per message or fact");
+        let record = memory.vector_store.get(&ids[0]).unwrap().unwrap();
+        assert_eq!(record.payload.get("content"), Some(&"1. Called the API. Result: 200 OK.".to_string()));
+        assert_eq!(record.payload.get("memory_type"), Some(&"procedural_memory".to_string()));
+        assert_eq!(record.payload.get("agent_id"), Some(&"agent-1".to_string()));
+    }
+
+    #[test]
+    fn test_add_with_procedural_memory_type_but_no_agent_id_falls_back_to_normal_extraction() {
+        let llm = FakeLlmProvider::with_facts("Alice is an engineer.");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Alice is an engineer.")];
+        let mut scope = HashMap::new();
+        scope.insert("user_id".to_string(), "alice".to_string());
+        scope.insert("memory_type".to_string(), "procedural_memory".to_string());
+
+        let ids = memory.add(&messages, scope, true).expect("add should succeed");
+        let record = memory.vector_store.get(&ids[0]).unwrap().unwrap();
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"Alice is an engineer.".to_string()),
+            "without agent_id, memory_type=procedural_memory must not trigger summarization"
+        );
     }
 
     #[test]

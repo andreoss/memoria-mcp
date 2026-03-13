@@ -141,6 +141,32 @@ fn parse_facts(response: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::missing_errors_doc)]
+pub fn summarize_procedure(provider: &impl LlmProvider, conversation: &[Message]) -> Result<String, LlmError> {
+    let system = Message::new(
+        Role::System,
+        "You are a memory summarization system that records the complete interaction \
+         history of an agent carrying out a task. Produce one comprehensive summary that \
+         preserves every detail needed to continue the task without ambiguity: the overall \
+         objective, progress so far, and each action taken together with its exact, \
+         unaltered result (data returned, errors encountered, decisions made). Do not \
+         paraphrase or drop any action's result. Number the steps in chronological order.",
+    );
+    let user = Message::new(
+        Role::User,
+        format!(
+            "Conversation:\n{}\n\nCreate a procedural memory of the above conversation.",
+            conversation
+                .iter()
+                .map(|m| format!("{:?}: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    );
+    let completion = provider.complete(&[system, user])?;
+    Ok(completion.content.trim().to_string())
+}
+
 pub struct LocalSentenceLlmProvider;
 
 impl LocalSentenceLlmProvider {
