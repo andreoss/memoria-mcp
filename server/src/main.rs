@@ -848,6 +848,42 @@ where
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MessageResponse {
+    message: String,
+}
+
+fn handle_delete_entity<L, E, V>(
+    admin_key: Option<&str>,
+    auth_store: &auth_store::AuthStore,
+    jwt_secret: &[u8],
+    headers: &[(String, String)],
+    memory: &Memory<L, E, V>,
+    entity_type: &str,
+    entity_id: &str,
+) -> (u16, Vec<u8>)
+where
+    L: core::llm::LlmProvider,
+    E: core::embedding::EmbeddingProvider,
+    V: core::vector_store::VectorStore,
+{
+    if !caller_is_admin(admin_key, auth_store, jwt_secret, headers) {
+        return (403, error_body("admin access required"));
+    }
+    let field = match entity_type {
+        "user" => "user_id",
+        "agent" => "agent_id",
+        "run" => "run_id",
+        other => return (400, error_body(format!("invalid entity_type '{other}': must be one of user, agent, run"))),
+    };
+    let mut scope = HashMap::new();
+    scope.insert(field.to_string(), entity_id.to_string());
+    match memory.reset(&scope, None) {
+        Ok(_) => (200, serde_json::to_vec(&MessageResponse { message: "Entity deleted".to_string() }).unwrap_or_default()),
+        Err(err) => error_response(&err),
+    }
+}
+
 fn handle_reset_all<L, E, V>(
     admin_key: Option<&str>,
     auth_store: &auth_store::AuthStore,
@@ -1489,6 +1525,30 @@ where
     .await
 }
 
+async fn axum_handle_delete_entity<L, E, V>(
+    State(state): State<Arc<ServerState<L, E, V>>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    axum::extract::Path((entity_type, entity_id)): axum::extract::Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response
+where
+    L: core::llm::LlmProvider + Send + Sync + 'static,
+    E: core::embedding::EmbeddingProvider + Send + Sync + 'static,
+    V: core::vector_store::VectorStore + Send + Sync + 'static,
+{
+    let request_headers = headers_from_map(&headers);
+    let path = format!("/entities/{entity_type}/{entity_id}");
+    wrap_handler(state, peer_addr.ip(), "DELETE".to_string(), path, request_headers.clone(), move |state| {
+        let result =
+            handle_delete_entity(state.token.as_deref(), &state.auth_store, &state.jwt_secret, &request_headers, &state.memory, &entity_type, &entity_id);
+        if state.persist_json_snapshot && result.0 == 200 {
+            let _ = save_store(&state.memory, &state.store_path);
+        }
+        result
+    })
+    .await
+}
+
 async fn axum_handle_get_configure<L, E, V>(
     State(state): State<Arc<ServerState<L, E, V>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -1833,6 +1893,7 @@ where
         .route("/api-keys", post(axum_handle_create_api_key::<L, E, V>).get(axum_handle_list_api_keys::<L, E, V>))
         .route("/api-keys/{id}", delete(axum_handle_revoke_api_key::<L, E, V>))
         .route("/entities", get(axum_handle_list_entities::<L, E, V>))
+        .route("/entities/{entity_type}/{entity_id}", delete(axum_handle_delete_entity::<L, E, V>))
         .route("/configure", get(axum_handle_get_configure::<L, E, V>))
         .route("/configure/providers", get(axum_handle_get_configure_providers::<L, E, V>))
         .route("/generate-instructions", post(axum_handle_generate_instructions::<L, E, V>))
@@ -3415,6 +3476,42 @@ mod tests {
         let store = auth_store::AuthStore::new();
         let (status, _) = handle_delete_all(Some("admin-secret"), &store, b"jwt-secret", &[], &memory, br#"{"user_id":"alice"}"#);
         assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn handle_delete_entity_removes_only_the_matching_entitys_memories() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        handle_create_memory(&memory, br#"{"content":"Alice's fact.","user_id":"alice","infer":false}"#);
+        handle_create_memory(&memory, br#"{"content":"Bob's fact.","user_id":"bob","infer":false}"#);
+
+        let (status, response_body) =
+            handle_delete_entity(Some("admin-secret"), &store, b"jwt-secret", &bearer_headers(&token), &memory, "user", "alice");
+        assert_eq!(status, 200);
+        let response: MessageResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        assert_eq!(response.message, "Entity deleted");
+
+        let remaining = memory.list_all(0, 100, true, None).expect("list should succeed");
+        assert_eq!(remaining.len(), 1, "only alice's memory should have been deleted");
+    }
+
+    #[test]
+    fn handle_delete_entity_rejects_a_non_admin_caller() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let (status, _) = handle_delete_entity(Some("admin-secret"), &store, b"jwt-secret", &[], &memory, "user", "alice");
+        assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn handle_delete_entity_rejects_an_invalid_entity_type() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let store = auth_store::AuthStore::new();
+        let token = seed_user_cheaply_and_get_access_token(&store, "correct horse battery staple");
+        let (status, _) =
+            handle_delete_entity(Some("admin-secret"), &store, b"jwt-secret", &bearer_headers(&token), &memory, "project", "alice");
+        assert_eq!(status, 400);
     }
 
     #[test]
