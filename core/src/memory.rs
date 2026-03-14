@@ -452,6 +452,11 @@ where
         }
         if scope.get("memory_type").map(String::as_str) == Some("procedural_memory") && scope.contains_key("agent_id") {
             let summary = summarize_procedure(&self.llm, messages)?;
+            if summary.is_empty() {
+                return Err(crate::CoreError::Validation(
+                    "the LLM returned no content for the procedural memory summary -- the model may have declined the request or returned an empty response".to_string(),
+                ));
+            }
             let vector = self.embedding.embed(&summary)?;
             let id = next_record_id();
             let mut payload = scope;
@@ -919,6 +924,25 @@ mod tests {
         assert_eq!(record.payload.get("content"), Some(&"1. Called the API. Result: 200 OK.".to_string()));
         assert_eq!(record.payload.get("memory_type"), Some(&"procedural_memory".to_string()));
         assert_eq!(record.payload.get("agent_id"), Some(&"agent-1".to_string()));
+    }
+
+    #[test]
+    fn test_add_with_procedural_memory_rejects_an_empty_llm_summary() {
+        let llm = FakeLlmProvider::with_response("");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Call the API.")];
+        let mut scope = HashMap::new();
+        scope.insert("agent_id".to_string(), "agent-1".to_string());
+        scope.insert("memory_type".to_string(), "procedural_memory".to_string());
+
+        let result = memory.add(&messages, scope, true);
+        assert!(
+            matches!(result, Err(crate::CoreError::Validation(_))),
+            "an empty LLM summary must be a real, clear error, not a silently-created empty record"
+        );
     }
 
     #[test]
