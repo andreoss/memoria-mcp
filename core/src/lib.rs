@@ -2,6 +2,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod embedding;
+pub mod entity;
 pub mod error;
 pub mod filter;
 pub mod llm;
