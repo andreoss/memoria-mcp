@@ -122,7 +122,7 @@ jobs:
         run: cargo test -p memoria-core -p server -p mcp --features postgres
 
   test-real-pgvector:
-    name: Real pgvector Contract Test (ADR-46 Increment 2)
+    name: Real pgvector Contract + Hybrid Search Test (ADR-46 Increments 2-3)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -157,6 +157,12 @@ jobs:
           MEMORIA_TEST_POSTGRES_URL: postgres://postgres:memoria@127.0.0.1:5432/memoria
         run: |
           cargo test -p server -p mcp --features postgres resolve_vector_store_postgres_choice_builds -- --ignored
+
+      - name: Run Real PgVectorStore Hybrid Search Test (Memory::search combining semantic + Postgres full-text keyword_search)
+        env:
+          MEMORIA_TEST_POSTGRES_URL: postgres://postgres:memoria@127.0.0.1:5432/memoria
+        run: |
+          cargo test -p memoria-core --features postgres real_postgres_hybrid_search -- --ignored
 
   coverage:
     name: Code Coverage (core, all features, reported not gated)

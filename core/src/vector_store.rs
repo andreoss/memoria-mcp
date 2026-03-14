@@ -790,6 +790,11 @@ impl PgVectorStore {
             &mut client,
             &format!("CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, vector VECTOR({dimension}) NOT NULL, payload JSONB NOT NULL)"),
         )?;
+        Self::run_idempotent_ddl(
+            &mut client,
+            &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', payload ->> 'content')) STORED"),
+        )?;
+        Self::run_idempotent_ddl(&mut client, &format!("CREATE INDEX IF NOT EXISTS {table}_content_tsv_idx ON {table} USING GIN (content_tsv)"))?;
         Ok(Self { client: Mutex::new(client), dimension, table: table.to_string() })
     }
 
@@ -798,7 +803,8 @@ impl PgVectorStore {
             Ok(_) => Ok(()),
             Err(err)
                 if err.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION)
-                    || err.code() == Some(&postgres::error::SqlState::DUPLICATE_TABLE) =>
+                    || err.code() == Some(&postgres::error::SqlState::DUPLICATE_TABLE)
+                    || err.code() == Some(&postgres::error::SqlState::DUPLICATE_COLUMN) =>
             {
                 Ok(())
             }
@@ -925,6 +931,33 @@ impl VectorStore for PgVectorStore {
     fn reset(&self) -> Result<(), VectorStoreError> {
         let mut client = self.client.lock().expect("lock poisoned");
         client.execute(&format!("DELETE FROM {}", self.table), &[]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
+    }
+
+    fn keyword_search(&self, query: &str, top_k: usize, filters: &HashMap<String, String>) -> Result<Option<Vec<SearchResult>>, VectorStoreError> {
+        let filters_json = Self::filters_to_jsonb(filters);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let limit = top_k.min(i64::MAX as usize) as i64;
+        let mut client = self.client.lock().expect("lock poisoned");
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT id, -ts_rank_cd(content_tsv, plainto_tsquery('english', $1)) AS score, payload FROM {} \
+                     WHERE content_tsv @@ plainto_tsquery('english', $1) AND payload @> $2::jsonb ORDER BY score LIMIT $3",
+                    self.table
+                ),
+                &[&query, &filters_json, &limit],
+            )
+            .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(client);
+        let rows = rows?;
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get(0);
+            let score: f32 = row.get(1);
+            let payload = Self::decode_payload(row.get(2))?;
+            results.push(SearchResult { id, score, payload });
+        }
+        Ok(Some(results))
     }
 }
 
@@ -1521,6 +1554,112 @@ mod tests {
             };
             let result = PgVectorStore::open(&url, 2, "records; DROP TABLE records;--");
             assert!(result.is_err(), "an unsafe table name must be rejected before it ever reaches a SQL statement");
+        }
+
+        fn record_with_content(id: &str, content: &str, scope: &[(&str, &str)]) -> VectorRecord {
+            let mut payload: HashMap<String, String> = scope.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+            payload.insert("content".to_string(), content.to_string());
+            VectorRecord::new(id, vec![0.0, 0.0], payload)
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_finds_a_real_match_by_content() {
+            let Some(store) = temp_store("keyword_match") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            store.insert(record_with_content("a", "the quick brown fox jumps", &[])).expect("insert should succeed");
+            store.insert(record_with_content("b", "a lazy dog sleeps all day", &[])).expect("insert should succeed");
+
+            let results = store.keyword_search("fox", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["a"], "only the record containing the query term should match");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_ranks_the_better_match_first() {
+            let Some(store) = temp_store("keyword_rank") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            store.insert(record_with_content("weak", "rust is mentioned once here", &[])).expect("insert should succeed");
+            store.insert(record_with_content("strong", "rust rust rust programming in rust", &[])).expect("insert should succeed");
+
+            let results = store.keyword_search("rust", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            assert_eq!(results[0].id, "strong", "the record with stronger term frequency should rank first, got: {results:?}");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_respects_filters() {
+            let Some(store) = temp_store("keyword_filters") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            store.insert(record_with_content("alice-rec", "engineer working on rust", &[("user_id", "alice")])).expect("insert should succeed");
+            store.insert(record_with_content("bob-rec", "engineer working on rust", &[("user_id", "bob")])).expect("insert should succeed");
+
+            let filters = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+            let results = store.keyword_search("engineer", 10, &filters).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["alice-rec"], "keyword_search must respect the same scope filters as search");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_respects_top_k() {
+            let Some(store) = temp_store("keyword_top_k") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            for i in 0..5 {
+                store.insert(record_with_content(&format!("rec-{i}"), "rust rust rust", &[])).expect("insert should succeed");
+            }
+            let results = store.keyword_search("rust", 2, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            assert_eq!(results.len(), 2);
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_treats_special_characters_as_literal_terms_not_tsquery_syntax() {
+            let Some(store) = temp_store("keyword_special_chars") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            store.insert(record_with_content("a", "rust programming language", &[])).expect("insert should succeed");
+
+            let result = store.keyword_search("rust' OR '1'='1", 10, &HashMap::new());
+            assert!(result.is_ok(), "special characters in the query must never cause a backend error, got: {result:?}");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_stays_in_sync_after_update() {
+            let Some(store) = temp_store("keyword_sync_update") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            let record = record_with_content("a", "original content about gardening", &[]);
+            store.insert(record.clone()).expect("insert should succeed");
+
+            let mut updated = record;
+            updated.payload.insert("content".to_string(), "updated content about astronomy".to_string());
+            store.update(updated).expect("update should succeed");
+
+            let old_term_results = store.keyword_search("gardening", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            assert!(old_term_results.is_empty(), "the old content's term must no longer match after an update -- the generated column must recompute automatically, with no manual sync step");
+
+            let new_term_results = store.keyword_search("astronomy", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            assert_eq!(new_term_results.len(), 1, "the updated content's term must match");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn pg_store_keyword_search_stays_in_sync_after_delete() {
+            let Some(store) = temp_store("keyword_sync_delete") else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            store.insert(record_with_content("a", "ephemeral content", &[])).expect("insert should succeed");
+            store.delete("a").expect("delete should succeed");
+
+            let results = store.keyword_search("ephemeral", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
+            assert!(results.is_empty(), "a deleted record must not surface in keyword_search results");
         }
     }
 }

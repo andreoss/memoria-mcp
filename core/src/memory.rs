@@ -2858,4 +2858,43 @@ mod tests {
             );
         }
     }
+
+    #[cfg(feature = "postgres")]
+    mod postgres_hybrid_search_tests {
+        use super::*;
+        use crate::embedding::LocalHashEmbeddingProvider;
+        use crate::llm::LocalSentenceLlmProvider;
+        use crate::vector_store::PgVectorStore;
+
+        fn test_url() -> Option<String> {
+            std::env::var("MEMORIA_TEST_POSTGRES_URL").ok()
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn real_postgres_hybrid_search_promotes_a_much_stronger_keyword_match() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            let table = format!("memoria_pg_hybrid_search_test_{}", std::process::id());
+            let store = PgVectorStore::open(&url, 8, &table).expect("open should succeed");
+            store.reset().expect("reset should succeed");
+            let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), store);
+
+            memory
+                .add(&[Message::new(Role::User, "keyword needle keyword needle keyword needle")], scope(), false)
+                .expect("add should succeed");
+            memory.add(&[Message::new(Role::User, "totally unrelated filler content here")], scope(), false).expect("add should succeed");
+
+            let results = memory.search("needle", 2, &scope(), None, false, None, false).expect("search should succeed");
+
+            assert_eq!(results.len(), 2, "both records should be returned");
+            assert!(
+                results[0].payload.get("content").is_some_and(|c| c.contains("needle")),
+                "a real Postgres tsvector keyword match should surface the matching record first through Memory::search's hybrid combination, got: {results:?}"
+            );
+
+            memory.vector_store.reset().expect("cleanup reset should succeed");
+        }
+    }
 }
