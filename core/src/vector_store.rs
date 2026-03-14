@@ -770,6 +770,153 @@ impl VectorStore for SqliteVectorStore {
     }
 }
 
+#[cfg(feature = "postgres")]
+pub struct PgVectorStore {
+    client: Mutex<postgres::Client>,
+    dimension: usize,
+    table: String,
+}
+
+#[cfg(feature = "postgres")]
+impl PgVectorStore {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn open(connection_string: &str, dimension: usize, table: &str) -> Result<Self, VectorStoreError> {
+        if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || table.is_empty() {
+            return Err(VectorStoreError::Backend(format!("invalid table name: {table}")));
+        }
+        let mut client = postgres::Client::connect(connection_string, postgres::NoTls).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        client.execute("CREATE EXTENSION IF NOT EXISTS vector", &[]).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        client
+            .execute(
+                &format!("CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, vector VECTOR({dimension}) NOT NULL, payload JSONB NOT NULL)"),
+                &[],
+            )
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        Ok(Self { client: Mutex::new(client), dimension, table: table.to_string() })
+    }
+
+    fn decode_payload(value: serde_json::Value) -> Result<HashMap<String, String>, VectorStoreError> {
+        serde_json::from_value(value).map_err(|err| VectorStoreError::Backend(err.to_string()))
+    }
+
+    fn filters_to_jsonb(filters: &HashMap<String, String>) -> serde_json::Value {
+        serde_json::Value::Object(filters.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl VectorStore for PgVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        if record.vector.len() != self.dimension {
+            return Err(VectorStoreError::DimensionMismatch { expected: self.dimension, actual: record.vector.len() });
+        }
+        let vector = pgvector::Vector::from(record.vector);
+        let payload = serde_json::to_value(&record.payload).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let mut client = self.client.lock().expect("lock poisoned");
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {} (id, vector, payload) VALUES ($1, $2, $3) \
+                     ON CONFLICT (id) DO UPDATE SET vector = excluded.vector, payload = excluded.payload",
+                    self.table
+                ),
+                &[&record.id, &vector, &payload],
+            )
+            .map(|_| ())
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>, threshold: Option<f32>) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let query_vector = pgvector::Vector::from(vector.to_vec());
+        let filters_json = Self::filters_to_jsonb(filters);
+        let mut client = self.client.lock().expect("lock poisoned");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let limit = top_k.min(i64::MAX as usize) as i64;
+        let rows = if let Some(threshold) = threshold {
+            client
+                .query(
+                    &format!(
+                        "SELECT id, vector <-> $1 AS distance, payload FROM {} \
+                         WHERE payload @> $2::jsonb AND vector <-> $1 <= $3 ORDER BY distance LIMIT $4",
+                        self.table
+                    ),
+                    &[&query_vector, &filters_json, &f64::from(threshold), &limit],
+                )
+                .map_err(|err| VectorStoreError::Backend(err.to_string()))?
+        } else {
+            client
+                .query(
+                    &format!("SELECT id, vector <-> $1 AS distance, payload FROM {} WHERE payload @> $2::jsonb ORDER BY distance LIMIT $3", self.table),
+                    &[&query_vector, &filters_json, &limit],
+                )
+                .map_err(|err| VectorStoreError::Backend(err.to_string()))?
+        };
+        drop(client);
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get(0);
+            #[allow(clippy::cast_possible_truncation)]
+            let score = row.get::<_, f64>(1) as f32;
+            let payload = Self::decode_payload(row.get(2))?;
+            results.push(SearchResult { id, score, payload });
+        }
+        Ok(results)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        let mut client = self.client.lock().expect("lock poisoned");
+        let row = client
+            .query_opt(&format!("SELECT vector, payload FROM {} WHERE id = $1", self.table), &[&id])
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        drop(client);
+        match row {
+            Some(row) => {
+                let vector: pgvector::Vector = row.get(0);
+                let payload = Self::decode_payload(row.get(1))?;
+                Ok(Some(VectorRecord { id: id.to_string(), vector: vector.to_vec(), payload }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        let vector = pgvector::Vector::from(record.vector);
+        let payload = serde_json::to_value(&record.payload).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let mut client = self.client.lock().expect("lock poisoned");
+        let affected = client
+            .execute(&format!("UPDATE {} SET vector = $2, payload = $3 WHERE id = $1", self.table), &[&record.id, &vector, &payload])
+            .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(client);
+        if affected? == 0 {
+            return Err(VectorStoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        let mut client = self.client.lock().expect("lock poisoned");
+        client.execute(&format!("DELETE FROM {} WHERE id = $1", self.table), &[&id]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let limit = limit.min(i64::MAX as usize) as i64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let offset = offset.min(i64::MAX as usize) as i64;
+        let mut client = self.client.lock().expect("lock poisoned");
+        let rows = client
+            .query(&format!("SELECT id FROM {} ORDER BY id LIMIT $1 OFFSET $2", self.table), &[&limit, &offset])
+            .map_err(|err| VectorStoreError::Backend(err.to_string()));
+        drop(client);
+        Ok(rows?.into_iter().map(|row| row.get(0)).collect())
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        let mut client = self.client.lock().expect("lock poisoned");
+        client.execute(&format!("DELETE FROM {}", self.table), &[]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InMemoryVectorStore, VectorStore, VectorStoreConfig, VectorStoreContractTests};
@@ -1238,6 +1385,107 @@ mod tests {
 
             drop(boxed);
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    mod postgres_tests {
+        use super::super::{PgVectorStore, VectorRecord, VectorStore, VectorStoreContractTests};
+        use std::collections::HashMap;
+
+        fn test_url() -> Option<String> {
+            std::env::var("MEMORIA_TEST_POSTGRES_URL").ok()
+        }
+
+        struct TempStore {
+            store: PgVectorStore,
+        }
+
+        impl Drop for TempStore {
+            fn drop(&mut self) {
+                let _ = self.store.reset();
+            }
+        }
+
+        impl std::ops::Deref for TempStore {
+            type Target = PgVectorStore;
+            fn deref(&self) -> &Self::Target {
+                &self.store
+            }
+        }
+
+        fn temp_store(name: &str) -> Option<TempStore> {
+            let url = test_url()?;
+            let table = format!("memoria_pg_test_{name}_{}", std::process::id());
+            let store = PgVectorStore::open(&url, 2, &table).expect("open should succeed");
+            store.reset().expect("reset should succeed");
+            Some(TempStore { store })
+        }
+
+        macro_rules! pg_contract_test {
+            ($test_name:ident, $slug:literal, $contract:ident) => {
+                #[test]
+                #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+                fn $test_name() {
+                    let Some(store) = temp_store($slug) else {
+                        panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+                    };
+                    store.$contract();
+                }
+            };
+        }
+
+        pg_contract_test!(pg_store_passes_insert_then_get_contract, "insert_then_get", contract_insert_then_get_round_trips);
+        pg_contract_test!(pg_store_passes_delete_then_get_contract, "delete_then_get", contract_delete_then_get_returns_none);
+        pg_contract_test!(pg_store_passes_reset_contract, "reset", contract_reset_clears_everything);
+        pg_contract_test!(pg_store_passes_search_respects_top_k_contract, "search_top_k", contract_search_respects_top_k);
+        pg_contract_test!(pg_store_passes_search_orders_by_score_contract, "search_orders", contract_search_orders_by_score);
+        pg_contract_test!(pg_store_passes_search_respects_threshold_contract, "search_threshold", contract_search_respects_threshold);
+        pg_contract_test!(
+            pg_store_passes_search_with_no_threshold_returns_everything_contract,
+            "search_no_threshold",
+            contract_search_with_no_threshold_returns_everything_up_to_top_k
+        );
+        pg_contract_test!(pg_store_passes_search_filters_by_metadata_key_contract, "search_filters_metadata", contract_search_filters_by_metadata_key);
+        pg_contract_test!(pg_store_passes_search_filters_by_agent_id_contract, "search_filters_agent", contract_search_filters_by_agent_id);
+        pg_contract_test!(pg_store_passes_search_filters_by_run_id_contract, "search_filters_run", contract_search_filters_by_run_id);
+        pg_contract_test!(pg_store_passes_update_then_get_contract, "update_then_get", contract_update_then_get_reflects_change);
+        pg_contract_test!(pg_store_passes_update_nonexistent_contract, "update_nonexistent", contract_update_nonexistent_returns_not_found);
+        pg_contract_test!(pg_store_passes_delete_nonexistent_is_idempotent_contract, "delete_nonexistent", contract_delete_nonexistent_is_idempotent);
+        pg_contract_test!(pg_store_passes_list_returns_all_inserted_ids_contract, "list_all", contract_list_returns_all_inserted_ids);
+        pg_contract_test!(pg_store_passes_list_on_empty_store_returns_empty_contract, "list_empty", contract_list_on_empty_store_returns_empty);
+        pg_contract_test!(pg_store_passes_insert_rejects_mismatched_dimension_contract, "dimension_mismatch", contract_insert_rejects_mismatched_dimension);
+        pg_contract_test!(pg_store_passes_list_pagination_respects_offset_and_limit_contract, "pagination", contract_list_pagination_respects_offset_and_limit);
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn records_survive_reopening_the_same_table() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            let table = format!("memoria_pg_test_durability_{}", std::process::id());
+            {
+                let store = PgVectorStore::open(&url, 3, &table).expect("open should succeed");
+                store.reset().expect("reset should succeed");
+                store
+                    .insert(VectorRecord::new("rec-1", vec![1.0, 2.0, 3.0], HashMap::from([("user_id".to_string(), "alice".to_string())])))
+                    .expect("insert should succeed");
+            }
+            let reopened = PgVectorStore::open(&url, 3, &table).expect("reopen should succeed");
+            let record = reopened.get("rec-1").expect("get should succeed").expect("record should survive reopening the store");
+            assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
+            assert_eq!(record.payload.get("user_id"), Some(&"alice".to_string()));
+            reopened.reset().expect("cleanup reset should succeed");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn open_rejects_an_unsafe_table_name() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            let result = PgVectorStore::open(&url, 2, "records; DROP TABLE records;--");
+            assert!(result.is_err(), "an unsafe table name must be rejected before it ever reaches a SQL statement");
         }
     }
 }

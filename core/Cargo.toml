@@ -21,6 +21,8 @@ candle-core = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
+postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
+pgvector = { version = "0.4", default-features = false, features = ["postgres"], optional = true }
 
 [features]
 serde = ["dep:serde"]
@@ -28,3 +30,4 @@ ollama = ["dep:reqwest"]
 fastembed = ["dep:fastembed"]
 sqlite = ["dep:rusqlite"]
 candle = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+postgres = ["dep:postgres", "dep:pgvector"]

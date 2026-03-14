@@ -1150,6 +1150,9 @@ fn resolve_vector_store(
     choice: Option<&str>,
     json_snapshot_path: &Path,
     sqlite_path: &Path,
+    postgres_url: Option<&str>,
+    postgres_dimension: Option<&str>,
+    postgres_table: Option<&str>,
 ) -> Result<(Box<dyn VectorStore + Send + Sync>, bool, String), String> {
     match choice.unwrap_or("local") {
         "local" => {
@@ -1169,7 +1172,29 @@ fn resolve_vector_store(
                 Err("MEMORIA_VECTOR_STORE=sqlite requires the server binary to be built with --features sqlite".to_string())
             }
         }
-        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"local\" or \"sqlite\")")),
+        "postgres" => {
+            #[cfg(feature = "postgres")]
+            {
+                let url = postgres_url
+                    .ok_or_else(|| "MEMORIA_VECTOR_STORE=postgres requires MEMORIA_POSTGRES_URL to be set".to_string())?;
+                let dimension: usize = postgres_dimension
+                    .ok_or_else(|| {
+                        "MEMORIA_VECTOR_STORE=postgres requires MEMORIA_POSTGRES_DIMENSION to be set (Postgres's native VECTOR(N) column needs a fixed dimension; see ADR-46)".to_string()
+                    })?
+                    .parse()
+                    .map_err(|_| "MEMORIA_POSTGRES_DIMENSION must be a positive integer".to_string())?;
+                let table = postgres_table.unwrap_or("memoria_vectors");
+                let store = core::vector_store::PgVectorStore::open(url, dimension, table).map_err(|err| err.to_string())?;
+                let label = format!("PgVectorStore (table {table}, dimension {dimension}; see ADR-46)");
+                Ok((Box::new(store), false, label))
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = (json_snapshot_path, sqlite_path, postgres_url, postgres_dimension, postgres_table);
+                Err("MEMORIA_VECTOR_STORE=postgres requires the server binary to be built with --features postgres".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"local\", \"sqlite\", or \"postgres\")")),
     }
 }
 
@@ -2018,8 +2043,17 @@ fn main() {
     let store_path = resolve_store_path(std::env::var("MEMORIA_STORE_PATH").ok().as_deref(), &home);
     let sqlite_path = resolve_sqlite_path(std::env::var("MEMORIA_SQLITE_PATH").ok().as_deref(), &home);
     let vector_store_choice = std::env::var("MEMORIA_VECTOR_STORE").ok();
-    let (vector_store, persist_json_snapshot, vector_store_label) =
-        match resolve_vector_store(vector_store_choice.as_deref(), &store_path, &sqlite_path) {
+    let postgres_url = std::env::var("MEMORIA_POSTGRES_URL").ok();
+    let postgres_dimension = std::env::var("MEMORIA_POSTGRES_DIMENSION").ok();
+    let postgres_table = std::env::var("MEMORIA_POSTGRES_TABLE").ok();
+    let (vector_store, persist_json_snapshot, vector_store_label) = match resolve_vector_store(
+        vector_store_choice.as_deref(),
+        &store_path,
+        &sqlite_path,
+        postgres_url.as_deref(),
+        postgres_dimension.as_deref(),
+        postgres_table.as_deref(),
+    ) {
             Ok(resolved) => resolved,
             Err(message) => {
                 eprintln!("{message}");
@@ -2571,7 +2605,8 @@ mod tests {
     fn resolve_vector_store_defaults_to_local_and_persists_json_snapshot() {
         let dir = std::env::temp_dir().join(format!("memoria-resolve-vector-store-default-{}", std::process::id()));
         let path = dir.join("does-not-exist.json");
-        let (_, persist_json_snapshot, label) = resolve_vector_store(None, &path, &dir.join("unused.db")).expect("expected a store");
+        let (_, persist_json_snapshot, label) =
+            resolve_vector_store(None, &path, &dir.join("unused.db"), None, None, None).expect("expected a store");
         assert!(label.contains("InMemoryVectorStore"), "got: {label}");
         assert!(persist_json_snapshot, "the local backend must keep saving JSON snapshots");
     }
@@ -2579,14 +2614,14 @@ mod tests {
     #[test]
     fn resolve_vector_store_rejects_an_unknown_choice() {
         let dir = std::env::temp_dir();
-        assert!(resolve_vector_store(Some("bogus"), &dir.join("a.json"), &dir.join("a.db")).is_err());
+        assert!(resolve_vector_store(Some("bogus"), &dir.join("a.json"), &dir.join("a.db"), None, None, None).is_err());
     }
 
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn resolve_vector_store_sqlite_choice_fails_clearly_without_the_feature() {
         let dir = std::env::temp_dir();
-        assert!(resolve_vector_store(Some("sqlite"), &dir.join("a.json"), &dir.join("a.db")).is_err());
+        assert!(resolve_vector_store(Some("sqlite"), &dir.join("a.json"), &dir.join("a.db"), None, None, None).is_err());
     }
 
     #[cfg(feature = "sqlite")]
@@ -2595,10 +2630,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("memoria-resolve-vector-store-sqlite-{}", std::process::id()));
         let db_path = dir.join("resolve-vector-store.db");
         let _ = std::fs::remove_file(&db_path);
-        let (_, persist_json_snapshot, label) = resolve_vector_store(Some("sqlite"), &dir.join("unused.json"), &db_path).expect("expected a store");
+        let (_, persist_json_snapshot, label) =
+            resolve_vector_store(Some("sqlite"), &dir.join("unused.json"), &db_path, None, None, None).expect("expected a store");
         assert!(label.contains("SqliteVectorStore"), "got: {label}");
         assert!(!persist_json_snapshot, "the sqlite backend persists itself; it must not also write a JSON snapshot");
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[test]
+    fn resolve_vector_store_postgres_choice_fails_clearly_without_the_feature() {
+        let dir = std::env::temp_dir();
+        assert!(resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), Some("postgres://x"), Some("2"), None).is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn resolve_vector_store_postgres_choice_requires_url() {
+        let dir = std::env::temp_dir();
+        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), None, Some("2"), None).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_POSTGRES_URL"), "got: {err}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn resolve_vector_store_postgres_choice_requires_dimension() {
+        let dir = std::env::temp_dir();
+        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), Some("postgres://x"), None, None).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_POSTGRES_DIMENSION"), "got: {err}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn resolve_vector_store_postgres_choice_rejects_a_non_numeric_dimension() {
+        let dir = std::env::temp_dir();
+        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), Some("postgres://x"), Some("not-a-number"), None).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_POSTGRES_DIMENSION"), "got: {err}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+    fn resolve_vector_store_postgres_choice_builds_and_does_not_persist_json_snapshot() {
+        let url = std::env::var("MEMORIA_TEST_POSTGRES_URL").expect("MEMORIA_TEST_POSTGRES_URL must be set for this test");
+        let dir = std::env::temp_dir();
+        let table = format!("memoria_resolve_vector_store_test_{}", std::process::id());
+        let (_, persist_json_snapshot, label) =
+            resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), Some(&url), Some("2"), Some(&table))
+                .expect("expected a store");
+        assert!(label.contains("PgVectorStore"), "got: {label}");
+        assert!(!persist_json_snapshot, "the postgres backend persists itself; it must not also write a JSON snapshot");
     }
 
     #[test]
