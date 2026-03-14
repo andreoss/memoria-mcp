@@ -11,6 +11,8 @@ const ENTITY_RECORD_KIND_VALUE: &str = "entity";
 const ENTITY_TYPE_KEY: &str = "entity_type";
 const ENTITY_TEXT_KEY: &str = "entity_text";
 const LINKED_MEMORY_IDS_KEY: &str = "linked_memory_ids";
+const ENTITY_BOOST_FRACTION: f32 = 0.15;
+const ENTITY_MATCHES_PER_QUERY_ENTITY: usize = 5;
 
 fn is_entity_record(payload: &HashMap<String, String>) -> bool {
     payload.get(ENTITY_RECORD_KIND_KEY).map(String::as_str) == Some(ENTITY_RECORD_KIND_VALUE)
@@ -235,6 +237,7 @@ where
                 combine_with_keyword_scores(&mut results, &keyword_results);
             }
         }
+        self.apply_entity_boost(query, scope, &mut results)?;
         results.truncate(top_k);
         if rerank {
             if let Some(reranker) = &self.reranker {
@@ -542,6 +545,52 @@ where
                 let record = VectorRecord::new(next_entity_record_id(), vector, payload);
                 self.vector_store.insert(record)?;
             }
+        }
+        Ok(())
+    }
+
+    fn apply_entity_boost(
+        &self,
+        query: &str,
+        scope: &HashMap<String, String>,
+        results: &mut [crate::vector_store::SearchResult],
+    ) -> Result<(), crate::CoreError> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let query_entities = extract_entities(query);
+        if query_entities.is_empty() {
+            return Ok(());
+        }
+        let mut boosted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (entity_type, entity_text) in query_entities {
+            let entity_type = match entity_type {
+                crate::entity::EntityType::Proper => "proper",
+                crate::entity::EntityType::Quoted => "quoted",
+            };
+            let vector = self.embedding.embed(&entity_text)?;
+            let mut entity_filters = scope.clone();
+            entity_filters.insert(ENTITY_RECORD_KIND_KEY.to_string(), ENTITY_RECORD_KIND_VALUE.to_string());
+            entity_filters.insert(ENTITY_TYPE_KEY.to_string(), entity_type.to_string());
+            let matches = self.vector_store.search(&vector, ENTITY_MATCHES_PER_QUERY_ENTITY, &entity_filters, None)?;
+            for matched in matches {
+                if let Some(linked) = matched.payload.get(LINKED_MEMORY_IDS_KEY) {
+                    boosted_ids.extend(linked.split(',').map(String::from));
+                }
+            }
+        }
+        if boosted_ids.is_empty() {
+            return Ok(());
+        }
+        let mut boosted_any = false;
+        for result in results.iter_mut() {
+            if boosted_ids.contains(&result.id) {
+                result.score *= 1.0 - ENTITY_BOOST_FRACTION;
+                boosted_any = true;
+            }
+        }
+        if boosted_any {
+            results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
         }
         Ok(())
     }
@@ -995,6 +1044,52 @@ mod tests {
         let entities = memory.list_entities().expect("list_entities should succeed");
         let alice = entities.iter().find(|e| e.entity_id == "alice").expect("alice entity");
         assert_eq!(alice.memory_count, 1, "the entity record's own scope fields must not inflate list_entities' real memory count");
+    }
+
+    #[test]
+    fn test_apply_entity_boost_lowers_the_score_of_a_record_linked_to_a_matching_entity() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let bob_ids = memory.add(&[Message::new(Role::User, "Bob Smith works at the office.")], scope(), false).expect("add should succeed");
+        let unrelated_ids = memory.add(&[Message::new(Role::User, "The weather was nice today.")], scope(), false).expect("add should succeed");
+
+        let mut results = vec![
+            crate::vector_store::SearchResult { id: unrelated_ids[0].clone(), score: 10.0, payload: HashMap::new() },
+            crate::vector_store::SearchResult { id: bob_ids[0].clone(), score: 10.5, payload: HashMap::new() },
+        ];
+        memory.apply_entity_boost("Tell me about Bob Smith", &scope(), &mut results).expect("boost should succeed");
+
+        let bob_result = results.iter().find(|r| r.id == bob_ids[0]).expect("bob's record");
+        assert!(bob_result.score < 10.5, "a record linked to a matching query entity must have its score lowered (lower is better), got {}", bob_result.score);
+        assert_eq!(results[0].id, bob_ids[0], "for two near-tied candidates, the boosted record must now rank first");
+    }
+
+    #[test]
+    fn test_apply_entity_boost_is_a_no_op_when_the_query_has_no_entities() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+        memory.add(&[Message::new(Role::User, "Bob Smith works at the office.")], scope(), false).expect("add should succeed");
+
+        let mut results = vec![crate::vector_store::SearchResult { id: "some-id".to_string(), score: 5.0, payload: HashMap::new() }];
+        memory.apply_entity_boost("just a plain lowercase query", &scope(), &mut results).expect("boost should succeed");
+        assert!((results[0].score - 5.0).abs() < 1e-6, "a query with no extractable entities must leave scores unchanged, got {}", results[0].score);
+    }
+
+    #[test]
+    fn test_apply_entity_boost_is_a_no_op_when_no_stored_entity_matches() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let mut results = vec![crate::vector_store::SearchResult { id: "some-id".to_string(), score: 5.0, payload: HashMap::new() }];
+        memory.apply_entity_boost("Nobody Special mentioned here", &scope(), &mut results).expect("boost should succeed");
+        assert!((results[0].score - 5.0).abs() < 1e-6, "a query entity with no matching stored entity record must leave scores unchanged, got {}", results[0].score);
     }
 
     #[test]
