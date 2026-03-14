@@ -1,9 +1,20 @@
 use crate::embedding::{EmbeddingConfig, EmbeddingProvider};
+use crate::entity::extract_entities;
 use crate::llm::{describe_image, extract_facts, summarize_procedure, LlmConfig, LlmProvider, Message, Role};
 use crate::vector_store::{VectorRecord, VectorStore, VectorStoreConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+const ENTITY_RECORD_KIND_KEY: &str = "__memoria_record_kind";
+const ENTITY_RECORD_KIND_VALUE: &str = "entity";
+const ENTITY_TYPE_KEY: &str = "entity_type";
+const ENTITY_TEXT_KEY: &str = "entity_text";
+const LINKED_MEMORY_IDS_KEY: &str = "linked_memory_ids";
+
+fn is_entity_record(payload: &HashMap<String, String>) -> bool {
+    payload.get(ENTITY_RECORD_KIND_KEY).map(String::as_str) == Some(ENTITY_RECORD_KIND_VALUE)
+}
 
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -14,6 +25,15 @@ fn next_record_id() -> String {
         .map_or(0, |d| d.as_nanos());
     let pid = std::process::id();
     format!("rec-{nanos}-{pid}-{n}")
+}
+
+fn next_entity_record_id() -> String {
+    let n = NEXT_RECORD_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let pid = std::process::id();
+    format!("entity-{nanos}-{pid}-{n}")
 }
 
 fn has_scope_id(scope: &HashMap<String, String>) -> bool {
@@ -202,6 +222,7 @@ where
         }
         let vector = self.embedding.embed(query)?;
         let mut results = self.vector_store.search(&vector, usize::MAX, scope, threshold)?;
+        results.retain(|r| !is_entity_record(&r.payload));
         if !show_expired {
             let today = today_ymd_string();
             results.retain(|r| !is_expired(&r.payload, &today));
@@ -271,7 +292,8 @@ where
                     return true;
                 };
                 let scope_matches = scope.is_none_or(|s| s.iter().all(|(k, v)| record.payload.get(k) == Some(v)));
-                scope_matches
+                !is_entity_record(&record.payload)
+                    && scope_matches
                     && (show_expired || !is_expired(&record.payload, &today))
                     && filters.is_none_or(|f| crate::filter::evaluate(f, &record.payload))
             })
@@ -468,9 +490,60 @@ where
                 event: HistoryEvent::Added,
                 content: content.clone(),
             });
+            self.link_entities(&scope, &id, content)?;
             ids.push(id);
         }
         Ok(ids)
+    }
+
+    fn find_existing_entity_record(
+        &self,
+        scope: &HashMap<String, String>,
+        entity_type: &str,
+        entity_text: &str,
+    ) -> Result<Option<VectorRecord>, crate::CoreError> {
+        let ids = self.vector_store.list(0, usize::MAX)?;
+        for id in ids {
+            let Some(record) = self.vector_store.get(&id)? else {
+                continue;
+            };
+            if is_entity_record(&record.payload)
+                && scope.iter().all(|(k, v)| record.payload.get(k) == Some(v))
+                && record.payload.get(ENTITY_TYPE_KEY).map(String::as_str) == Some(entity_type)
+                && record.payload.get(ENTITY_TEXT_KEY).map(String::as_str) == Some(entity_text)
+            {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn link_entities(&self, scope: &HashMap<String, String>, memory_id: &str, content: &str) -> Result<(), crate::CoreError> {
+        for (entity_type, entity_text) in extract_entities(content) {
+            let entity_type = match entity_type {
+                crate::entity::EntityType::Proper => "proper",
+                crate::entity::EntityType::Quoted => "quoted",
+            };
+            if let Some(mut record) = self.find_existing_entity_record(scope, entity_type, &entity_text)? {
+                let mut linked: Vec<String> =
+                    record.payload.get(LINKED_MEMORY_IDS_KEY).map(|s| s.split(',').map(String::from).collect()).unwrap_or_default();
+                if !linked.iter().any(|id| id == memory_id) {
+                    linked.push(memory_id.to_string());
+                    record.payload.insert(LINKED_MEMORY_IDS_KEY.to_string(), linked.join(","));
+                    self.vector_store.update(record)?;
+                }
+            } else {
+                let vector = self.embedding.embed(&entity_text)?;
+                let mut payload = scope.clone();
+                payload.insert(ENTITY_RECORD_KIND_KEY.to_string(), ENTITY_RECORD_KIND_VALUE.to_string());
+                payload.insert(ENTITY_TYPE_KEY.to_string(), entity_type.to_string());
+                payload.insert(ENTITY_TEXT_KEY.to_string(), entity_text.clone());
+                payload.insert(LINKED_MEMORY_IDS_KEY.to_string(), memory_id.to_string());
+                let record = VectorRecord::new(next_entity_record_id(), vector, payload);
+                self.vector_store.insert(record)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -836,6 +909,92 @@ mod tests {
             Some(&"A photo of a red bicycle.".to_string()),
             "an image-bearing message's content must be replaced by the LLM's real description before storage"
         );
+    }
+
+    #[test]
+    fn test_add_creates_a_linked_entity_record_for_a_real_proper_noun() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let messages = [Message::new(Role::User, "Bob Smith works at the office.")];
+        let ids = memory.add(&messages, scope(), false).expect("add should succeed");
+        let memory_id = &ids[0];
+
+        let all_ids = memory.vector_store.list(0, usize::MAX).expect("list should succeed");
+        let entity_record = all_ids
+            .iter()
+            .filter_map(|id| memory.vector_store.get(id).ok().flatten())
+            .find(|r| is_entity_record(&r.payload))
+            .expect("a real entity record should have been created for the proper noun");
+        assert_eq!(entity_record.payload.get(ENTITY_TYPE_KEY), Some(&"proper".to_string()));
+        assert_eq!(entity_record.payload.get(ENTITY_TEXT_KEY), Some(&"Bob Smith".to_string()));
+        assert_eq!(entity_record.payload.get(LINKED_MEMORY_IDS_KEY), Some(memory_id));
+        assert_eq!(entity_record.payload.get("user_id"), Some(&"alice".to_string()), "the entity record must carry the same scope");
+    }
+
+    #[test]
+    fn test_add_twice_with_the_same_entity_links_both_memory_ids_to_one_entity_record() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let first = memory
+            .add(&[Message::new(Role::User, "Bob Smith works at the office.")], scope(), false)
+            .expect("add should succeed");
+        let second = memory
+            .add(&[Message::new(Role::User, "Bob Smith left early today.")], scope(), false)
+            .expect("add should succeed");
+
+        let all_ids = memory.vector_store.list(0, usize::MAX).expect("list should succeed");
+        let entity_records: Vec<VectorRecord> =
+            all_ids.iter().filter_map(|id| memory.vector_store.get(id).ok().flatten()).filter(|r| is_entity_record(&r.payload)).collect();
+        assert_eq!(entity_records.len(), 1, "the same entity mentioned twice must dedup into exactly one entity record");
+        let linked: Vec<&str> = entity_records[0].payload.get(LINKED_MEMORY_IDS_KEY).unwrap().split(',').collect();
+        assert!(linked.contains(&first[0].as_str()));
+        assert!(linked.contains(&second[0].as_str()));
+    }
+
+    #[test]
+    fn test_entity_records_never_appear_in_search_results() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        memory.add(&[Message::new(Role::User, "Bob Smith works at the office.")], scope(), false).expect("add should succeed");
+        let results = memory.search("Bob Smith", 100, &scope(), None, true, None, false).expect("search should succeed");
+        assert!(
+            results.iter().all(|r| !is_entity_record(&r.payload)),
+            "an entity record must never be returned as a real search result"
+        );
+    }
+
+    #[test]
+    fn test_entity_records_never_appear_in_list_results() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        let ids = memory.add(&[Message::new(Role::User, "Bob Smith works at the office.")], scope(), false).expect("add should succeed");
+        let listed = memory.list(&scope(), 0, 100, true, None).expect("list should succeed");
+        assert_eq!(listed, ids, "list must return only the real memory record, never the entity record created alongside it");
+    }
+
+    #[test]
+    fn test_entity_records_are_not_counted_by_list_entities() {
+        let llm = FakeLlmProvider::with_response("unused");
+        let embedding = FakeEmbeddingProvider::new();
+        let store = InMemoryVectorStore::new();
+        let memory = Memory::new(llm, embedding, store);
+
+        memory.add(&[Message::new(Role::User, "Bob Smith works at the office.")], scope(), false).expect("add should succeed");
+        let entities = memory.list_entities().expect("list_entities should succeed");
+        let alice = entities.iter().find(|e| e.entity_id == "alice").expect("alice entity");
+        assert_eq!(alice.memory_count, 1, "the entity record's own scope fields must not inflate list_entities' real memory count");
     }
 
     #[test]
