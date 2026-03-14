@@ -785,14 +785,25 @@ impl PgVectorStore {
             return Err(VectorStoreError::Backend(format!("invalid table name: {table}")));
         }
         let mut client = postgres::Client::connect(connection_string, postgres::NoTls).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
-        client.execute("CREATE EXTENSION IF NOT EXISTS vector", &[]).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
-        client
-            .execute(
-                &format!("CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, vector VECTOR({dimension}) NOT NULL, payload JSONB NOT NULL)"),
-                &[],
-            )
-            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        Self::run_idempotent_ddl(&mut client, "CREATE EXTENSION IF NOT EXISTS vector")?;
+        Self::run_idempotent_ddl(
+            &mut client,
+            &format!("CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, vector VECTOR({dimension}) NOT NULL, payload JSONB NOT NULL)"),
+        )?;
         Ok(Self { client: Mutex::new(client), dimension, table: table.to_string() })
+    }
+
+    fn run_idempotent_ddl(client: &mut postgres::Client, sql: &str) -> Result<(), VectorStoreError> {
+        match client.execute(sql, &[]) {
+            Ok(_) => Ok(()),
+            Err(err)
+                if err.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION)
+                    || err.code() == Some(&postgres::error::SqlState::DUPLICATE_TABLE) =>
+            {
+                Ok(())
+            }
+            Err(err) => Err(VectorStoreError::Backend(err.to_string())),
+        }
     }
 
     fn decode_payload(value: serde_json::Value) -> Result<HashMap<String, String>, VectorStoreError> {
@@ -1476,6 +1487,30 @@ mod tests {
             assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
             assert_eq!(record.payload.get("user_id"), Some(&"alice".to_string()));
             reopened.reset().expect("cleanup reset should succeed");
+        }
+
+        #[test]
+        #[ignore = "requires a real Postgres+pgvector instance reachable at MEMORIA_TEST_POSTGRES_URL"]
+        fn concurrent_open_calls_racing_the_same_extension_all_succeed() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_POSTGRES_URL must be set to run this test");
+            };
+            let table = format!("memoria_pg_test_concurrent_open_{}", std::process::id());
+            #[allow(clippy::needless_collect)]
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let url = url.clone();
+                    let table = table.clone();
+                    std::thread::spawn(move || PgVectorStore::open(&url, 2, &table))
+                })
+                .collect();
+            let stores: Vec<_> = handles.into_iter().map(|h| h.join().expect("thread should not panic")).collect();
+            for result in &stores {
+                if let Err(err) = result {
+                    panic!("concurrent open() should never fail on the CREATE EXTENSION race: {err}");
+                }
+            }
+            stores.into_iter().next().unwrap().unwrap().reset().expect("cleanup reset should succeed");
         }
 
         #[test]
