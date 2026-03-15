@@ -121,6 +121,52 @@ jobs:
       - name: Cargo Test (postgres feature, non-live cases only)
         run: cargo test -p memoria-core -p server -p mcp --features postgres
 
+      - name: Cargo Build (qdrant feature)
+        run: cargo build -p memoria-core -p server -p mcp --features qdrant
+
+      - name: Cargo Clippy (qdrant feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p server -p mcp --features qdrant --all-targets -- -D warnings
+
+      - name: Cargo Test (qdrant feature, non-live cases only)
+        run: cargo test -p memoria-core -p server -p mcp --features qdrant
+
+  test-real-qdrant:
+    name: Real Qdrant Contract Test (ADR-47 Increment 1)
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+          - 6334:6334
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Wait for Qdrant to Accept Connections
+        run: |
+          for _ in $(seq 1 20); do
+            curl -s -o /dev/null http://127.0.0.1:6333/healthz && break
+            sleep 1
+          done
+
+      - name: Run Real QdrantVectorStore Contract Tests (VectorStoreContractTests, live against qdrant/qdrant)
+        env:
+          MEMORIA_TEST_QDRANT_URL: http://127.0.0.1:6334
+        run: |
+          cargo test -p memoria-core --features qdrant qdrant_tests -- --ignored --test-threads=8
+
+      - name: Run Real resolve_vector_store Qdrant Tests (server, mcp)
+        env:
+          MEMORIA_TEST_QDRANT_URL: http://127.0.0.1:6334
+        run: |
+          cargo test -p server -p mcp --features qdrant resolve_vector_store_qdrant_choice_builds -- --ignored
+
   test-real-pgvector:
     name: Real pgvector Contract + Hybrid Search Test (ADR-46 Increments 2-3)
     runs-on: ubuntu-latest

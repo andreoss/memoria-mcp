@@ -961,6 +961,356 @@ impl VectorStore for PgVectorStore {
     }
 }
 
+#[cfg(feature = "qdrant")]
+const QDRANT_MEMORIA_ID_KEY: &str = "__memoria_id";
+
+#[cfg(feature = "qdrant")]
+const QDRANT_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x69, 0x61, 0x2d, 0x71, 0x64, 0x72, 0x61, 0x6e, 0x74, 0x2d, 0x31,
+]);
+
+#[cfg(feature = "qdrant")]
+fn qdrant_point_id(id: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&QDRANT_ID_NAMESPACE, id.as_bytes())
+}
+
+#[cfg(feature = "qdrant")]
+enum QdrantCommand {
+    Insert(VectorRecord, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Get(String, std::sync::mpsc::Sender<Result<Option<VectorRecord>, VectorStoreError>>),
+    Update(VectorRecord, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Delete(String, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    List(usize, usize, std::sync::mpsc::Sender<Result<Vec<String>, VectorStoreError>>),
+    Reset(std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Search(Vec<f32>, usize, HashMap<String, String>, Option<f32>, std::sync::mpsc::Sender<Result<Vec<SearchResult>, VectorStoreError>>),
+}
+
+#[cfg(feature = "qdrant")]
+pub struct QdrantVectorStore {
+    command_tx: std::sync::mpsc::Sender<QdrantCommand>,
+    dimension: usize,
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_already_exists(err: &qdrant_client::QdrantError) -> bool {
+    matches!(err, qdrant_client::QdrantError::ResponseError { status } if status.code() == tonic::Code::AlreadyExists)
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_ensure_collection(client: &qdrant_client::Qdrant, collection: &str, dimension: usize) -> Result<(), VectorStoreError> {
+    use qdrant_client::qdrant::{CreateCollectionBuilder, Distance, VectorParamsBuilder};
+
+    let exists = client.collection_exists(collection).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    if exists {
+        return Ok(());
+    }
+    let dimension_u64 = u64::try_from(dimension).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    match client
+        .create_collection(CreateCollectionBuilder::new(collection).vectors_config(VectorParamsBuilder::new(dimension_u64, Distance::Euclid)))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if qdrant_already_exists(&err) => Ok(()),
+        Err(err) => Err(VectorStoreError::Backend(err.to_string())),
+    }
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_payload_value_to_string(value: &qdrant_client::qdrant::Value) -> Option<String> {
+    match &value.kind {
+        Some(qdrant_client::qdrant::value::Kind::StringValue(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_decode_payload(payload: HashMap<String, qdrant_client::qdrant::Value>) -> HashMap<String, String> {
+    payload
+        .into_iter()
+        .filter(|(key, _)| key != QDRANT_MEMORIA_ID_KEY)
+        .filter_map(|(key, value)| qdrant_payload_value_to_string(&value).map(|value| (key, value)))
+        .collect()
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_record_id(payload: &HashMap<String, qdrant_client::qdrant::Value>, fallback: &str) -> String {
+    payload.get(QDRANT_MEMORIA_ID_KEY).and_then(qdrant_payload_value_to_string).unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_point_id_to_string(point_id: Option<&qdrant_client::qdrant::PointId>) -> String {
+    match point_id.and_then(|id| id.point_id_options.as_ref()) {
+        Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(num)) => num.to_string(),
+        Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(uuid)) => uuid.clone(),
+        None => String::new(),
+    }
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_extract_vector(vectors: Option<qdrant_client::qdrant::VectorsOutput>) -> Vec<f32> {
+    use qdrant_client::qdrant::vector_output::Vector;
+
+    match vectors.and_then(|v| v.get_vector()) {
+        Some(Vector::Dense(dense)) => dense.data,
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_insert(client: &qdrant_client::Qdrant, collection: &str, dimension: usize, record: VectorRecord) -> Result<(), VectorStoreError> {
+    use qdrant_client::qdrant::{PointStruct, UpsertPointsBuilder};
+
+    if record.vector.len() != dimension {
+        return Err(VectorStoreError::DimensionMismatch { expected: dimension, actual: record.vector.len() });
+    }
+    let point_id = qdrant_point_id(&record.id);
+    let mut payload: HashMap<String, qdrant_client::qdrant::Value> = record.payload.into_iter().map(|(k, v)| (k, v.into())).collect();
+    payload.insert(QDRANT_MEMORIA_ID_KEY.to_string(), record.id.into());
+    let point = PointStruct::new(point_id, record.vector, payload);
+    client
+        .upsert_points(UpsertPointsBuilder::new(collection, vec![point]).wait(true))
+        .await
+        .map(|_| ())
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_get(client: &qdrant_client::Qdrant, collection: &str, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+    use qdrant_client::qdrant::GetPointsBuilder;
+
+    let point_id = qdrant_point_id(id);
+    let response = client
+        .get_points(GetPointsBuilder::new(collection, vec![qdrant_client::qdrant::PointId::from(point_id)]).with_vectors(true).with_payload(true))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let Some(retrieved) = response.result.into_iter().next() else {
+        return Ok(None);
+    };
+    let vector = qdrant_extract_vector(retrieved.vectors);
+    let record_id = qdrant_record_id(&retrieved.payload, id);
+    let payload = qdrant_decode_payload(retrieved.payload);
+    Ok(Some(VectorRecord { id: record_id, vector, payload }))
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_update(client: &qdrant_client::Qdrant, collection: &str, dimension: usize, record: VectorRecord) -> Result<(), VectorStoreError> {
+    let point_id = qdrant_point_id(&record.id);
+    let exists = client
+        .get_points(qdrant_client::qdrant::GetPointsBuilder::new(collection, vec![qdrant_client::qdrant::PointId::from(point_id)]))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    if exists.result.is_empty() {
+        return Err(VectorStoreError::NotFound);
+    }
+    qdrant_handle_insert(client, collection, dimension, record).await
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_delete(client: &qdrant_client::Qdrant, collection: &str, id: &str) -> Result<(), VectorStoreError> {
+    use qdrant_client::qdrant::DeletePointsBuilder;
+
+    let point_id = qdrant_point_id(id);
+    client
+        .delete_points(DeletePointsBuilder::new(collection).points(vec![qdrant_client::qdrant::PointId::from(point_id)]).wait(true))
+        .await
+        .map(|_| ())
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_list(client: &qdrant_client::Qdrant, collection: &str, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+    use qdrant_client::qdrant::ScrollPointsBuilder;
+
+    let mut ids = Vec::new();
+    let mut page_offset = None;
+    loop {
+        let mut builder = ScrollPointsBuilder::new(collection).limit(1000).with_payload(true).with_vectors(false);
+        if let Some(page_offset) = page_offset.take() {
+            builder = builder.offset(page_offset);
+        }
+        let response = client.scroll(builder).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let page_len = response.result.len();
+        for point in response.result {
+            let fallback = qdrant_point_id_to_string(point.id.as_ref());
+            ids.push(qdrant_record_id(&point.payload, &fallback));
+        }
+        match response.next_page_offset {
+            Some(next) if page_len > 0 => page_offset = Some(next),
+            _ => break,
+        }
+    }
+    ids.sort();
+    Ok(ids.into_iter().skip(offset).take(limit).collect())
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_reset(client: &qdrant_client::Qdrant, collection: &str, dimension: usize) -> Result<(), VectorStoreError> {
+    use qdrant_client::qdrant::{CreateCollectionBuilder, Distance, VectorParamsBuilder};
+
+    client.delete_collection(collection).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let dimension_u64 = u64::try_from(dimension).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    client
+        .create_collection(CreateCollectionBuilder::new(collection).vectors_config(VectorParamsBuilder::new(dimension_u64, Distance::Euclid)))
+        .await
+        .map(|_| ())
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "qdrant")]
+async fn qdrant_handle_search(
+    client: &qdrant_client::Qdrant,
+    collection: &str,
+    vector: Vec<f32>,
+    top_k: usize,
+    filters: HashMap<String, String>,
+    threshold: Option<f32>,
+) -> Result<Vec<SearchResult>, VectorStoreError> {
+    use qdrant_client::qdrant::{Condition, Filter, SearchPointsBuilder};
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let limit = top_k.min(usize::try_from(u64::MAX).unwrap_or(usize::MAX)) as u64;
+    let mut builder = SearchPointsBuilder::new(collection, vector, limit).with_payload(true);
+    if !filters.is_empty() {
+        let conditions: Vec<Condition> = filters.into_iter().map(|(k, v)| Condition::matches(k, v)).collect();
+        builder = builder.filter(Filter::all(conditions));
+    }
+    let response = client.search_points(builder).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let mut results: Vec<SearchResult> = response
+        .result
+        .into_iter()
+        .map(|scored| {
+            let fallback = qdrant_point_id_to_string(scored.id.as_ref());
+            let id = qdrant_record_id(&scored.payload, &fallback);
+            let payload = qdrant_decode_payload(scored.payload);
+            SearchResult { id, score: scored.score, payload }
+        })
+        .collect();
+    if let Some(threshold) = threshold {
+        results.retain(|result| result.score <= threshold);
+    }
+    Ok(results)
+}
+
+#[cfg(feature = "qdrant")]
+#[allow(clippy::needless_pass_by_value)]
+fn qdrant_run_dispatcher(url: String, dimension: usize, collection: String, ready_tx: std::sync::mpsc::Sender<Result<(), VectorStoreError>>, command_rx: std::sync::mpsc::Receiver<QdrantCommand>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = ready_tx.send(Err(VectorStoreError::Backend(err.to_string())));
+            return;
+        }
+    };
+    let client = match qdrant_client::Qdrant::from_url(&url).build() {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = ready_tx.send(Err(VectorStoreError::Backend(err.to_string())));
+            return;
+        }
+    };
+    if let Err(err) = runtime.block_on(qdrant_ensure_collection(&client, &collection, dimension)) {
+        let _ = ready_tx.send(Err(err));
+        return;
+    }
+    if ready_tx.send(Ok(())).is_err() {
+        return;
+    }
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            QdrantCommand::Insert(record, reply) => {
+                let result = runtime.block_on(qdrant_handle_insert(&client, &collection, dimension, record));
+                let _ = reply.send(result);
+            }
+            QdrantCommand::Get(id, reply) => {
+                let result = runtime.block_on(qdrant_handle_get(&client, &collection, &id));
+                let _ = reply.send(result);
+            }
+            QdrantCommand::Update(record, reply) => {
+                let result = runtime.block_on(qdrant_handle_update(&client, &collection, dimension, record));
+                let _ = reply.send(result);
+            }
+            QdrantCommand::Delete(id, reply) => {
+                let result = runtime.block_on(qdrant_handle_delete(&client, &collection, &id));
+                let _ = reply.send(result);
+            }
+            QdrantCommand::List(offset, limit, reply) => {
+                let result = runtime.block_on(qdrant_handle_list(&client, &collection, offset, limit));
+                let _ = reply.send(result);
+            }
+            QdrantCommand::Reset(reply) => {
+                let result = runtime.block_on(qdrant_handle_reset(&client, &collection, dimension));
+                let _ = reply.send(result);
+            }
+            QdrantCommand::Search(vector, top_k, filters, threshold, reply) => {
+                let result = runtime.block_on(qdrant_handle_search(&client, &collection, vector, top_k, filters, threshold));
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "qdrant")]
+impl QdrantVectorStore {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn open(url: &str, dimension: usize, collection: &str) -> Result<Self, VectorStoreError> {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<QdrantCommand>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), VectorStoreError>>();
+        let url = url.to_string();
+        let collection = collection.to_string();
+        std::thread::spawn(move || qdrant_run_dispatcher(url, dimension, collection, ready_tx, command_rx));
+        ready_rx
+            .recv()
+            .map_err(|_| VectorStoreError::Backend("qdrant dispatcher thread exited before startup completed".to_string()))??;
+        Ok(Self { command_tx, dimension })
+    }
+
+    fn send<T>(&self, build_command: impl FnOnce(std::sync::mpsc::Sender<Result<T, VectorStoreError>>) -> QdrantCommand) -> Result<T, VectorStoreError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(build_command(reply_tx))
+            .map_err(|_| VectorStoreError::Backend("qdrant dispatcher thread is no longer running".to_string()))?;
+        reply_rx.recv().map_err(|_| VectorStoreError::Backend("qdrant dispatcher thread dropped the reply channel".to_string()))?
+    }
+}
+
+#[cfg(feature = "qdrant")]
+impl VectorStore for QdrantVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.send(|reply| QdrantCommand::Insert(record, reply))
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>, threshold: Option<f32>) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let vector = vector.to_vec();
+        let filters = filters.clone();
+        self.send(|reply| QdrantCommand::Search(vector, top_k, filters, threshold, reply))
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        let id = id.to_string();
+        self.send(|reply| QdrantCommand::Get(id, reply))
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        if record.vector.len() != self.dimension {
+            return Err(VectorStoreError::DimensionMismatch { expected: self.dimension, actual: record.vector.len() });
+        }
+        self.send(|reply| QdrantCommand::Update(record, reply))
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        let id = id.to_string();
+        self.send(|reply| QdrantCommand::Delete(id, reply))
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        self.send(|reply| QdrantCommand::List(offset, limit, reply))
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.send(QdrantCommand::Reset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InMemoryVectorStore, VectorStore, VectorStoreConfig, VectorStoreContractTests};
@@ -1660,6 +2010,127 @@ mod tests {
 
             let results = store.keyword_search("ephemeral", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
             assert!(results.is_empty(), "a deleted record must not surface in keyword_search results");
+        }
+    }
+
+    #[cfg(feature = "qdrant")]
+    mod qdrant_tests {
+        use super::super::{QdrantVectorStore, VectorRecord, VectorStore, VectorStoreContractTests};
+        use std::collections::HashMap;
+
+        fn test_url() -> Option<String> {
+            std::env::var("MEMORIA_TEST_QDRANT_URL").ok()
+        }
+
+        struct TempStore {
+            store: QdrantVectorStore,
+        }
+
+        impl Drop for TempStore {
+            fn drop(&mut self) {
+                let _ = self.store.reset();
+            }
+        }
+
+        impl std::ops::Deref for TempStore {
+            type Target = QdrantVectorStore;
+            fn deref(&self) -> &Self::Target {
+                &self.store
+            }
+        }
+
+        fn temp_store(name: &str) -> Option<TempStore> {
+            let url = test_url()?;
+            let collection = format!("memoria_qd_test_{name}_{}", std::process::id());
+            let store = QdrantVectorStore::open(&url, 2, &collection).expect("open should succeed");
+            store.reset().expect("reset should succeed");
+            Some(TempStore { store })
+        }
+
+        macro_rules! qd_contract_test {
+            ($test_name:ident, $slug:literal, $contract:ident) => {
+                #[test]
+                #[ignore = "requires a real Qdrant instance reachable at MEMORIA_TEST_QDRANT_URL"]
+                fn $test_name() {
+                    let Some(store) = temp_store($slug) else {
+                        panic!("MEMORIA_TEST_QDRANT_URL must be set to run this test");
+                    };
+                    store.$contract();
+                }
+            };
+        }
+
+        qd_contract_test!(qd_store_passes_insert_then_get_contract, "insert_then_get", contract_insert_then_get_round_trips);
+        qd_contract_test!(qd_store_passes_delete_then_get_contract, "delete_then_get", contract_delete_then_get_returns_none);
+        qd_contract_test!(qd_store_passes_reset_contract, "reset", contract_reset_clears_everything);
+        qd_contract_test!(qd_store_passes_search_respects_top_k_contract, "search_top_k", contract_search_respects_top_k);
+        qd_contract_test!(qd_store_passes_search_orders_by_score_contract, "search_orders", contract_search_orders_by_score);
+        qd_contract_test!(qd_store_passes_search_respects_threshold_contract, "search_threshold", contract_search_respects_threshold);
+        qd_contract_test!(
+            qd_store_passes_search_with_no_threshold_returns_everything_contract,
+            "search_no_threshold",
+            contract_search_with_no_threshold_returns_everything_up_to_top_k
+        );
+        qd_contract_test!(qd_store_passes_search_filters_by_metadata_key_contract, "search_filters_metadata", contract_search_filters_by_metadata_key);
+        qd_contract_test!(qd_store_passes_search_filters_by_agent_id_contract, "search_filters_agent", contract_search_filters_by_agent_id);
+        qd_contract_test!(qd_store_passes_search_filters_by_run_id_contract, "search_filters_run", contract_search_filters_by_run_id);
+        qd_contract_test!(qd_store_passes_update_then_get_contract, "update_then_get", contract_update_then_get_reflects_change);
+        qd_contract_test!(qd_store_passes_update_nonexistent_contract, "update_nonexistent", contract_update_nonexistent_returns_not_found);
+        qd_contract_test!(qd_store_passes_delete_nonexistent_is_idempotent_contract, "delete_nonexistent", contract_delete_nonexistent_is_idempotent);
+        qd_contract_test!(qd_store_passes_list_returns_all_inserted_ids_contract, "list_all", contract_list_returns_all_inserted_ids);
+        qd_contract_test!(qd_store_passes_list_on_empty_store_returns_empty_contract, "list_empty", contract_list_on_empty_store_returns_empty);
+        qd_contract_test!(qd_store_passes_insert_rejects_mismatched_dimension_contract, "dimension_mismatch", contract_insert_rejects_mismatched_dimension);
+        qd_contract_test!(qd_store_passes_list_pagination_respects_offset_and_limit_contract, "pagination", contract_list_pagination_respects_offset_and_limit);
+
+        #[test]
+        #[ignore = "requires a real Qdrant instance reachable at MEMORIA_TEST_QDRANT_URL"]
+        fn records_survive_reopening_the_same_collection() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_QDRANT_URL must be set to run this test");
+            };
+            let collection = format!("memoria_qd_test_durability_{}", std::process::id());
+            {
+                let store = QdrantVectorStore::open(&url, 3, &collection).expect("open should succeed");
+                store.reset().expect("reset should succeed");
+                store
+                    .insert(VectorRecord::new("rec-1", vec![1.0, 2.0, 3.0], HashMap::from([("user_id".to_string(), "alice".to_string())])))
+                    .expect("insert should succeed");
+            }
+            let reopened = QdrantVectorStore::open(&url, 3, &collection).expect("reopen should succeed");
+            let record = reopened.get("rec-1").expect("get should succeed").expect("record should survive reopening the store");
+            assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
+            assert_eq!(record.payload.get("user_id"), Some(&"alice".to_string()));
+            reopened.reset().expect("cleanup reset should succeed");
+        }
+
+        #[test]
+        #[ignore = "requires a real Qdrant instance reachable at MEMORIA_TEST_QDRANT_URL"]
+        fn concurrent_callers_from_real_os_threads_all_succeed() {
+            let Some(store) = temp_store("concurrent_callers") else {
+                panic!("MEMORIA_TEST_QDRANT_URL must be set to run this test");
+            };
+            let store = std::sync::Arc::new(store);
+            #[allow(clippy::needless_collect)]
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let store = std::sync::Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        let id = format!("concurrent-{i}");
+                        #[allow(clippy::cast_precision_loss)]
+                        let value = i as f32;
+                        store.insert(VectorRecord::new(id.clone(), vec![value, value], HashMap::new())).expect("insert should succeed");
+                        store.get(&id).expect("get should succeed").expect("record should exist")
+                    })
+                })
+                .collect();
+            let records: Vec<VectorRecord> = handles.into_iter().map(|h| h.join().expect("thread should not panic")).collect();
+            assert_eq!(records.len(), 8);
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(record.id, format!("concurrent-{i}"));
+                #[allow(clippy::cast_precision_loss)]
+                let expected = i as f32;
+                assert_eq!(record.vector, vec![expected, expected], "each thread's own record must round-trip without cross-request corruption");
+            }
         }
     }
 }

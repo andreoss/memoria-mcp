@@ -557,13 +557,20 @@ fn resolve_embedding_provider(
     }
 }
 
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+struct NetworkedStoreEnv<'a> {
+    url: Option<&'a str>,
+    dimension: Option<&'a str>,
+    name: Option<&'a str>,
+}
+
 fn resolve_vector_store(
     choice: Option<&str>,
     json_snapshot_path: &Path,
     sqlite_path: &Path,
-    postgres_url: Option<&str>,
-    postgres_dimension: Option<&str>,
-    postgres_table: Option<&str>,
+    postgres: NetworkedStoreEnv<'_>,
+    qdrant: NetworkedStoreEnv<'_>,
 ) -> Result<(BoxedVectorStore, bool, String), String> {
     match choice.unwrap_or("sqlite") {
         "sqlite" => {
@@ -583,26 +590,50 @@ fn resolve_vector_store(
         "postgres" => {
             #[cfg(feature = "postgres")]
             {
-                let url = postgres_url
+                let url = postgres
+                    .url
                     .ok_or_else(|| "MEMORIA_VECTOR_STORE=postgres requires MEMORIA_POSTGRES_URL to be set".to_string())?;
-                let dimension: usize = postgres_dimension
+                let dimension: usize = postgres
+                    .dimension
                     .ok_or_else(|| {
                         "MEMORIA_VECTOR_STORE=postgres requires MEMORIA_POSTGRES_DIMENSION to be set (Postgres's native VECTOR(N) column needs a fixed dimension; see ADR-46)".to_string()
                     })?
                     .parse()
                     .map_err(|_| "MEMORIA_POSTGRES_DIMENSION must be a positive integer".to_string())?;
-                let table = postgres_table.unwrap_or("memoria_vectors");
+                let table = postgres.name.unwrap_or("memoria_vectors");
                 let store = memoria_core::vector_store::PgVectorStore::open(url, dimension, table).map_err(|err| err.to_string())?;
                 let label = format!("PgVectorStore (table {table}, dimension {dimension}; see ADR-46)");
                 Ok((Box::new(store), false, label))
             }
             #[cfg(not(feature = "postgres"))]
             {
-                let _ = (postgres_url, postgres_dimension, postgres_table);
+                let _ = postgres;
                 Err("the mcp binary must be built with --features postgres to use MEMORIA_VECTOR_STORE=postgres (see ADR-46)".to_string())
             }
         }
-        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"sqlite\", \"local\", or \"postgres\")")),
+        "qdrant" => {
+            #[cfg(feature = "qdrant")]
+            {
+                let url = qdrant.url.ok_or_else(|| "MEMORIA_VECTOR_STORE=qdrant requires MEMORIA_QDRANT_URL to be set".to_string())?;
+                let dimension: usize = qdrant
+                    .dimension
+                    .ok_or_else(|| {
+                        "MEMORIA_VECTOR_STORE=qdrant requires MEMORIA_QDRANT_DIMENSION to be set (Qdrant's own collection schema needs a fixed dimension; see ADR-47)".to_string()
+                    })?
+                    .parse()
+                    .map_err(|_| "MEMORIA_QDRANT_DIMENSION must be a positive integer".to_string())?;
+                let collection = qdrant.name.unwrap_or("memoria_vectors");
+                let store = memoria_core::vector_store::QdrantVectorStore::open(url, dimension, collection).map_err(|err| err.to_string())?;
+                let label = format!("QdrantVectorStore (collection {collection}, dimension {dimension}; see ADR-47)");
+                Ok((Box::new(store), false, label))
+            }
+            #[cfg(not(feature = "qdrant"))]
+            {
+                let _ = qdrant;
+                Err("the mcp binary must be built with --features qdrant to use MEMORIA_VECTOR_STORE=qdrant (see ADR-47)".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"sqlite\", \"local\", \"postgres\", or \"qdrant\")")),
     }
 }
 
@@ -631,13 +662,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let postgres_url = std::env::var("MEMORIA_POSTGRES_URL").ok();
     let postgres_dimension = std::env::var("MEMORIA_POSTGRES_DIMENSION").ok();
     let postgres_table = std::env::var("MEMORIA_POSTGRES_TABLE").ok();
+    let qdrant_url = std::env::var("MEMORIA_QDRANT_URL").ok();
+    let qdrant_dimension = std::env::var("MEMORIA_QDRANT_DIMENSION").ok();
+    let qdrant_collection = std::env::var("MEMORIA_QDRANT_COLLECTION").ok();
+    let postgres_env = NetworkedStoreEnv { url: postgres_url.as_deref(), dimension: postgres_dimension.as_deref(), name: postgres_table.as_deref() };
+    let qdrant_env = NetworkedStoreEnv { url: qdrant_url.as_deref(), dimension: qdrant_dimension.as_deref(), name: qdrant_collection.as_deref() };
     let (vector_store, persist_json_snapshot, vector_store_label) = resolve_vector_store(
         std::env::var("MEMORIA_VECTOR_STORE").ok().as_deref(),
         &store_path,
         &sqlite_path,
-        postgres_url.as_deref(),
-        postgres_dimension.as_deref(),
-        postgres_table.as_deref(),
+        postgres_env,
+        qdrant_env,
     )
     .map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
 
@@ -925,7 +960,7 @@ mod tests {
     fn resolve_vector_store_defaults_to_sqlite() {
         let dir = std::env::temp_dir().join(format!("memoria-mcp-default-store-test-{}", std::process::id()));
         let (_, persist_json_snapshot, label) =
-            resolve_vector_store(None, &dir.join("unused.json"), &dir.join("default.db"), None, None, None).expect("expected a store");
+            resolve_vector_store(None, &dir.join("unused.json"), &dir.join("default.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).expect("expected a store");
         assert!(!persist_json_snapshot, "the sqlite default persists itself; it must not also write a JSON snapshot");
         assert!(label.contains("SqliteVectorStore"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -983,7 +1018,7 @@ mod tests {
     #[test]
     fn resolve_vector_store_unknown_choice_is_a_clear_error() {
         let dir = std::env::temp_dir();
-        let result = resolve_vector_store(Some("bogus"), &dir.join("unused.json"), &dir.join("unused.db"), None, None, None);
+        let result = resolve_vector_store(Some("bogus"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default());
         assert!(result.is_err());
     }
 
@@ -991,7 +1026,8 @@ mod tests {
     #[test]
     fn resolve_vector_store_postgres_choice_fails_clearly_without_the_feature() {
         let dir = std::env::temp_dir();
-        let result = resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), Some("postgres://x"), Some("2"), None);
+        let postgres = NetworkedStoreEnv { url: Some("postgres://x"), dimension: Some("2"), name: None };
+        let result = resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), postgres, NetworkedStoreEnv::default());
         assert!(result.is_err());
     }
 
@@ -999,7 +1035,8 @@ mod tests {
     #[test]
     fn resolve_vector_store_postgres_choice_requires_url() {
         let dir = std::env::temp_dir();
-        let err = resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), None, Some("2"), None).err().expect("expected an error");
+        let postgres = NetworkedStoreEnv { url: None, dimension: Some("2"), name: None };
+        let err = resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), postgres, NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_POSTGRES_URL"), "got: {err}");
     }
 
@@ -1007,7 +1044,8 @@ mod tests {
     #[test]
     fn resolve_vector_store_postgres_choice_requires_dimension() {
         let dir = std::env::temp_dir();
-        let err = resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), Some("postgres://x"), None, None).err().expect("expected an error");
+        let postgres = NetworkedStoreEnv { url: Some("postgres://x"), dimension: None, name: None };
+        let err = resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), postgres, NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_POSTGRES_DIMENSION"), "got: {err}");
     }
 
@@ -1018,11 +1056,52 @@ mod tests {
         let url = std::env::var("MEMORIA_TEST_POSTGRES_URL").expect("MEMORIA_TEST_POSTGRES_URL must be set for this test");
         let dir = std::env::temp_dir();
         let table = format!("memoria_mcp_resolve_vector_store_test_{}", std::process::id());
+        let postgres = NetworkedStoreEnv { url: Some(&url), dimension: Some("2"), name: Some(&table) };
         let (_, persist_json_snapshot, label) =
-            resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), Some(&url), Some("2"), Some(&table))
-                .expect("expected a store");
+            resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), postgres, NetworkedStoreEnv::default()).expect("expected a store");
         assert!(label.contains("PgVectorStore"), "got: {label}");
         assert!(!persist_json_snapshot, "the postgres backend persists itself; it must not also write a JSON snapshot");
+    }
+
+    #[cfg(not(feature = "qdrant"))]
+    #[test]
+    fn resolve_vector_store_qdrant_choice_fails_clearly_without_the_feature() {
+        let dir = std::env::temp_dir();
+        let qdrant = NetworkedStoreEnv { url: Some("http://x"), dimension: Some("2"), name: None };
+        let result = resolve_vector_store(Some("qdrant"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), qdrant);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[test]
+    fn resolve_vector_store_qdrant_choice_requires_url() {
+        let dir = std::env::temp_dir();
+        let qdrant = NetworkedStoreEnv { url: None, dimension: Some("2"), name: None };
+        let err = resolve_vector_store(Some("qdrant"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), qdrant).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_QDRANT_URL"), "got: {err}");
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[test]
+    fn resolve_vector_store_qdrant_choice_requires_dimension() {
+        let dir = std::env::temp_dir();
+        let qdrant = NetworkedStoreEnv { url: Some("http://x"), dimension: None, name: None };
+        let err = resolve_vector_store(Some("qdrant"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), qdrant).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_QDRANT_DIMENSION"), "got: {err}");
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[test]
+    #[ignore = "requires a real Qdrant instance reachable at MEMORIA_TEST_QDRANT_URL"]
+    fn resolve_vector_store_qdrant_choice_builds_and_does_not_persist_json_snapshot() {
+        let url = std::env::var("MEMORIA_TEST_QDRANT_URL").expect("MEMORIA_TEST_QDRANT_URL must be set for this test");
+        let dir = std::env::temp_dir();
+        let collection = format!("memoria_mcp_resolve_vector_store_test_{}", std::process::id());
+        let qdrant = NetworkedStoreEnv { url: Some(&url), dimension: Some("2"), name: Some(&collection) };
+        let (_, persist_json_snapshot, label) =
+            resolve_vector_store(Some("qdrant"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), qdrant).expect("expected a store");
+        assert!(label.contains("QdrantVectorStore"), "got: {label}");
+        assert!(!persist_json_snapshot, "the qdrant backend persists itself; it must not also write a JSON snapshot");
     }
 
     #[test]
