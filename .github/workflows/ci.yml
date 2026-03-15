@@ -130,6 +130,15 @@ jobs:
       - name: Cargo Test (qdrant feature, non-live cases only)
         run: cargo test -p memoria-core -p server -p mcp --features qdrant
 
+      - name: Cargo Build (chroma feature)
+        run: cargo build -p memoria-core -p server -p mcp --features chroma
+
+      - name: Cargo Clippy (chroma feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p server -p mcp --features chroma --all-targets -- -D warnings
+
+      - name: Cargo Test (chroma feature, non-live cases only)
+        run: cargo test -p memoria-core -p server -p mcp --features chroma
+
   test-real-qdrant:
     name: Real Qdrant Contract Test (ADR-47 Increment 1)
     runs-on: ubuntu-latest
@@ -166,6 +175,42 @@ jobs:
           MEMORIA_TEST_QDRANT_URL: http://127.0.0.1:6334
         run: |
           cargo test -p server -p mcp --features qdrant resolve_vector_store_qdrant_choice_builds -- --ignored
+
+  test-real-chroma:
+    name: Real Chroma Contract Test (ADR-48 Increment 1)
+    runs-on: ubuntu-latest
+    services:
+      chroma:
+        image: chromadb/chroma:latest
+        ports:
+          - 8000:8000
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Wait for Chroma to Accept Connections
+        run: |
+          for _ in $(seq 1 20); do
+            curl -s -o /dev/null http://127.0.0.1:8000/api/v2/heartbeat && break
+            sleep 1
+          done
+
+      - name: Run Real ChromaVectorStore Contract Tests (VectorStoreContractTests, live against chromadb/chroma)
+        env:
+          MEMORIA_TEST_CHROMA_URL: http://127.0.0.1:8000
+        run: |
+          cargo test -p memoria-core --features chroma chroma_tests -- --ignored --test-threads=8
+
+      - name: Run Real resolve_vector_store Chroma Tests (server, mcp)
+        env:
+          MEMORIA_TEST_CHROMA_URL: http://127.0.0.1:8000
+        run: |
+          cargo test -p server -p mcp --features chroma resolve_vector_store_chroma_choice_builds -- --ignored
 
   test-real-pgvector:
     name: Real pgvector Contract + Hybrid Search Test (ADR-46 Increments 2-3)

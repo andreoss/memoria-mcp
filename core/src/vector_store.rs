@@ -1311,6 +1311,317 @@ impl VectorStore for QdrantVectorStore {
     }
 }
 
+#[cfg(feature = "chroma")]
+enum ChromaCommand {
+    Insert(VectorRecord, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Get(String, std::sync::mpsc::Sender<Result<Option<VectorRecord>, VectorStoreError>>),
+    Update(VectorRecord, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Delete(String, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    List(usize, usize, std::sync::mpsc::Sender<Result<Vec<String>, VectorStoreError>>),
+    Reset(std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Search(Vec<f32>, usize, HashMap<String, String>, Option<f32>, std::sync::mpsc::Sender<Result<Vec<SearchResult>, VectorStoreError>>),
+}
+
+#[cfg(feature = "chroma")]
+pub struct ChromaVectorStore {
+    command_tx: std::sync::mpsc::Sender<ChromaCommand>,
+    dimension: usize,
+}
+
+#[cfg(feature = "chroma")]
+fn chroma_client(url: &str) -> Result<chroma::ChromaHttpClient, VectorStoreError> {
+    let endpoint = url.parse::<reqwest::Url>().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let options = chroma::ChromaHttpClientOptions {
+        endpoint,
+        tenant_id: Some("default_tenant".to_string()),
+        database_name: Some("default_database".to_string()),
+        ..chroma::ChromaHttpClientOptions::default()
+    };
+    Ok(chroma::ChromaHttpClient::new(options))
+}
+
+#[cfg(feature = "chroma")]
+fn chroma_l2_metadata() -> chroma::types::Metadata {
+    HashMap::from([("hnsw:space".to_string(), chroma::types::MetadataValue::Str("l2".to_string()))])
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_ensure_collection(client: &chroma::ChromaHttpClient, collection: &str) -> Result<chroma::ChromaCollection, VectorStoreError> {
+    client
+        .get_or_create_collection(collection, None, Some(chroma_l2_metadata()))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "chroma")]
+fn chroma_payload_to_metadata(payload: HashMap<String, String>) -> chroma::types::Metadata {
+    payload.into_iter().map(|(key, value)| (key, chroma::types::MetadataValue::Str(value))).collect()
+}
+
+#[cfg(feature = "chroma")]
+fn chroma_metadata_to_payload(metadata: Option<chroma::types::Metadata>) -> HashMap<String, String> {
+    metadata
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| match value {
+            chroma::types::MetadataValue::Str(value) => Some((key, value)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(feature = "chroma")]
+fn chroma_where_from_filters(filters: &HashMap<String, String>) -> Option<chroma::types::Where> {
+    use chroma::types::{MetadataComparison, MetadataExpression, MetadataValue, PrimitiveOperator, Where};
+
+    if filters.is_empty() {
+        return None;
+    }
+    let clauses = filters.iter().map(|(key, value)| {
+        Where::Metadata(MetadataExpression {
+            key: key.clone(),
+            comparison: MetadataComparison::Primitive(PrimitiveOperator::Equal, MetadataValue::Str(value.clone())),
+        })
+    });
+    Some(Where::conjunction(clauses))
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_insert(collection: &chroma::ChromaCollection, dimension: usize, record: VectorRecord) -> Result<(), VectorStoreError> {
+    if record.vector.len() != dimension {
+        return Err(VectorStoreError::DimensionMismatch { expected: dimension, actual: record.vector.len() });
+    }
+    let metadata: chroma::types::UpdateMetadata = chroma_payload_to_metadata(record.payload).into_iter().map(|(key, value)| (key, value.into())).collect();
+    collection
+        .upsert(vec![record.id], vec![record.vector], None, None, Some(vec![Some(metadata)]))
+        .await
+        .map(|_| ())
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_get(collection: &chroma::ChromaCollection, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+    use chroma::types::{Include, IncludeList};
+
+    let include = IncludeList(vec![Include::Metadata, Include::Embedding]);
+    let mut response = collection
+        .get(Some(vec![id.to_string()]), None, None, None, Some(include))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    if response.ids.is_empty() {
+        return Ok(None);
+    }
+    let record_id = response.ids.remove(0);
+    let vector = response.embeddings.map(|mut e| e.remove(0)).unwrap_or_default();
+    let metadata = response.metadatas.and_then(|mut m| m.remove(0));
+    Ok(Some(VectorRecord { id: record_id, vector, payload: chroma_metadata_to_payload(metadata) }))
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_update(collection: &chroma::ChromaCollection, dimension: usize, record: VectorRecord) -> Result<(), VectorStoreError> {
+    let exists = collection
+        .get(Some(vec![record.id.clone()]), None, None, None, Some(chroma::types::IncludeList::empty()))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    if exists.ids.is_empty() {
+        return Err(VectorStoreError::NotFound);
+    }
+    chroma_handle_insert(collection, dimension, record).await
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_delete(collection: &chroma::ChromaCollection, id: &str) -> Result<(), VectorStoreError> {
+    collection
+        .delete(Some(vec![id.to_string()]), None, None)
+        .await
+        .map(|_| ())
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_list(collection: &chroma::ChromaCollection, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+    use chroma::types::IncludeList;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let response = collection
+        .get(None, None, Some(limit as u32), Some(offset as u32), Some(IncludeList::empty()))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let mut ids = response.ids;
+    ids.sort();
+    Ok(ids)
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_reset(client: &chroma::ChromaHttpClient, collection: &str) -> Result<chroma::ChromaCollection, VectorStoreError> {
+    client.delete_collection(collection).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    chroma_ensure_collection(client, collection).await
+}
+
+#[cfg(feature = "chroma")]
+async fn chroma_handle_search(
+    collection: &chroma::ChromaCollection,
+    vector: Vec<f32>,
+    top_k: usize,
+    filters: HashMap<String, String>,
+    threshold: Option<f32>,
+) -> Result<Vec<SearchResult>, VectorStoreError> {
+    use chroma::types::{Include, IncludeList};
+
+    #[allow(clippy::cast_possible_truncation)]
+    let n_results = top_k as u32;
+    let include = IncludeList(vec![Include::Metadata, Include::Distance]);
+    let where_clause = chroma_where_from_filters(&filters);
+    let mut response = collection
+        .query(vec![vector], Some(n_results), where_clause, None, Some(include))
+        .await
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    if response.ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = response.ids.remove(0);
+    let mut distances = response.distances.map(|mut d| d.remove(0)).unwrap_or_default();
+    let mut metadatas = response.metadatas.map(|mut m| m.remove(0)).unwrap_or_default();
+    let mut results = Vec::with_capacity(ids.len());
+    for (index, id) in ids.into_iter().enumerate() {
+        let score = distances.get_mut(index).and_then(std::mem::take).unwrap_or(f32::MAX);
+        let payload = metadatas.get_mut(index).and_then(std::mem::take).map_or_else(HashMap::new, |metadata| chroma_metadata_to_payload(Some(metadata)));
+        results.push(SearchResult { id, score, payload });
+    }
+    if let Some(threshold) = threshold {
+        results.retain(|result| result.score <= threshold);
+    }
+    Ok(results)
+}
+
+#[cfg(feature = "chroma")]
+#[allow(clippy::needless_pass_by_value)]
+fn chroma_run_dispatcher(url: String, dimension: usize, collection_name: String, ready_tx: std::sync::mpsc::Sender<Result<(), VectorStoreError>>, command_rx: std::sync::mpsc::Receiver<ChromaCommand>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = ready_tx.send(Err(VectorStoreError::Backend(err.to_string())));
+            return;
+        }
+    };
+    let client = match chroma_client(&url) {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+    let mut collection = match runtime.block_on(chroma_ensure_collection(&client, &collection_name)) {
+        Ok(collection) => collection,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+    if ready_tx.send(Ok(())).is_err() {
+        return;
+    }
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            ChromaCommand::Insert(record, reply) => {
+                let result = runtime.block_on(chroma_handle_insert(&collection, dimension, record));
+                let _ = reply.send(result);
+            }
+            ChromaCommand::Get(id, reply) => {
+                let result = runtime.block_on(chroma_handle_get(&collection, &id));
+                let _ = reply.send(result);
+            }
+            ChromaCommand::Update(record, reply) => {
+                let result = runtime.block_on(chroma_handle_update(&collection, dimension, record));
+                let _ = reply.send(result);
+            }
+            ChromaCommand::Delete(id, reply) => {
+                let result = runtime.block_on(chroma_handle_delete(&collection, &id));
+                let _ = reply.send(result);
+            }
+            ChromaCommand::List(offset, limit, reply) => {
+                let result = runtime.block_on(chroma_handle_list(&collection, offset, limit));
+                let _ = reply.send(result);
+            }
+            ChromaCommand::Reset(reply) => match runtime.block_on(chroma_handle_reset(&client, &collection_name)) {
+                Ok(new_collection) => {
+                    collection = new_collection;
+                    let _ = reply.send(Ok(()));
+                }
+                Err(err) => {
+                    let _ = reply.send(Err(err));
+                }
+            },
+            ChromaCommand::Search(vector, top_k, filters, threshold, reply) => {
+                let result = runtime.block_on(chroma_handle_search(&collection, vector, top_k, filters, threshold));
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "chroma")]
+impl ChromaVectorStore {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn open(url: &str, dimension: usize, collection: &str) -> Result<Self, VectorStoreError> {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<ChromaCommand>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), VectorStoreError>>();
+        let url = url.to_string();
+        let collection = collection.to_string();
+        std::thread::spawn(move || chroma_run_dispatcher(url, dimension, collection, ready_tx, command_rx));
+        ready_rx
+            .recv()
+            .map_err(|_| VectorStoreError::Backend("chroma dispatcher thread exited before startup completed".to_string()))??;
+        Ok(Self { command_tx, dimension })
+    }
+
+    fn send<T>(&self, build_command: impl FnOnce(std::sync::mpsc::Sender<Result<T, VectorStoreError>>) -> ChromaCommand) -> Result<T, VectorStoreError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(build_command(reply_tx))
+            .map_err(|_| VectorStoreError::Backend("chroma dispatcher thread is no longer running".to_string()))?;
+        reply_rx.recv().map_err(|_| VectorStoreError::Backend("chroma dispatcher thread dropped the reply channel".to_string()))?
+    }
+}
+
+#[cfg(feature = "chroma")]
+impl VectorStore for ChromaVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.send(|reply| ChromaCommand::Insert(record, reply))
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>, threshold: Option<f32>) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let vector = vector.to_vec();
+        let filters = filters.clone();
+        self.send(|reply| ChromaCommand::Search(vector, top_k, filters, threshold, reply))
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        let id = id.to_string();
+        self.send(|reply| ChromaCommand::Get(id, reply))
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        if record.vector.len() != self.dimension {
+            return Err(VectorStoreError::DimensionMismatch { expected: self.dimension, actual: record.vector.len() });
+        }
+        self.send(|reply| ChromaCommand::Update(record, reply))
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        let id = id.to_string();
+        self.send(|reply| ChromaCommand::Delete(id, reply))
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        self.send(|reply| ChromaCommand::List(offset, limit, reply))
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.send(ChromaCommand::Reset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InMemoryVectorStore, VectorStore, VectorStoreConfig, VectorStoreContractTests};
@@ -2108,6 +2419,127 @@ mod tests {
         fn concurrent_callers_from_real_os_threads_all_succeed() {
             let Some(store) = temp_store("concurrent_callers") else {
                 panic!("MEMORIA_TEST_QDRANT_URL must be set to run this test");
+            };
+            let store = std::sync::Arc::new(store);
+            #[allow(clippy::needless_collect)]
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let store = std::sync::Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        let id = format!("concurrent-{i}");
+                        #[allow(clippy::cast_precision_loss)]
+                        let value = i as f32;
+                        store.insert(VectorRecord::new(id.clone(), vec![value, value], HashMap::new())).expect("insert should succeed");
+                        store.get(&id).expect("get should succeed").expect("record should exist")
+                    })
+                })
+                .collect();
+            let records: Vec<VectorRecord> = handles.into_iter().map(|h| h.join().expect("thread should not panic")).collect();
+            assert_eq!(records.len(), 8);
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(record.id, format!("concurrent-{i}"));
+                #[allow(clippy::cast_precision_loss)]
+                let expected = i as f32;
+                assert_eq!(record.vector, vec![expected, expected], "each thread's own record must round-trip without cross-request corruption");
+            }
+        }
+    }
+
+    #[cfg(feature = "chroma")]
+    mod chroma_tests {
+        use super::super::{ChromaVectorStore, VectorRecord, VectorStore, VectorStoreContractTests};
+        use std::collections::HashMap;
+
+        fn test_url() -> Option<String> {
+            std::env::var("MEMORIA_TEST_CHROMA_URL").ok()
+        }
+
+        struct TempStore {
+            store: ChromaVectorStore,
+        }
+
+        impl Drop for TempStore {
+            fn drop(&mut self) {
+                let _ = self.store.reset();
+            }
+        }
+
+        impl std::ops::Deref for TempStore {
+            type Target = ChromaVectorStore;
+            fn deref(&self) -> &Self::Target {
+                &self.store
+            }
+        }
+
+        fn temp_store(name: &str) -> Option<TempStore> {
+            let url = test_url()?;
+            let collection = format!("memoria_chroma_test_{name}_{}", std::process::id());
+            let store = ChromaVectorStore::open(&url, 2, &collection).expect("open should succeed");
+            store.reset().expect("reset should succeed");
+            Some(TempStore { store })
+        }
+
+        macro_rules! chroma_contract_test {
+            ($test_name:ident, $slug:literal, $contract:ident) => {
+                #[test]
+                #[ignore = "requires a real Chroma instance reachable at MEMORIA_TEST_CHROMA_URL"]
+                fn $test_name() {
+                    let Some(store) = temp_store($slug) else {
+                        panic!("MEMORIA_TEST_CHROMA_URL must be set to run this test");
+                    };
+                    store.$contract();
+                }
+            };
+        }
+
+        chroma_contract_test!(chroma_store_passes_insert_then_get_contract, "insert_then_get", contract_insert_then_get_round_trips);
+        chroma_contract_test!(chroma_store_passes_delete_then_get_contract, "delete_then_get", contract_delete_then_get_returns_none);
+        chroma_contract_test!(chroma_store_passes_reset_contract, "reset", contract_reset_clears_everything);
+        chroma_contract_test!(chroma_store_passes_search_respects_top_k_contract, "search_top_k", contract_search_respects_top_k);
+        chroma_contract_test!(chroma_store_passes_search_orders_by_score_contract, "search_orders", contract_search_orders_by_score);
+        chroma_contract_test!(chroma_store_passes_search_respects_threshold_contract, "search_threshold", contract_search_respects_threshold);
+        chroma_contract_test!(
+            chroma_store_passes_search_with_no_threshold_returns_everything_contract,
+            "search_no_threshold",
+            contract_search_with_no_threshold_returns_everything_up_to_top_k
+        );
+        chroma_contract_test!(chroma_store_passes_search_filters_by_metadata_key_contract, "search_filters_metadata", contract_search_filters_by_metadata_key);
+        chroma_contract_test!(chroma_store_passes_search_filters_by_agent_id_contract, "search_filters_agent", contract_search_filters_by_agent_id);
+        chroma_contract_test!(chroma_store_passes_search_filters_by_run_id_contract, "search_filters_run", contract_search_filters_by_run_id);
+        chroma_contract_test!(chroma_store_passes_update_then_get_contract, "update_then_get", contract_update_then_get_reflects_change);
+        chroma_contract_test!(chroma_store_passes_update_nonexistent_contract, "update_nonexistent", contract_update_nonexistent_returns_not_found);
+        chroma_contract_test!(chroma_store_passes_delete_nonexistent_is_idempotent_contract, "delete_nonexistent", contract_delete_nonexistent_is_idempotent);
+        chroma_contract_test!(chroma_store_passes_list_returns_all_inserted_ids_contract, "list_all", contract_list_returns_all_inserted_ids);
+        chroma_contract_test!(chroma_store_passes_list_on_empty_store_returns_empty_contract, "list_empty", contract_list_on_empty_store_returns_empty);
+        chroma_contract_test!(chroma_store_passes_insert_rejects_mismatched_dimension_contract, "dimension_mismatch", contract_insert_rejects_mismatched_dimension);
+        chroma_contract_test!(chroma_store_passes_list_pagination_respects_offset_and_limit_contract, "pagination", contract_list_pagination_respects_offset_and_limit);
+
+        #[test]
+        #[ignore = "requires a real Chroma instance reachable at MEMORIA_TEST_CHROMA_URL"]
+        fn records_survive_reopening_the_same_collection() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_CHROMA_URL must be set to run this test");
+            };
+            let collection = format!("memoria_chroma_test_durability_{}", std::process::id());
+            {
+                let store = ChromaVectorStore::open(&url, 3, &collection).expect("open should succeed");
+                store.reset().expect("reset should succeed");
+                store
+                    .insert(VectorRecord::new("rec-1", vec![1.0, 2.0, 3.0], HashMap::from([("user_id".to_string(), "alice".to_string())])))
+                    .expect("insert should succeed");
+            }
+            let reopened = ChromaVectorStore::open(&url, 3, &collection).expect("reopen should succeed");
+            let record = reopened.get("rec-1").expect("get should succeed").expect("record should survive reopening the store");
+            assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
+            assert_eq!(record.payload.get("user_id"), Some(&"alice".to_string()));
+            reopened.reset().expect("cleanup reset should succeed");
+        }
+
+        #[test]
+        #[ignore = "requires a real Chroma instance reachable at MEMORIA_TEST_CHROMA_URL"]
+        fn concurrent_callers_from_real_os_threads_all_succeed() {
+            let Some(store) = temp_store("concurrent_callers") else {
+                panic!("MEMORIA_TEST_CHROMA_URL must be set to run this test");
             };
             let store = std::sync::Arc::new(store);
             #[allow(clippy::needless_collect)]

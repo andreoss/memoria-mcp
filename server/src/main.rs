@@ -1160,6 +1160,7 @@ fn resolve_vector_store(
     sqlite_path: &Path,
     postgres: NetworkedStoreEnv<'_>,
     qdrant: NetworkedStoreEnv<'_>,
+    chroma: NetworkedStoreEnv<'_>,
 ) -> Result<(Box<dyn VectorStore + Send + Sync>, bool, String), String> {
     match choice.unwrap_or("local") {
         "local" => {
@@ -1225,7 +1226,29 @@ fn resolve_vector_store(
                 Err("MEMORIA_VECTOR_STORE=qdrant requires the server binary to be built with --features qdrant".to_string())
             }
         }
-        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"local\", \"sqlite\", \"postgres\", or \"qdrant\")")),
+        "chroma" => {
+            #[cfg(feature = "chroma")]
+            {
+                let url = chroma.url.ok_or_else(|| "MEMORIA_VECTOR_STORE=chroma requires MEMORIA_CHROMA_URL to be set".to_string())?;
+                let dimension: usize = chroma
+                    .dimension
+                    .ok_or_else(|| {
+                        "MEMORIA_VECTOR_STORE=chroma requires MEMORIA_CHROMA_DIMENSION to be set (memoria validates every vector's dimension client-side; see ADR-48)".to_string()
+                    })?
+                    .parse()
+                    .map_err(|_| "MEMORIA_CHROMA_DIMENSION must be a positive integer".to_string())?;
+                let collection = chroma.name.unwrap_or("memoria_vectors");
+                let store = core::vector_store::ChromaVectorStore::open(url, dimension, collection).map_err(|err| err.to_string())?;
+                let label = format!("ChromaVectorStore (collection {collection}, dimension {dimension}; see ADR-48)");
+                Ok((Box::new(store), false, label))
+            }
+            #[cfg(not(feature = "chroma"))]
+            {
+                let _ = (json_snapshot_path, sqlite_path, postgres, qdrant, chroma);
+                Err("MEMORIA_VECTOR_STORE=chroma requires the server binary to be built with --features chroma".to_string())
+            }
+        }
+        other => Err(format!("unknown MEMORIA_VECTOR_STORE value {other:?} (expected \"local\", \"sqlite\", \"postgres\", \"qdrant\", or \"chroma\")")),
     }
 }
 
@@ -2080,14 +2103,19 @@ fn main() {
     let qdrant_url = std::env::var("MEMORIA_QDRANT_URL").ok();
     let qdrant_dimension = std::env::var("MEMORIA_QDRANT_DIMENSION").ok();
     let qdrant_collection = std::env::var("MEMORIA_QDRANT_COLLECTION").ok();
+    let chroma_url = std::env::var("MEMORIA_CHROMA_URL").ok();
+    let chroma_dimension = std::env::var("MEMORIA_CHROMA_DIMENSION").ok();
+    let chroma_collection = std::env::var("MEMORIA_CHROMA_COLLECTION").ok();
     let postgres_env = NetworkedStoreEnv { url: postgres_url.as_deref(), dimension: postgres_dimension.as_deref(), name: postgres_table.as_deref() };
     let qdrant_env = NetworkedStoreEnv { url: qdrant_url.as_deref(), dimension: qdrant_dimension.as_deref(), name: qdrant_collection.as_deref() };
+    let chroma_env = NetworkedStoreEnv { url: chroma_url.as_deref(), dimension: chroma_dimension.as_deref(), name: chroma_collection.as_deref() };
     let (vector_store, persist_json_snapshot, vector_store_label) = match resolve_vector_store(
         vector_store_choice.as_deref(),
         &store_path,
         &sqlite_path,
         postgres_env,
         qdrant_env,
+        chroma_env,
     ) {
             Ok(resolved) => resolved,
             Err(message) => {
@@ -2641,7 +2669,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("memoria-resolve-vector-store-default-{}", std::process::id()));
         let path = dir.join("does-not-exist.json");
         let (_, persist_json_snapshot, label) =
-            resolve_vector_store(None, &path, &dir.join("unused.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).expect("expected a store");
+            resolve_vector_store(None, &path, &dir.join("unused.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).expect("expected a store");
         assert!(label.contains("InMemoryVectorStore"), "got: {label}");
         assert!(persist_json_snapshot, "the local backend must keep saving JSON snapshots");
     }
@@ -2649,14 +2677,14 @@ mod tests {
     #[test]
     fn resolve_vector_store_rejects_an_unknown_choice() {
         let dir = std::env::temp_dir();
-        assert!(resolve_vector_store(Some("bogus"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).is_err());
+        assert!(resolve_vector_store(Some("bogus"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).is_err());
     }
 
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn resolve_vector_store_sqlite_choice_fails_clearly_without_the_feature() {
         let dir = std::env::temp_dir();
-        assert!(resolve_vector_store(Some("sqlite"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).is_err());
+        assert!(resolve_vector_store(Some("sqlite"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).is_err());
     }
 
     #[cfg(feature = "sqlite")]
@@ -2666,7 +2694,7 @@ mod tests {
         let db_path = dir.join("resolve-vector-store.db");
         let _ = std::fs::remove_file(&db_path);
         let (_, persist_json_snapshot, label) =
-            resolve_vector_store(Some("sqlite"), &dir.join("unused.json"), &db_path, NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).expect("expected a store");
+            resolve_vector_store(Some("sqlite"), &dir.join("unused.json"), &db_path, NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).expect("expected a store");
         assert!(label.contains("SqliteVectorStore"), "got: {label}");
         assert!(!persist_json_snapshot, "the sqlite backend persists itself; it must not also write a JSON snapshot");
         let _ = std::fs::remove_file(&db_path);
@@ -2677,7 +2705,7 @@ mod tests {
     fn resolve_vector_store_postgres_choice_fails_clearly_without_the_feature() {
         let dir = std::env::temp_dir();
         let postgres = NetworkedStoreEnv { url: Some("postgres://x"), dimension: Some("2"), name: None };
-        assert!(resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default()).is_err());
+        assert!(resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).is_err());
     }
 
     #[cfg(feature = "postgres")]
@@ -2685,7 +2713,7 @@ mod tests {
     fn resolve_vector_store_postgres_choice_requires_url() {
         let dir = std::env::temp_dir();
         let postgres = NetworkedStoreEnv { url: None, dimension: Some("2"), name: None };
-        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default()).err().expect("expected an error");
+        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_POSTGRES_URL"), "got: {err}");
     }
 
@@ -2694,7 +2722,7 @@ mod tests {
     fn resolve_vector_store_postgres_choice_requires_dimension() {
         let dir = std::env::temp_dir();
         let postgres = NetworkedStoreEnv { url: Some("postgres://x"), dimension: None, name: None };
-        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default()).err().expect("expected an error");
+        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_POSTGRES_DIMENSION"), "got: {err}");
     }
 
@@ -2703,7 +2731,7 @@ mod tests {
     fn resolve_vector_store_postgres_choice_rejects_a_non_numeric_dimension() {
         let dir = std::env::temp_dir();
         let postgres = NetworkedStoreEnv { url: Some("postgres://x"), dimension: Some("not-a-number"), name: None };
-        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default()).err().expect("expected an error");
+        let err = resolve_vector_store(Some("postgres"), &dir.join("a.json"), &dir.join("a.db"), postgres, NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_POSTGRES_DIMENSION"), "got: {err}");
     }
 
@@ -2716,7 +2744,7 @@ mod tests {
         let table = format!("memoria_resolve_vector_store_test_{}", std::process::id());
         let postgres = NetworkedStoreEnv { url: Some(&url), dimension: Some("2"), name: Some(&table) };
         let (_, persist_json_snapshot, label) =
-            resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), postgres, NetworkedStoreEnv::default()).expect("expected a store");
+            resolve_vector_store(Some("postgres"), &dir.join("unused.json"), &dir.join("unused.db"), postgres, NetworkedStoreEnv::default(), NetworkedStoreEnv::default()).expect("expected a store");
         assert!(label.contains("PgVectorStore"), "got: {label}");
         assert!(!persist_json_snapshot, "the postgres backend persists itself; it must not also write a JSON snapshot");
     }
@@ -2726,7 +2754,7 @@ mod tests {
     fn resolve_vector_store_qdrant_choice_fails_clearly_without_the_feature() {
         let dir = std::env::temp_dir();
         let qdrant = NetworkedStoreEnv { url: Some("http://x"), dimension: Some("2"), name: None };
-        assert!(resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant).is_err());
+        assert!(resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant, NetworkedStoreEnv::default()).is_err());
     }
 
     #[cfg(feature = "qdrant")]
@@ -2734,7 +2762,7 @@ mod tests {
     fn resolve_vector_store_qdrant_choice_requires_url() {
         let dir = std::env::temp_dir();
         let qdrant = NetworkedStoreEnv { url: None, dimension: Some("2"), name: None };
-        let err = resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant).err().expect("expected an error");
+        let err = resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant, NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_QDRANT_URL"), "got: {err}");
     }
 
@@ -2743,7 +2771,7 @@ mod tests {
     fn resolve_vector_store_qdrant_choice_requires_dimension() {
         let dir = std::env::temp_dir();
         let qdrant = NetworkedStoreEnv { url: Some("http://x"), dimension: None, name: None };
-        let err = resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant).err().expect("expected an error");
+        let err = resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant, NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_QDRANT_DIMENSION"), "got: {err}");
     }
 
@@ -2752,7 +2780,7 @@ mod tests {
     fn resolve_vector_store_qdrant_choice_rejects_a_non_numeric_dimension() {
         let dir = std::env::temp_dir();
         let qdrant = NetworkedStoreEnv { url: Some("http://x"), dimension: Some("not-a-number"), name: None };
-        let err = resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant).err().expect("expected an error");
+        let err = resolve_vector_store(Some("qdrant"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), qdrant, NetworkedStoreEnv::default()).err().expect("expected an error");
         assert!(err.contains("MEMORIA_QDRANT_DIMENSION"), "got: {err}");
     }
 
@@ -2765,9 +2793,68 @@ mod tests {
         let collection = format!("memoria_resolve_vector_store_test_{}", std::process::id());
         let qdrant = NetworkedStoreEnv { url: Some(&url), dimension: Some("2"), name: Some(&collection) };
         let (_, persist_json_snapshot, label) =
-            resolve_vector_store(Some("qdrant"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), qdrant).expect("expected a store");
+            resolve_vector_store(Some("qdrant"), &dir.join("unused.json"), &dir.join("unused.db"), NetworkedStoreEnv::default(), qdrant, NetworkedStoreEnv::default()).expect("expected a store");
         assert!(label.contains("QdrantVectorStore"), "got: {label}");
         assert!(!persist_json_snapshot, "the qdrant backend persists itself; it must not also write a JSON snapshot");
+    }
+
+    #[cfg(not(feature = "chroma"))]
+    #[test]
+    fn resolve_vector_store_chroma_choice_fails_clearly_without_the_feature() {
+        let dir = std::env::temp_dir();
+        let chroma = NetworkedStoreEnv { url: Some("http://x"), dimension: Some("2"), name: None };
+        assert!(resolve_vector_store(Some("chroma"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), chroma).is_err());
+    }
+
+    #[cfg(feature = "chroma")]
+    #[test]
+    fn resolve_vector_store_chroma_choice_requires_url() {
+        let dir = std::env::temp_dir();
+        let chroma = NetworkedStoreEnv { url: None, dimension: Some("2"), name: None };
+        let err =
+            resolve_vector_store(Some("chroma"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), chroma).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_CHROMA_URL"), "got: {err}");
+    }
+
+    #[cfg(feature = "chroma")]
+    #[test]
+    fn resolve_vector_store_chroma_choice_requires_dimension() {
+        let dir = std::env::temp_dir();
+        let chroma = NetworkedStoreEnv { url: Some("http://x"), dimension: None, name: None };
+        let err =
+            resolve_vector_store(Some("chroma"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), chroma).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_CHROMA_DIMENSION"), "got: {err}");
+    }
+
+    #[cfg(feature = "chroma")]
+    #[test]
+    fn resolve_vector_store_chroma_choice_rejects_a_non_numeric_dimension() {
+        let dir = std::env::temp_dir();
+        let chroma = NetworkedStoreEnv { url: Some("http://x"), dimension: Some("not-a-number"), name: None };
+        let err =
+            resolve_vector_store(Some("chroma"), &dir.join("a.json"), &dir.join("a.db"), NetworkedStoreEnv::default(), NetworkedStoreEnv::default(), chroma).err().expect("expected an error");
+        assert!(err.contains("MEMORIA_CHROMA_DIMENSION"), "got: {err}");
+    }
+
+    #[cfg(feature = "chroma")]
+    #[test]
+    #[ignore = "requires a real Chroma instance reachable at MEMORIA_TEST_CHROMA_URL"]
+    fn resolve_vector_store_chroma_choice_builds_and_does_not_persist_json_snapshot() {
+        let url = std::env::var("MEMORIA_TEST_CHROMA_URL").expect("MEMORIA_TEST_CHROMA_URL must be set for this test");
+        let dir = std::env::temp_dir();
+        let collection = format!("memoria_resolve_vector_store_test_{}", std::process::id());
+        let chroma = NetworkedStoreEnv { url: Some(&url), dimension: Some("2"), name: Some(&collection) };
+        let (_, persist_json_snapshot, label) = resolve_vector_store(
+            Some("chroma"),
+            &dir.join("unused.json"),
+            &dir.join("unused.db"),
+            NetworkedStoreEnv::default(),
+            NetworkedStoreEnv::default(),
+            chroma,
+        )
+        .expect("expected a store");
+        assert!(label.contains("ChromaVectorStore"), "got: {label}");
+        assert!(!persist_json_snapshot, "the chroma backend persists itself; it must not also write a JSON snapshot");
     }
 
     #[test]
