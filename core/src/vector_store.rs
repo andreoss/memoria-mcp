@@ -1729,12 +1729,13 @@ async fn milvus_handle_insert(client: &milvus::v2::ClientV2, collection: &str, d
 #[cfg(feature = "milvus")]
 async fn milvus_handle_get(client: &milvus::v2::ClientV2, collection: &str, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
     use milvus::v2::request::dql::GetRequest;
-    use milvus::v2::Ids;
+    use milvus::v2::{ConsistencyLevel, Ids};
 
     let request = GetRequest::builder()
         .collection_name(collection)
         .ids(Ids::VarChar(vec![id.to_string()]))
         .output_fields(["*"])
+        .consistency_level(ConsistencyLevel::Strong)
         .build()
         .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
     let response = client.get(request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
@@ -1767,6 +1768,7 @@ async fn milvus_handle_delete(client: &milvus::v2::ClientV2, collection: &str, i
 #[cfg(feature = "milvus")]
 async fn milvus_handle_list(client: &milvus::v2::ClientV2, collection: &str, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
     use milvus::v2::request::dql::QueryRequest;
+    use milvus::v2::ConsistencyLevel;
 
     const PAGE_SIZE: i64 = 1000;
     let mut ids = Vec::new();
@@ -1777,6 +1779,7 @@ async fn milvus_handle_list(client: &milvus::v2::ClientV2, collection: &str, off
             .output_fields([MILVUS_PRIMARY_FIELD])
             .limit(PAGE_SIZE)
             .offset(page_offset)
+            .consistency_level(ConsistencyLevel::Strong)
             .build()
             .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
         let response = client.query(request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
@@ -1815,14 +1818,16 @@ async fn milvus_handle_search(
     threshold: Option<f32>,
 ) -> Result<Vec<SearchResult>, VectorStoreError> {
     use milvus::v2::request::dql::SearchRequest;
-    use milvus::v2::{Ids, SearchVectors};
+    use milvus::v2::{ConsistencyLevel, Ids, SearchVectors};
 
-    let limit = i64::try_from(top_k).unwrap_or(i64::MAX).max(1);
+    const MILVUS_MAX_TOP_K: i64 = 16384;
+    let limit = i64::try_from(top_k).unwrap_or(i64::MAX).clamp(1, MILVUS_MAX_TOP_K);
     let mut builder = SearchRequest::builder()
         .collection_name(collection)
         .vector_field(MILVUS_VECTOR_FIELD)
         .vectors(SearchVectors::Float(vec![vector]))
         .output_fields(["*"])
+        .consistency_level(ConsistencyLevel::Strong)
         .limit(limit);
     let filter_expr = milvus_filter_expression(&filters);
     if !filter_expr.is_empty() {
