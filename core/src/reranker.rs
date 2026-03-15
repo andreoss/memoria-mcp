@@ -197,6 +197,56 @@ impl<L: crate::llm::LlmProvider> Reranker for LlmReranker<L> {
     }
 }
 
+#[cfg(feature = "fastembed")]
+fn sigmoid(logit: f32) -> f32 {
+    1.0 / (1.0 + (-logit).exp())
+}
+
+#[cfg(feature = "fastembed")]
+pub struct FastEmbedReranker {
+    model: std::sync::Mutex<fastembed::TextRerank>,
+}
+
+#[cfg(feature = "fastembed")]
+impl FastEmbedReranker {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn new(cache_dir: Option<std::path::PathBuf>) -> Result<Self, crate::CoreError> {
+        let mut options = fastembed::RerankInitOptions::new(fastembed::RerankerModel::BGERerankerBase);
+        if let Some(cache_dir) = cache_dir {
+            options = options.with_cache_dir(cache_dir);
+        }
+        let model = fastembed::TextRerank::try_new(options).map_err(|err| crate::CoreError::Config(format!("fastembed reranker init failed: {err}")))?;
+        Ok(Self { model: std::sync::Mutex::new(model) })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl Reranker for FastEmbedReranker {
+    fn rerank(&self, query: &str, results: Vec<SearchResult>) -> Result<Vec<SearchResult>, RerankError> {
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+        let documents: Vec<&str> = results.iter().map(|result| result.payload.get("content").map_or("", String::as_str)).collect();
+        let mut model = self.model.lock().expect("lock poisoned");
+        let scored = model.rerank(query, &documents, false, None).map_err(|err| RerankError::Backend(err.to_string()))?;
+        drop(model);
+        let mut relevance_by_index = vec![0.0_f32; results.len()];
+        for entry in scored {
+            relevance_by_index[entry.index] = sigmoid(entry.score);
+        }
+        let mut rescored: Vec<SearchResult> = results
+            .into_iter()
+            .zip(relevance_by_index)
+            .map(|(mut result, relevance)| {
+                result.score = 1.0 - relevance;
+                result
+            })
+            .collect();
+        rescored.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(rescored)
+    }
+}
+
 pub trait RerankerContractTests: Reranker {
     fn contract_empty_input_is_empty_output(&self) {
         let result = self.rerank("query", Vec::new()).expect("expected a successful rerank");
@@ -360,6 +410,59 @@ mod tests {
         let reranker = LlmReranker::new(crate::test_support::FakeLlmProvider::with_response("0.5"));
         reranker.contract_empty_input_is_empty_output();
         LlmReranker::new(crate::test_support::FakeLlmProvider::with_response("0.5")).contract_preserves_the_same_set_of_ids();
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn sigmoid_of_zero_logit_is_neutral() {
+        assert_score_eq(sigmoid(0.0), 0.5);
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn sigmoid_of_a_known_logit_matches_the_known_value() {
+        assert_score_eq(sigmoid(2.0), 0.880_797_1);
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn sigmoid_of_a_large_positive_logit_approaches_one() {
+        assert!(sigmoid(20.0) > 0.999_999);
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn sigmoid_of_a_large_negative_logit_approaches_zero() {
+        assert!(sigmoid(-20.0) < 0.000_001);
+    }
+
+    #[cfg(feature = "fastembed")]
+    mod fastembed_tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "downloads a real BAAI/bge-reranker-base model from HuggingFace Hub on first use"]
+        fn real_fastembed_reranker_ranks_the_genuinely_relevant_record_first() {
+            let reranker = FastEmbedReranker::new(None).expect("expected the real model to download and initialize");
+
+            let input = vec![
+                result_with_content("relevant", 0.5, "The cloud division's revenue exceeded expectations this quarter."),
+                result_with_content("unrelated", 0.5, "Bob prefers tea over coffee in the mornings."),
+            ];
+            let output = reranker.rerank("cloud division revenue", input).expect("expected a successful rerank");
+
+            assert_eq!(output[0].id, "relevant", "the genuinely relevant record should be ranked first by a real cross-encoder, got: {output:?}");
+            assert!(output[0].score < output[1].score, "the relevant record's distance should be lower than the unrelated one's, got: {output:?}");
+        }
+
+        #[test]
+        #[ignore = "downloads a real BAAI/bge-reranker-base model from HuggingFace Hub on first use"]
+        fn real_fastembed_reranker_passes_the_shared_contract() {
+            let reranker = FastEmbedReranker::new(None).expect("expected the real model to download and initialize");
+            reranker.contract_empty_input_is_empty_output();
+            let reranker = FastEmbedReranker::new(None).expect("expected the real model to download and initialize");
+            reranker.contract_preserves_the_same_set_of_ids();
+        }
     }
 
     #[cfg(feature = "ollama")]
