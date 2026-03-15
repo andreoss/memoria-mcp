@@ -1622,6 +1622,362 @@ impl VectorStore for ChromaVectorStore {
     }
 }
 
+#[cfg(feature = "milvus")]
+const MILVUS_PRIMARY_FIELD: &str = "id";
+#[cfg(feature = "milvus")]
+const MILVUS_VECTOR_FIELD: &str = "vector";
+
+#[cfg(feature = "milvus")]
+fn milvus_escape_filter_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(feature = "milvus")]
+fn milvus_filter_expression(filters: &HashMap<String, String>) -> String {
+    filters
+        .iter()
+        .map(|(key, value)| format!("{key} == \"{}\"", milvus_escape_filter_value(value)))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+#[cfg(feature = "milvus")]
+enum MilvusCommand {
+    Insert(VectorRecord, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Get(String, std::sync::mpsc::Sender<Result<Option<VectorRecord>, VectorStoreError>>),
+    Update(VectorRecord, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Delete(String, std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    List(usize, usize, std::sync::mpsc::Sender<Result<Vec<String>, VectorStoreError>>),
+    Reset(std::sync::mpsc::Sender<Result<(), VectorStoreError>>),
+    Search(Vec<f32>, usize, HashMap<String, String>, Option<f32>, std::sync::mpsc::Sender<Result<Vec<SearchResult>, VectorStoreError>>),
+}
+
+#[cfg(feature = "milvus")]
+pub struct MilvusVectorStore {
+    command_tx: std::sync::mpsc::Sender<MilvusCommand>,
+    dimension: usize,
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_ensure_collection(client: &milvus::v2::ClientV2, collection: &str, dimension: usize) -> Result<(), VectorStoreError> {
+    use milvus::v2::request::collection::{CreateSimpleCollectionRequest, HasCollectionRequest, LoadCollectionRequest};
+    use milvus::v2::{DataType, MetricType};
+
+    let dimension_u32 = u32::try_from(dimension).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let has_collection_request = HasCollectionRequest::builder().collection_name(collection).build().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let exists = client.has_collection(has_collection_request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?.exists();
+    if !exists {
+        let create_request = CreateSimpleCollectionRequest::builder()
+            .collection_name(collection)
+            .dimension(dimension_u32)
+            .primary_field_type(DataType::VarChar)
+            .enable_dynamic_field(true)
+            .metric_type(MetricType::L2)
+            .build()
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        client.create_collection(create_request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    }
+    let load_request = LoadCollectionRequest::builder()
+        .collection_name(collection)
+        .sync(true)
+        .build()
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    client.load_collection(load_request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "milvus")]
+fn milvus_row_json(dimension: usize, record: VectorRecord) -> Result<serde_json::Value, VectorStoreError> {
+    if record.vector.len() != dimension {
+        return Err(VectorStoreError::DimensionMismatch { expected: dimension, actual: record.vector.len() });
+    }
+    let mut row = serde_json::Map::new();
+    row.insert(MILVUS_PRIMARY_FIELD.to_string(), serde_json::Value::String(record.id));
+    row.insert(MILVUS_VECTOR_FIELD.to_string(), serde_json::Value::Array(record.vector.into_iter().map(serde_json::Value::from).collect()));
+    for (key, value) in record.payload {
+        row.insert(key, serde_json::Value::String(value));
+    }
+    Ok(serde_json::Value::Object(row))
+}
+
+#[cfg(feature = "milvus")]
+fn milvus_entity_row_to_record(row: &serde_json::Map<String, serde_json::Value>, fallback_id: &str) -> VectorRecord {
+    let id = row.get(MILVUS_PRIMARY_FIELD).and_then(serde_json::Value::as_str).unwrap_or(fallback_id).to_string();
+    #[allow(clippy::cast_possible_truncation)]
+    let vector = row
+        .get(MILVUS_VECTOR_FIELD)
+        .and_then(serde_json::Value::as_array)
+        .map(|values| values.iter().filter_map(serde_json::Value::as_f64).map(|value| value as f32).collect())
+        .unwrap_or_default();
+    let payload = row
+        .iter()
+        .filter(|(key, _)| key.as_str() != MILVUS_PRIMARY_FIELD && key.as_str() != MILVUS_VECTOR_FIELD)
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+        .collect();
+    VectorRecord { id, vector, payload }
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_insert(client: &milvus::v2::ClientV2, collection: &str, dimension: usize, record: VectorRecord) -> Result<(), VectorStoreError> {
+    use milvus::v2::request::dml::{InsertRequest, UpsertRequest};
+
+    let row = milvus_row_json(dimension, record)?;
+    let insert = InsertRequest::builder().collection_name(collection).row(row).build().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let upsert = UpsertRequest::builder().insert(insert).build().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    client.upsert(upsert).await.map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_get(client: &milvus::v2::ClientV2, collection: &str, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+    use milvus::v2::request::dql::GetRequest;
+    use milvus::v2::Ids;
+
+    let request = GetRequest::builder()
+        .collection_name(collection)
+        .ids(Ids::VarChar(vec![id.to_string()]))
+        .output_fields(["*"])
+        .build()
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let response = client.get(request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let rows = response.results().get_output_rows().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    Ok(rows.first().map(|row| milvus_entity_row_to_record(row, id)))
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_update(client: &milvus::v2::ClientV2, collection: &str, dimension: usize, record: VectorRecord) -> Result<(), VectorStoreError> {
+    let exists = milvus_handle_get(client, collection, &record.id).await?;
+    if exists.is_none() {
+        return Err(VectorStoreError::NotFound);
+    }
+    milvus_handle_insert(client, collection, dimension, record).await
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_delete(client: &milvus::v2::ClientV2, collection: &str, id: &str) -> Result<(), VectorStoreError> {
+    use milvus::v2::request::dml::DeleteRequest;
+    use milvus::v2::Ids;
+
+    let request = DeleteRequest::builder()
+        .collection_name(collection)
+        .ids(Ids::VarChar(vec![id.to_string()]))
+        .build()
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    client.delete(request).await.map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_list(client: &milvus::v2::ClientV2, collection: &str, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+    use milvus::v2::request::dql::QueryRequest;
+
+    const PAGE_SIZE: i64 = 1000;
+    let mut ids = Vec::new();
+    let mut page_offset: i64 = 0;
+    loop {
+        let request = QueryRequest::builder()
+            .collection_name(collection)
+            .output_fields([MILVUS_PRIMARY_FIELD])
+            .limit(PAGE_SIZE)
+            .offset(page_offset)
+            .build()
+            .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let response = client.query(request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let rows = response.results().get_output_rows().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let page_len = rows.len();
+        for row in &rows {
+            if let Some(id) = row.get(MILVUS_PRIMARY_FIELD).and_then(serde_json::Value::as_str) {
+                ids.push(id.to_string());
+            }
+        }
+        if i64::try_from(page_len).unwrap_or(i64::MAX) < PAGE_SIZE {
+            break;
+        }
+        page_offset += PAGE_SIZE;
+    }
+    ids.sort();
+    Ok(ids.into_iter().skip(offset).take(limit).collect())
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_reset(client: &milvus::v2::ClientV2, collection: &str, dimension: usize) -> Result<(), VectorStoreError> {
+    use milvus::v2::request::collection::DropCollectionRequest;
+
+    let request = DropCollectionRequest::builder().collection_name(collection).build().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    client.drop_collection(request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    milvus_ensure_collection(client, collection, dimension).await
+}
+
+#[cfg(feature = "milvus")]
+async fn milvus_handle_search(
+    client: &milvus::v2::ClientV2,
+    collection: &str,
+    vector: Vec<f32>,
+    top_k: usize,
+    filters: HashMap<String, String>,
+    threshold: Option<f32>,
+) -> Result<Vec<SearchResult>, VectorStoreError> {
+    use milvus::v2::request::dql::SearchRequest;
+    use milvus::v2::{Ids, SearchVectors};
+
+    let limit = i64::try_from(top_k).unwrap_or(i64::MAX).max(1);
+    let mut builder = SearchRequest::builder()
+        .collection_name(collection)
+        .vector_field(MILVUS_VECTOR_FIELD)
+        .vectors(SearchVectors::Float(vec![vector]))
+        .output_fields(["*"])
+        .limit(limit);
+    let filter_expr = milvus_filter_expression(&filters);
+    if !filter_expr.is_empty() {
+        builder = builder.filter(filter_expr);
+    }
+    let request = builder.build().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let response = client.search(request).await.map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let Some(single) = response.results().iter().next() else {
+        return Ok(Vec::new());
+    };
+    let ids = single.get_ids();
+    let scores = single.get_scores();
+    let rows = single.get_output_rows().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+    let mut results = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let fallback = match ids {
+            Ids::Int64(values) => values.get(index).map(ToString::to_string).unwrap_or_default(),
+            Ids::VarChar(values) => values.get(index).cloned().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let record = milvus_entity_row_to_record(row, &fallback);
+        let score = scores.get(index).copied().unwrap_or(f32::MAX);
+        results.push(SearchResult { id: record.id, score, payload: record.payload });
+    }
+    if let Some(threshold) = threshold {
+        results.retain(|result| result.score <= threshold);
+    }
+    Ok(results)
+}
+
+#[cfg(feature = "milvus")]
+#[allow(clippy::needless_pass_by_value)]
+fn milvus_run_dispatcher(url: String, dimension: usize, collection: String, ready_tx: std::sync::mpsc::Sender<Result<(), VectorStoreError>>, command_rx: std::sync::mpsc::Receiver<MilvusCommand>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = ready_tx.send(Err(VectorStoreError::Backend(err.to_string())));
+            return;
+        }
+    };
+    let config = milvus::v2::ConnectConfig::new().uri(url);
+    let client = match runtime.block_on(milvus::v2::ClientV2::new(&config)) {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = ready_tx.send(Err(VectorStoreError::Backend(err.to_string())));
+            return;
+        }
+    };
+    if let Err(err) = runtime.block_on(milvus_ensure_collection(&client, &collection, dimension)) {
+        let _ = ready_tx.send(Err(err));
+        return;
+    }
+    if ready_tx.send(Ok(())).is_err() {
+        return;
+    }
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            MilvusCommand::Insert(record, reply) => {
+                let result = runtime.block_on(milvus_handle_insert(&client, &collection, dimension, record));
+                let _ = reply.send(result);
+            }
+            MilvusCommand::Get(id, reply) => {
+                let result = runtime.block_on(milvus_handle_get(&client, &collection, &id));
+                let _ = reply.send(result);
+            }
+            MilvusCommand::Update(record, reply) => {
+                let result = runtime.block_on(milvus_handle_update(&client, &collection, dimension, record));
+                let _ = reply.send(result);
+            }
+            MilvusCommand::Delete(id, reply) => {
+                let result = runtime.block_on(milvus_handle_delete(&client, &collection, &id));
+                let _ = reply.send(result);
+            }
+            MilvusCommand::List(offset, limit, reply) => {
+                let result = runtime.block_on(milvus_handle_list(&client, &collection, offset, limit));
+                let _ = reply.send(result);
+            }
+            MilvusCommand::Reset(reply) => {
+                let result = runtime.block_on(milvus_handle_reset(&client, &collection, dimension));
+                let _ = reply.send(result);
+            }
+            MilvusCommand::Search(vector, top_k, filters, threshold, reply) => {
+                let result = runtime.block_on(milvus_handle_search(&client, &collection, vector, top_k, filters, threshold));
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "milvus")]
+impl MilvusVectorStore {
+    #[allow(clippy::missing_errors_doc)]
+    pub fn open(url: &str, dimension: usize, collection: &str) -> Result<Self, VectorStoreError> {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<MilvusCommand>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), VectorStoreError>>();
+        let url = url.to_string();
+        let collection = collection.to_string();
+        std::thread::spawn(move || milvus_run_dispatcher(url, dimension, collection, ready_tx, command_rx));
+        ready_rx
+            .recv()
+            .map_err(|_| VectorStoreError::Backend("milvus dispatcher thread exited before startup completed".to_string()))??;
+        Ok(Self { command_tx, dimension })
+    }
+
+    fn send<T>(&self, build_command: impl FnOnce(std::sync::mpsc::Sender<Result<T, VectorStoreError>>) -> MilvusCommand) -> Result<T, VectorStoreError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .send(build_command(reply_tx))
+            .map_err(|_| VectorStoreError::Backend("milvus dispatcher thread is no longer running".to_string()))?;
+        reply_rx.recv().map_err(|_| VectorStoreError::Backend("milvus dispatcher thread dropped the reply channel".to_string()))?
+    }
+}
+
+#[cfg(feature = "milvus")]
+impl VectorStore for MilvusVectorStore {
+    fn insert(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        self.send(|reply| MilvusCommand::Insert(record, reply))
+    }
+
+    fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>, threshold: Option<f32>) -> Result<Vec<SearchResult>, VectorStoreError> {
+        let vector = vector.to_vec();
+        let filters = filters.clone();
+        self.send(|reply| MilvusCommand::Search(vector, top_k, filters, threshold, reply))
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
+        let id = id.to_string();
+        self.send(|reply| MilvusCommand::Get(id, reply))
+    }
+
+    fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
+        if record.vector.len() != self.dimension {
+            return Err(VectorStoreError::DimensionMismatch { expected: self.dimension, actual: record.vector.len() });
+        }
+        self.send(|reply| MilvusCommand::Update(record, reply))
+    }
+
+    fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
+        let id = id.to_string();
+        self.send(|reply| MilvusCommand::Delete(id, reply))
+    }
+
+    fn list(&self, offset: usize, limit: usize) -> Result<Vec<String>, VectorStoreError> {
+        self.send(|reply| MilvusCommand::List(offset, limit, reply))
+    }
+
+    fn reset(&self) -> Result<(), VectorStoreError> {
+        self.send(MilvusCommand::Reset)
+    }
+
+    fn keyword_search(&self, _query: &str, _top_k: usize, _filters: &HashMap<String, String>) -> Result<Option<Vec<SearchResult>>, VectorStoreError> {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InMemoryVectorStore, VectorStore, VectorStoreConfig, VectorStoreContractTests};
@@ -2540,6 +2896,150 @@ mod tests {
         fn concurrent_callers_from_real_os_threads_all_succeed() {
             let Some(store) = temp_store("concurrent_callers") else {
                 panic!("MEMORIA_TEST_CHROMA_URL must be set to run this test");
+            };
+            let store = std::sync::Arc::new(store);
+            #[allow(clippy::needless_collect)]
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let store = std::sync::Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        let id = format!("concurrent-{i}");
+                        #[allow(clippy::cast_precision_loss)]
+                        let value = i as f32;
+                        store.insert(VectorRecord::new(id.clone(), vec![value, value], HashMap::new())).expect("insert should succeed");
+                        store.get(&id).expect("get should succeed").expect("record should exist")
+                    })
+                })
+                .collect();
+            let records: Vec<VectorRecord> = handles.into_iter().map(|h| h.join().expect("thread should not panic")).collect();
+            assert_eq!(records.len(), 8);
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(record.id, format!("concurrent-{i}"));
+                #[allow(clippy::cast_precision_loss)]
+                let expected = i as f32;
+                assert_eq!(record.vector, vec![expected, expected], "each thread's own record must round-trip without cross-request corruption");
+            }
+        }
+    }
+
+    #[cfg(feature = "milvus")]
+    mod milvus_tests {
+        use super::super::{MilvusVectorStore, VectorRecord, VectorStore, VectorStoreContractTests};
+        use std::collections::HashMap;
+
+        #[test]
+        fn milvus_filter_expression_escapes_embedded_quotes_and_backslashes() {
+            let filters = HashMap::from([("user_id".to_string(), "ali\"ce\\bob".to_string())]);
+            let expr = super::super::milvus_filter_expression(&filters);
+            assert_eq!(expr, "user_id == \"ali\\\"ce\\\\bob\"");
+        }
+
+        fn test_url() -> Option<String> {
+            std::env::var("MEMORIA_TEST_MILVUS_URL").ok()
+        }
+
+        struct TempStore {
+            store: MilvusVectorStore,
+        }
+
+        impl Drop for TempStore {
+            fn drop(&mut self) {
+                let _ = self.store.reset();
+            }
+        }
+
+        impl std::ops::Deref for TempStore {
+            type Target = MilvusVectorStore;
+            fn deref(&self) -> &Self::Target {
+                &self.store
+            }
+        }
+
+        fn temp_store(name: &str) -> Option<TempStore> {
+            let url = test_url()?;
+            let collection = format!("memoria_milvus_test_{name}_{}", std::process::id());
+            let store = MilvusVectorStore::open(&url, 2, &collection).expect("open should succeed");
+            store.reset().expect("reset should succeed");
+            Some(TempStore { store })
+        }
+
+        macro_rules! milvus_contract_test {
+            ($test_name:ident, $slug:literal, $contract:ident) => {
+                #[test]
+                #[ignore = "requires a real Milvus instance reachable at MEMORIA_TEST_MILVUS_URL"]
+                fn $test_name() {
+                    let Some(store) = temp_store($slug) else {
+                        panic!("MEMORIA_TEST_MILVUS_URL must be set to run this test");
+                    };
+                    store.$contract();
+                }
+            };
+        }
+
+        milvus_contract_test!(milvus_store_passes_insert_then_get_contract, "insert_then_get", contract_insert_then_get_round_trips);
+        milvus_contract_test!(milvus_store_passes_delete_then_get_contract, "delete_then_get", contract_delete_then_get_returns_none);
+        milvus_contract_test!(milvus_store_passes_reset_contract, "reset", contract_reset_clears_everything);
+        milvus_contract_test!(milvus_store_passes_search_respects_top_k_contract, "search_top_k", contract_search_respects_top_k);
+        milvus_contract_test!(milvus_store_passes_search_orders_by_score_contract, "search_orders", contract_search_orders_by_score);
+        milvus_contract_test!(milvus_store_passes_search_respects_threshold_contract, "search_threshold", contract_search_respects_threshold);
+        milvus_contract_test!(
+            milvus_store_passes_search_with_no_threshold_returns_everything_contract,
+            "search_no_threshold",
+            contract_search_with_no_threshold_returns_everything_up_to_top_k
+        );
+        milvus_contract_test!(milvus_store_passes_search_filters_by_metadata_key_contract, "search_filters_metadata", contract_search_filters_by_metadata_key);
+        milvus_contract_test!(milvus_store_passes_search_filters_by_agent_id_contract, "search_filters_agent", contract_search_filters_by_agent_id);
+        milvus_contract_test!(milvus_store_passes_search_filters_by_run_id_contract, "search_filters_run", contract_search_filters_by_run_id);
+        milvus_contract_test!(milvus_store_passes_update_then_get_contract, "update_then_get", contract_update_then_get_reflects_change);
+        milvus_contract_test!(milvus_store_passes_update_nonexistent_contract, "update_nonexistent", contract_update_nonexistent_returns_not_found);
+        milvus_contract_test!(milvus_store_passes_delete_nonexistent_is_idempotent_contract, "delete_nonexistent", contract_delete_nonexistent_is_idempotent);
+        milvus_contract_test!(milvus_store_passes_list_returns_all_inserted_ids_contract, "list_all", contract_list_returns_all_inserted_ids);
+        milvus_contract_test!(milvus_store_passes_list_on_empty_store_returns_empty_contract, "list_empty", contract_list_on_empty_store_returns_empty);
+        milvus_contract_test!(milvus_store_passes_insert_rejects_mismatched_dimension_contract, "dimension_mismatch", contract_insert_rejects_mismatched_dimension);
+        milvus_contract_test!(milvus_store_passes_list_pagination_respects_offset_and_limit_contract, "pagination", contract_list_pagination_respects_offset_and_limit);
+
+        #[test]
+        #[ignore = "requires a real Milvus instance reachable at MEMORIA_TEST_MILVUS_URL"]
+        fn records_survive_reopening_the_same_collection() {
+            let Some(url) = test_url() else {
+                panic!("MEMORIA_TEST_MILVUS_URL must be set to run this test");
+            };
+            let collection = format!("memoria_milvus_test_durability_{}", std::process::id());
+            {
+                let store = MilvusVectorStore::open(&url, 3, &collection).expect("open should succeed");
+                store.reset().expect("reset should succeed");
+                store
+                    .insert(VectorRecord::new("rec-1", vec![1.0, 2.0, 3.0], HashMap::from([("user_id".to_string(), "alice".to_string())])))
+                    .expect("insert should succeed");
+            }
+            let reopened = MilvusVectorStore::open(&url, 3, &collection).expect("reopen should succeed");
+            let record = reopened.get("rec-1").expect("get should succeed").expect("record should survive reopening the store");
+            assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
+            assert_eq!(record.payload.get("user_id"), Some(&"alice".to_string()));
+            reopened.reset().expect("cleanup reset should succeed");
+        }
+
+        #[test]
+        #[ignore = "requires a real Milvus instance reachable at MEMORIA_TEST_MILVUS_URL"]
+        fn search_filter_with_an_embedded_quote_round_trips() {
+            let Some(store) = temp_store("filter_quote") else {
+                panic!("MEMORIA_TEST_MILVUS_URL must be set to run this test");
+            };
+            let tricky = "ali\"ce";
+            store
+                .insert(VectorRecord::new("rec-1", vec![1.0, 2.0], HashMap::from([("user_id".to_string(), tricky.to_string())])))
+                .expect("insert should succeed");
+            let filters = HashMap::from([("user_id".to_string(), tricky.to_string())]);
+            let results = store.search(&[1.0, 2.0], 10, &filters, None).expect("search with an escaped filter value should succeed");
+            assert_eq!(results.len(), 1, "the escaped filter must still match the record it was stored with");
+            assert_eq!(results[0].id, "rec-1");
+        }
+
+        #[test]
+        #[ignore = "requires a real Milvus instance reachable at MEMORIA_TEST_MILVUS_URL"]
+        fn concurrent_callers_from_real_os_threads_all_succeed() {
+            let Some(store) = temp_store("concurrent_callers") else {
+                panic!("MEMORIA_TEST_MILVUS_URL must be set to run this test");
             };
             let store = std::sync::Arc::new(store);
             #[allow(clippy::needless_collect)]

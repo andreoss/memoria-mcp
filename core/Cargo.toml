@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["v5"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 tonic = { version = "0.14", default-features = false, optional = true }
 chroma = { version = "0.15", default-features = false, features = ["rustls"], optional = true }
+milvus = { package = "milvus-sdk-rust", version = "2.6", optional = true }
 
 [features]
 serde = ["dep:serde"]
@@ -38,3 +39,4 @@ candle = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:h
 postgres = ["dep:postgres", "dep:pgvector"]
 qdrant = ["dep:qdrant-client", "dep:uuid", "dep:tokio", "dep:tonic"]
 chroma = ["dep:chroma", "dep:tokio", "dep:reqwest"]
+milvus = ["dep:milvus", "dep:tokio"]
