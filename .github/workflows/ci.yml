@@ -139,6 +139,15 @@ jobs:
       - name: Cargo Test (chroma feature, non-live cases only)
         run: cargo test -p memoria-core -p server -p mcp --features chroma
 
+      - name: Cargo Build (milvus feature)
+        run: cargo build -p memoria-core -p server -p mcp --features milvus
+
+      - name: Cargo Clippy (milvus feature, All Targets, Deny Warnings)
+        run: cargo clippy -p memoria-core -p server -p mcp --features milvus --all-targets -- -D warnings
+
+      - name: Cargo Test (milvus feature, non-live cases only)
+        run: cargo test -p memoria-core -p server -p mcp --features milvus
+
   test-real-qdrant:
     name: Real Qdrant Contract Test (ADR-47 Increment 1)
     runs-on: ubuntu-latest
@@ -211,6 +220,73 @@ jobs:
           MEMORIA_TEST_CHROMA_URL: http://127.0.0.1:8000
         run: |
           cargo test -p server -p mcp --features chroma resolve_vector_store_chroma_choice_builds -- --ignored
+
+  test-real-milvus:
+    name: Real Milvus Contract Test (ADR-49 Increment 1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Start Milvus Standalone (embedded etcd, local storage)
+        run: |
+          mkdir -p volumes/milvus
+          cat << 'EOF' > embedEtcd.yaml
+          listen-client-urls: http://0.0.0.0:2379
+          advertise-client-urls: http://0.0.0.0:2379
+          quota-backend-bytes: 4294967296
+          auto-compaction-mode: revision
+          auto-compaction-retention: '1000'
+          EOF
+          cat << 'EOF' > user.yaml
+          # Extra config to override default milvus.yaml
+          EOF
+          chmod -R 777 volumes
+          docker run -d \
+            --name milvus-standalone \
+            --security-opt seccomp:unconfined \
+            -e ETCD_USE_EMBED=true \
+            -e ETCD_DATA_DIR=/var/lib/milvus/etcd \
+            -e ETCD_CONFIG_PATH=/milvus/configs/embedEtcd.yaml \
+            -e COMMON_STORAGETYPE=local \
+            -e DEPLOY_MODE=STANDALONE \
+            -v "$(pwd)/volumes/milvus:/var/lib/milvus" \
+            -v "$(pwd)/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml" \
+            -v "$(pwd)/user.yaml:/milvus/configs/user.yaml" \
+            -p 19530:19530 \
+            -p 9091:9091 \
+            -p 2379:2379 \
+            milvusdb/milvus:v3.0.0 \
+            milvus run standalone
+
+      - name: Wait for Milvus to Accept Connections
+        run: |
+          for _ in $(seq 1 90); do
+            if curl -s http://127.0.0.1:9091/healthz | grep -q OK; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Milvus did not become healthy in time"
+          docker logs milvus-standalone
+          exit 1
+
+      - name: Run Real MilvusVectorStore Contract Tests (VectorStoreContractTests, live against milvusdb/milvus)
+        env:
+          MEMORIA_TEST_MILVUS_URL: http://127.0.0.1:19530
+        run: |
+          cargo test -p memoria-core --features milvus milvus_tests -- --ignored --test-threads=8
+
+      - name: Run Real resolve_vector_store Milvus Tests (server, mcp)
+        env:
+          MEMORIA_TEST_MILVUS_URL: http://127.0.0.1:19530
+        run: |
+          cargo test -p server -p mcp --features milvus resolve_vector_store_milvus_choice_builds -- --ignored
 
   test-real-pgvector:
     name: Real pgvector Contract + Hybrid Search Test (ADR-46 Increments 2-3)
