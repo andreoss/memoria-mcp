@@ -155,12 +155,16 @@ struct CreateMemoryRequest {
     infer: Option<bool>,
     memory_type: Option<String>,
     expiration_date: Option<String>,
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct MessageInput {
     role: String,
     content: String,
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 fn parse_message_role(role: &str) -> Option<Role> {
@@ -649,11 +653,11 @@ where
                     error_body(format!("unknown message role {:?} (expected \"system\", \"user\", or \"assistant\")", input.role)),
                 );
             };
-            parsed.push(Message::new(role, input.content));
+            parsed.push(Message::with_images(role, input.content, input.images));
         }
         parsed
     } else if let Some(content) = request.content {
-        vec![Message::new(Role::User, content)]
+        vec![Message::with_images(Role::User, content, request.images)]
     } else {
         return (400, error_body("request body must include either \"content\" or \"messages\""));
     };
@@ -2366,6 +2370,14 @@ mod tests {
         }
     }
 
+    struct DescribingLlmProvider;
+
+    impl core::llm::LlmProvider for DescribingLlmProvider {
+        fn complete(&self, _messages: &[Message]) -> Result<core::llm::Completion, core::llm::LlmError> {
+            Ok(core::llm::Completion { content: "A photo of a red bicycle.".to_string() })
+        }
+    }
+
     #[test]
     fn error_response_maps_validation_to_400() {
         let (status, _) = error_response(&core::CoreError::Validation("bad input".to_string()));
@@ -3525,6 +3537,50 @@ mod tests {
         let id = response.ids.first().expect("expected at least one id");
         let record = memory.get(id).expect("get should succeed").expect("record should exist");
         assert_eq!(record.payload.get("content"), Some(&"The user is allergic to shellfish.".to_string()));
+    }
+
+    #[test]
+    fn handle_create_memory_with_images_on_content_path_describes_it_before_storage() {
+        let memory = Memory::new(DescribingLlmProvider, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"","user_id":"alice","infer":false,"images":["base64imagedata"]}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"A photo of a red bicycle.".to_string()),
+            "an image-bearing content-only request must be described before storage"
+        );
+    }
+
+    #[test]
+    fn handle_create_memory_with_images_on_messages_path_describes_it_before_storage() {
+        let memory = Memory::new(DescribingLlmProvider, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"messages":[{"role":"user","content":"","images":["base64imagedata"]}],"user_id":"alice","infer":false}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"A photo of a red bicycle.".to_string()),
+            "an image-bearing messages[] entry must be described before storage"
+        );
+    }
+
+    #[test]
+    fn handle_create_memory_without_images_is_unaffected() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let body = br#"{"content":"Alice is an engineer.","user_id":"alice","infer":false}"#;
+        let (status, response_body) = handle_create_memory(&memory, body);
+        assert_eq!(status, 201);
+        let response: CreateMemoryResponse = serde_json::from_slice(&response_body).expect("expected valid JSON");
+        let id = response.ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("record should exist");
+        assert_eq!(record.payload.get("content"), Some(&"Alice is an engineer.".to_string()));
     }
 
     #[test]
