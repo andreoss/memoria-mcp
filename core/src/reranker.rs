@@ -440,10 +440,14 @@ mod tests {
     mod fastembed_tests {
         use super::*;
 
+        fn test_cache_dir() -> Option<std::path::PathBuf> {
+            std::env::var("MEMORIA_TEST_FASTEMBED_CACHE_DIR").ok().map(std::path::PathBuf::from)
+        }
+
         #[test]
         #[ignore = "downloads a real BAAI/bge-reranker-base model from HuggingFace Hub on first use"]
         fn real_fastembed_reranker_ranks_the_genuinely_relevant_record_first() {
-            let reranker = FastEmbedReranker::new(None).expect("expected the real model to download and initialize");
+            let reranker = FastEmbedReranker::new(test_cache_dir()).expect("expected the real model to download and initialize");
 
             let input = vec![
                 result_with_content("relevant", 0.5, "The cloud division's revenue exceeded expectations this quarter."),
@@ -458,9 +462,9 @@ mod tests {
         #[test]
         #[ignore = "downloads a real BAAI/bge-reranker-base model from HuggingFace Hub on first use"]
         fn real_fastembed_reranker_passes_the_shared_contract() {
-            let reranker = FastEmbedReranker::new(None).expect("expected the real model to download and initialize");
+            let reranker = FastEmbedReranker::new(test_cache_dir()).expect("expected the real model to download and initialize");
             reranker.contract_empty_input_is_empty_output();
-            let reranker = FastEmbedReranker::new(None).expect("expected the real model to download and initialize");
+            let reranker = FastEmbedReranker::new(test_cache_dir()).expect("expected the real model to download and initialize");
             reranker.contract_preserves_the_same_set_of_ids();
         }
     }
