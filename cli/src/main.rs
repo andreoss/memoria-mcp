@@ -36,6 +36,8 @@ enum Command {
         agent_id: Option<String>,
         #[arg(long, help = "Scope this memory to a run")]
         run_id: Option<String>,
+        #[arg(long, help = "Store CONTENT verbatim instead of extracting facts from it")]
+        no_infer: bool,
     },
     #[command(about = "Search stored memories within a scope")]
     Search {
@@ -53,6 +55,8 @@ enum Command {
         threshold: Option<f32>,
         #[arg(long, help = "Rerank results using the configured reranker (MEMORIA_RERANKER)")]
         rerank: bool,
+        #[arg(long, value_parser = parse_filter_arg, help = "Filter results with a JSON filter expression (ADR-30)")]
+        filter: Option<core::filter::FilterExpr>,
     },
     #[command(about = "Fetch a single memory by id")]
     Get {
@@ -199,6 +203,11 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .ok_or_else(|| format!("expected KEY=VALUE, got {s:?}"))
+}
+
+fn parse_filter_arg(s: &str) -> Result<core::filter::FilterExpr, String> {
+    let value: serde_json::Value = serde_json::from_str(s).map_err(|err| format!("malformed filter JSON: {err}"))?;
+    core::filter::parse_filter_expr(&value).map_err(|err| format!("malformed filters: {err}"))
 }
 
 fn build_scope(user_id: Option<String>, agent_id: Option<String>, run_id: Option<String>) -> HashMap<String, String> {
@@ -500,9 +509,9 @@ fn run<L, E, V>(
     V: core::vector_store::VectorStore,
 {
     match command {
-        Command::Add { content, user_id, agent_id, run_id } => {
+        Command::Add { content, user_id, agent_id, run_id, no_infer } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.add(&[Message::new(Role::User, content)], scope, true) {
+            match memory.add(&[Message::new(Role::User, content)], scope, !no_infer) {
                 Ok(ids) => {
                     print_ids(&ids, json, quiet);
                     save_store(memory, path);
@@ -514,9 +523,9 @@ fn run<L, E, V>(
                 }
             }
         }
-        Command::Search { query, user_id, agent_id, run_id, top_k, threshold, rerank } => {
+        Command::Search { query, user_id, agent_id, run_id, top_k, threshold, rerank, filter } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.search(&query, top_k, &scope, threshold, true, None, rerank) {
+            match memory.search(&query, top_k, &scope, threshold, true, filter.as_ref(), rerank) {
                 Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -858,6 +867,27 @@ mod tests {
     #[test]
     fn parse_key_value_keeps_everything_after_first_equals() {
         assert_eq!(parse_key_value("url=http://x=y"), Ok(("url".to_string(), "http://x=y".to_string())));
+    }
+
+    #[test]
+    fn parse_filter_arg_parses_a_bare_equality_condition() {
+        let parsed = parse_filter_arg(r#"{"user_id":"alice"}"#).expect("expected a valid filter");
+        assert_eq!(
+            parsed,
+            core::filter::FilterExpr::Field("user_id".to_string(), core::filter::FilterOp::Eq(core::filter::FilterValue::String("alice".to_string())))
+        );
+    }
+
+    #[test]
+    fn parse_filter_arg_rejects_malformed_json() {
+        let err = parse_filter_arg("not json").expect_err("expected a parse error");
+        assert!(err.contains("malformed filter JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_filter_arg_rejects_a_non_object_filter() {
+        let err = parse_filter_arg(r#""just a string""#).expect_err("expected a validation error");
+        assert!(err.contains("malformed filters"), "got: {err}");
     }
 
     #[test]

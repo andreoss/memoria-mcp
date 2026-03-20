@@ -46,6 +46,18 @@ check "get returns the real content" "true" "$(contains "${get_output}" "Alice i
 search_output="$("${cli_bin}" --json search "engineer" --user-id smoke)"
 check "search finds the record within scope" "true" "$(contains "${search_output}" "${record_id}")"
 
+noinfer_output="$("${cli_bin}" --json add "The quick brown fox jumps over the lazy dog." --user-id smoke --no-infer)"
+noinfer_id="$(printf '%s' "${noinfer_output}" | grep -o '"[^"]*"' | head -n1 | tr -d '"')"
+noinfer_get="$("${cli_bin}" --json get "${noinfer_id}")"
+check "--no-infer stores the content verbatim" "true" "$(contains "${noinfer_get}" "The quick brown fox jumps over the lazy dog.")"
+
+filter_output="$("${cli_bin}" --json search "engineer" --user-id smoke --filter "{\"content\":{\"icontains\":\"fox\"}}")"
+check "--filter excludes a record that doesn't match" "true" "$([[ "${filter_output}" != *"${record_id}"* ]] && echo true || echo false)"
+check "--filter includes a record that does match" "true" "$(contains "${filter_output}" "${noinfer_id}")"
+
+check "--filter with malformed JSON is rejected" 2 \
+  "$("${cli_bin}" search "x" --user-id smoke --filter "not json" > /dev/null 2>&1; echo $?)"
+
 list_output="$("${cli_bin}" --json list --user-id smoke)"
 check "list includes the record id" "true" "$(contains "${list_output}" "${record_id}")"
 
