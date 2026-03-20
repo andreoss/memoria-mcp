@@ -383,6 +383,7 @@ fn resolve_reranker(
     llm_model: Option<String>,
     llm_base_url: Option<String>,
     llm_candle_cache_dir: Option<String>,
+    fastembed_cache_dir: Option<String>,
 ) -> RerankerResolution {
     match choice {
         None => Ok(None),
@@ -395,7 +396,22 @@ fn resolve_reranker(
             let label = format!("LlmReranker (llm={llm_label}; see ADR-36)");
             Ok(Some((Box::new(core::reranker::LlmReranker::new(llm_provider)), label)))
         }
-        Some(other) => Err(format!("unknown MEMORIA_RERANKER value {other:?} (expected \"local\" or \"llm\")")),
+        Some("fastembed") => {
+            #[cfg(feature = "fastembed")]
+            {
+                let cache_dir = fastembed_cache_dir.clone().map(std::path::PathBuf::from);
+                let reranker = core::reranker::FastEmbedReranker::new(cache_dir).map_err(|err| err.to_string())?;
+                let cache_label = fastembed_cache_dir.unwrap_or_else(|| ".fastembed_cache (default)".to_string());
+                let label = format!("FastEmbedReranker (model=BAAI/bge-reranker-base, cache_dir={cache_label}; see ADR-50)");
+                Ok(Some((Box::new(reranker), label)))
+            }
+            #[cfg(not(feature = "fastembed"))]
+            {
+                let _ = (fastembed_cache_dir,);
+                Err("MEMORIA_RERANKER=fastembed requires the cli binary to be built with --features fastembed".to_string())
+            }
+        }
+        Some(other) => Err(format!("unknown MEMORIA_RERANKER value {other:?} (expected \"local\", \"llm\", or \"fastembed\")")),
     }
 }
 
@@ -447,6 +463,7 @@ fn main() {
         std::env::var("MEMORIA_LLM_MODEL").ok(),
         std::env::var("MEMORIA_LLM_BASE_URL").ok(),
         std::env::var("MEMORIA_CANDLE_CACHE_DIR").ok(),
+        std::env::var("MEMORIA_FASTEMBED_CACHE_DIR").ok(),
     ) {
         Ok(resolved) => resolved,
         Err(message) => {
@@ -626,32 +643,47 @@ mod tests {
 
     #[test]
     fn resolve_reranker_with_nothing_set_resolves_to_none() {
-        let resolved = resolve_reranker(None, None, None, None, None).expect("expected a resolution");
+        let resolved = resolve_reranker(None, None, None, None, None, None).expect("expected a resolution");
         assert!(resolved.is_none(), "no MEMORIA_RERANKER should mean no reranker is configured, not a default one");
     }
 
     #[test]
     fn resolve_reranker_local_choice_resolves_to_a_real_reranker() {
-        let (_, label) = resolve_reranker(Some("local"), None, None, None, None).expect("expected a resolution").expect("expected a reranker");
+        let (_, label) = resolve_reranker(Some("local"), None, None, None, None, None).expect("expected a resolution").expect("expected a reranker");
         assert!(label.contains("LocalOverlapReranker"), "got: {label}");
     }
 
     #[test]
     fn resolve_reranker_llm_choice_resolves_to_a_real_reranker() {
-        let (_, label) = resolve_reranker(Some("llm"), None, None, None, None).expect("expected a resolution").expect("expected a reranker");
+        let (_, label) = resolve_reranker(Some("llm"), None, None, None, None, None).expect("expected a resolution").expect("expected a reranker");
         assert!(label.contains("LlmReranker"), "got: {label}");
     }
 
     #[cfg(feature = "ollama")]
     #[test]
     fn resolve_reranker_llm_choice_honors_the_underlying_llm_provider_choice() {
-        let (_, label) = resolve_reranker(Some("llm"), Some("ollama"), None, None, None).expect("expected a resolution").expect("expected a reranker");
+        let (_, label) = resolve_reranker(Some("llm"), Some("ollama"), None, None, None, None).expect("expected a resolution").expect("expected a reranker");
         assert!(label.contains("OllamaLlmProvider"), "got: {label}");
     }
 
     #[test]
     fn resolve_reranker_rejects_an_unknown_choice() {
-        assert!(resolve_reranker(Some("bogus"), None, None, None, None).is_err());
+        assert!(resolve_reranker(Some("bogus"), None, None, None, None, None).is_err());
+    }
+
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn resolve_reranker_fastembed_choice_fails_clearly_without_the_feature() {
+        assert!(resolve_reranker(Some("fastembed"), None, None, None, None, None).is_err());
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    #[ignore = "downloads a real ~278MB cross-encoder model + ONNX runtime on first run; needs real network access"]
+    fn resolve_reranker_fastembed_choice_builds_with_defaults() {
+        let cache_dir = std::env::var("MEMORIA_TEST_FASTEMBED_CACHE_DIR").ok();
+        let (_, label) = resolve_reranker(Some("fastembed"), None, None, None, None, cache_dir).expect("expected a resolution").expect("expected a reranker");
+        assert!(label.contains("BAAI/bge-reranker-base"), "got: {label}");
     }
 
     #[cfg(feature = "ollama")]
