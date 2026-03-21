@@ -58,6 +58,11 @@ check "--filter includes a record that does match" "true" "$(contains "${filter_
 check "--filter with malformed JSON is rejected" 2 \
   "$("${cli_bin}" search "x" --user-id smoke --filter "not json" > /dev/null 2>&1; echo $?)"
 
+explain_output="$("${cli_bin}" --json search "engineer" --user-id smoke --explain)"
+check "--explain includes a real score_details breakdown" "true" "$(contains "${explain_output}" "score_details")"
+no_explain_output="$("${cli_bin}" --json search "engineer" --user-id smoke)"
+check "omitting --explain leaves score_details null" "true" "$([[ "${no_explain_output}" == *'"score_details":null'* ]] && echo true || echo false)"
+
 list_output="$("${cli_bin}" --json list --user-id smoke)"
 check "list includes the record id" "true" "$(contains "${list_output}" "${record_id}")"
 

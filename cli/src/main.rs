@@ -59,6 +59,8 @@ enum Command {
         rerank: bool,
         #[arg(long, value_parser = parse_filter_arg, help = "Filter results with a JSON filter expression (ADR-30)")]
         filter: Option<core::filter::FilterExpr>,
+        #[arg(long, help = "Print a score_details breakdown (semantic/keyword/entity-boost components) for each result")]
+        explain: bool,
     },
     #[command(about = "Fetch a single memory by id")]
     Get {
@@ -249,6 +251,14 @@ fn print_search_results(results: &[core::vector_store::SearchResult], json: bool
         for result in results {
             let content = result.payload.get("content").map_or("", String::as_str);
             println!("{}\t{}\t{content}", result.id, result.score);
+            if let Some(details) = &result.score_details {
+                let bm25 = details.bm25_score.map_or_else(|| "-".to_string(), |v| v.to_string());
+                let entity_boost = details.entity_boost.map_or_else(|| "-".to_string(), |v| v.to_string());
+                println!(
+                    "    semantic={} bm25={bm25} entity_boost={entity_boost} raw={} final={}",
+                    details.semantic_score, details.raw_score, details.final_score
+                );
+            }
         }
     }
 }
@@ -525,9 +535,9 @@ fn run<L, E, V>(
                 }
             }
         }
-        Command::Search { query, user_id, agent_id, run_id, top_k, threshold, rerank, filter } => {
+        Command::Search { query, user_id, agent_id, run_id, top_k, threshold, rerank, filter, explain } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.search(&query, top_k, &scope, threshold, true, filter.as_ref(), rerank) {
+            match memory.search(&query, top_k, &scope, threshold, true, filter.as_ref(), rerank, explain) {
                 Ok(results) => print_search_results(&results, json, quiet),
                 Err(err) => {
                     eprintln!("error: {err}");
