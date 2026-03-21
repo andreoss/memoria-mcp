@@ -223,7 +223,7 @@ impl VectorStore for VecVectorStore {
             .filter(|r| filters.iter().all(|(k, v)| r.payload.get(k).is_some_and(|pv| pv == v)))
             .map(|r| {
                 let score = r.vector.iter().zip(vector.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, |acc, d| acc + d);
-                SearchResult { id: r.id.clone(), score, payload: r.payload.clone() }
+                SearchResult { id: r.id.clone(), score, payload: r.payload.clone(), score_details: None }
             })
             .collect();
         if let Some(threshold) = threshold {

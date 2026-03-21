@@ -27,6 +27,17 @@ pub struct SearchResult {
     pub id: String,
     pub score: f32,
     pub payload: HashMap<String, String>,
+    pub score_details: Option<ScoreDetails>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ScoreDetails {
+    pub semantic_score: f32,
+    pub bm25_score: Option<f32>,
+    pub entity_boost: Option<f32>,
+    pub raw_score: f32,
+    pub final_score: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -476,6 +487,7 @@ impl VectorStore for InMemoryVectorStore {
                     id: r.id.clone(),
                     score,
                     payload: r.payload.clone(),
+                    score_details: None,
                 }
             })
             .collect();
@@ -643,7 +655,7 @@ impl VectorStore for SqliteVectorStore {
             .filter(|r| filters.iter().all(|(k, v)| r.payload.get(k).is_some_and(|pv| pv == v)))
             .map(|r| {
                 let score = r.vector.iter().zip(vector.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, |acc, d| acc + d);
-                SearchResult { id: r.id.clone(), score, payload: r.payload.clone() }
+                SearchResult { id: r.id.clone(), score, payload: r.payload.clone(), score_details: None }
             })
             .collect();
         if let Some(threshold) = threshold {
@@ -760,7 +772,7 @@ impl VectorStore for SqliteVectorStore {
             }
             #[allow(clippy::cast_possible_truncation)]
             let score = score as f32;
-            results.push(SearchResult { id, score, payload });
+            results.push(SearchResult { id, score, payload, score_details: None });
             if results.len() >= top_k {
                 break;
             }
@@ -875,7 +887,7 @@ impl VectorStore for PgVectorStore {
             #[allow(clippy::cast_possible_truncation)]
             let score = row.get::<_, f64>(1) as f32;
             let payload = Self::decode_payload(row.get(2))?;
-            results.push(SearchResult { id, score, payload });
+            results.push(SearchResult { id, score, payload, score_details: None });
         }
         Ok(results)
     }
@@ -955,7 +967,7 @@ impl VectorStore for PgVectorStore {
             let id: String = row.get(0);
             let score: f32 = row.get(1);
             let payload = Self::decode_payload(row.get(2))?;
-            results.push(SearchResult { id, score, payload });
+            results.push(SearchResult { id, score, payload, score_details: None });
         }
         Ok(Some(results))
     }
@@ -1182,7 +1194,7 @@ async fn qdrant_handle_search(
             let fallback = qdrant_point_id_to_string(scored.id.as_ref());
             let id = qdrant_record_id(&scored.payload, &fallback);
             let payload = qdrant_decode_payload(scored.payload);
-            SearchResult { id, score: scored.score, payload }
+            SearchResult { id, score: scored.score, payload, score_details: None }
         })
         .collect();
     if let Some(threshold) = threshold {
@@ -1486,7 +1498,7 @@ async fn chroma_handle_search(
     for (index, id) in ids.into_iter().enumerate() {
         let score = distances.get_mut(index).and_then(std::mem::take).unwrap_or(f32::MAX);
         let payload = metadatas.get_mut(index).and_then(std::mem::take).map_or_else(HashMap::new, |metadata| chroma_metadata_to_payload(Some(metadata)));
-        results.push(SearchResult { id, score, payload });
+        results.push(SearchResult { id, score, payload, score_details: None });
     }
     if let Some(threshold) = threshold {
         results.retain(|result| result.score <= threshold);
@@ -1850,7 +1862,7 @@ async fn milvus_handle_search(
         };
         let record = milvus_entity_row_to_record(row, &fallback);
         let score = scores.get(index).copied().unwrap_or(f32::MAX);
-        results.push(SearchResult { id: record.id, score, payload: record.payload });
+        results.push(SearchResult { id: record.id, score, payload: record.payload, score_details: None });
     }
     if let Some(threshold) = threshold {
         results.retain(|result| result.score <= threshold);

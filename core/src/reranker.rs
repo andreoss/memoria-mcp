@@ -259,8 +259,8 @@ pub trait RerankerContractTests: Reranker {
         let mut payload_b = std::collections::HashMap::new();
         payload_b.insert("content".to_string(), "a lazy dog sleeps".to_string());
         let input = vec![
-            SearchResult { id: "a".to_string(), score: 0.5, payload: payload_a },
-            SearchResult { id: "b".to_string(), score: 0.5, payload: payload_b },
+            SearchResult { id: "a".to_string(), score: 0.5, payload: payload_a, score_details: None },
+            SearchResult { id: "b".to_string(), score: 0.5, payload: payload_b, score_details: None },
         ];
         let output = self.rerank("fox", input).expect("expected a successful rerank");
         let mut ids: Vec<&str> = output.iter().map(|r| r.id.as_str()).collect();
@@ -285,7 +285,7 @@ mod tests {
     fn result_with_content(id: &str, score: f32, content: &str) -> SearchResult {
         let mut payload = HashMap::new();
         payload.insert("content".to_string(), content.to_string());
-        SearchResult { id: id.to_string(), score, payload }
+        SearchResult { id: id.to_string(), score, payload, score_details: None }
     }
 
     #[test]
