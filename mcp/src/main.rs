@@ -72,11 +72,33 @@ struct MemoryResult {
     id: String,
     score: f32,
     payload: HashMap<String, String>,
+    score_details: Option<ScoreDetailsResult>,
 }
 
 impl From<memoria_core::vector_store::SearchResult> for MemoryResult {
     fn from(result: memoria_core::vector_store::SearchResult) -> Self {
-        Self { id: result.id, score: result.score, payload: result.payload }
+        Self { id: result.id, score: result.score, payload: result.payload, score_details: result.score_details.map(ScoreDetailsResult::from) }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+struct ScoreDetailsResult {
+    semantic_score: f32,
+    bm25_score: Option<f32>,
+    entity_boost: Option<f32>,
+    raw_score: f32,
+    final_score: f32,
+}
+
+impl From<memoria_core::vector_store::ScoreDetails> for ScoreDetailsResult {
+    fn from(details: memoria_core::vector_store::ScoreDetails) -> Self {
+        Self {
+            semantic_score: details.semantic_score,
+            bm25_score: details.bm25_score,
+            entity_boost: details.entity_boost,
+            raw_score: details.raw_score,
+            final_score: details.final_score,
+        }
     }
 }
 
@@ -130,6 +152,9 @@ struct SearchMemoriesRequest {
     #[serde(default)]
     #[schemars(description = "Include expired memories (default false)")]
     show_expired: bool,
+    #[serde(default)]
+    #[schemars(description = "Include a score_details breakdown (semantic/keyword/entity-boost components) in each result (default false)")]
+    explain: bool,
     #[serde(default)]
     #[schemars(description = "Required if MEMORIA_MCP_SECRET is configured on the server; omit otherwise")]
     secret: Option<String>,
@@ -350,7 +375,7 @@ impl MemoriaMcpServer {
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let results = self
             .memory
-            .search(&request.query, request.top_k, &scope, request.threshold, request.show_expired, None, false)
+            .search(&request.query, request.top_k, &scope, request.threshold, request.show_expired, None, false, request.explain)
             .map_err(|err| err.to_string())?;
         Ok(Json(results.into_iter().map(MemoryResult::from).collect()))
     }
@@ -834,10 +859,32 @@ mod tests {
             top_k: 10,
             threshold: None,
             show_expired: false,
+            explain: false,
             secret: None,
         };
         let Json(results) = server.search_memories(Parameters(request)).await.expect("search should succeed");
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_memories_with_explain_true_returns_a_real_score_details_breakdown() {
+        let memory = test_memory();
+        add_fact(&memory, "Alice is an engineer.", "alice");
+        let server = test_server(memory, None);
+        let request = SearchMemoriesRequest {
+            query: "engineer".to_string(),
+            user_id: Some("alice".to_string()),
+            agent_id: None,
+            run_id: None,
+            top_k: 10,
+            threshold: None,
+            show_expired: false,
+            explain: true,
+            secret: None,
+        };
+        let Json(results) = server.search_memories(Parameters(request)).await.expect("search should succeed");
+        let details = results[0].score_details.as_ref().expect("explain=true must return score_details");
+        assert!((details.final_score - results[0].score).abs() < 1e-6, "final_score must equal the real returned score");
     }
 
     #[tokio::test]
@@ -852,6 +899,7 @@ mod tests {
             top_k: 10,
             threshold: None,
             show_expired: false,
+            explain: false,
             secret: None,
         };
         let result = server.search_memories(Parameters(request)).await;
