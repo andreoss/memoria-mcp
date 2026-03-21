@@ -693,6 +693,7 @@ struct SearchMemoryRequest {
     show_expired: Option<bool>,
     filters: Option<serde_json::Value>,
     rerank: Option<bool>,
+    explain: Option<bool>,
 }
 
 const fn default_top_k() -> usize {
@@ -717,13 +718,14 @@ where
     let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
     let show_expired = request.show_expired.unwrap_or(false);
     let rerank = request.rerank.unwrap_or(false);
+    let explain = request.explain.unwrap_or(false);
     let filters = match request.filters.as_ref().map(core::filter::parse_filter_expr) {
         Some(Ok(filters)) => Some(filters),
         Some(Err(err)) => return (400, error_body(format!("malformed filters: {err}"))),
         None => None,
     };
 
-    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref(), rerank) {
+    match memory.search(&request.query, request.top_k, &scope, request.threshold, show_expired, filters.as_ref(), rerank, explain) {
         Ok(results) => (200, serde_json::to_vec(&SearchMemoryResponse { results }).unwrap_or_default()),
         Err(err) => error_response(&err),
     }
@@ -3721,6 +3723,29 @@ mod tests {
         assert_eq!(status, 200);
         let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
         assert!(!response.results.is_empty());
+    }
+
+    #[test]
+    fn handle_search_memory_defaults_explain_to_false() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice"}"#);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert!(response.results[0].score_details.is_none(), "omitting explain must not populate score_details");
+    }
+
+    #[test]
+    fn handle_search_memory_with_explain_true_returns_a_real_score_details_breakdown() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice","explain":true}"#);
+        assert_eq!(status, 200);
+        let response: SearchMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        let details = response.results[0].score_details.as_ref().expect("explain=true must return score_details");
+        assert!((details.final_score - response.results[0].score).abs() < 1e-6, "final_score must equal the real returned score");
     }
 
     #[test]
