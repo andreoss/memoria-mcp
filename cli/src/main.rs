@@ -38,6 +38,8 @@ enum Command {
         run_id: Option<String>,
         #[arg(long, help = "Store CONTENT verbatim instead of extracting facts from it")]
         no_infer: bool,
+        #[arg(long = "image", help = "Base64-encoded image; a vision-capable LLM describes it before storage (repeatable)")]
+        images: Vec<String>,
     },
     #[command(about = "Search stored memories within a scope")]
     Search {
@@ -509,9 +511,9 @@ fn run<L, E, V>(
     V: core::vector_store::VectorStore,
 {
     match command {
-        Command::Add { content, user_id, agent_id, run_id, no_infer } => {
+        Command::Add { content, user_id, agent_id, run_id, no_infer, images } => {
             let scope = build_scope(user_id, agent_id, run_id);
-            match memory.add(&[Message::new(Role::User, content)], scope, !no_infer) {
+            match memory.add(&[Message::with_images(Role::User, content, images)], scope, !no_infer) {
                 Ok(ids) => {
                     print_ids(&ids, json, quiet);
                     save_store(memory, path);
@@ -782,6 +784,70 @@ mod tests {
         let loaded = load_store(&path);
 
         let record = loaded.get("rec-1").expect("get should succeed").expect("record should round-trip");
+        assert_eq!(record.payload.get("content"), Some(&"Alice is an engineer.".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct DescribingLlmProvider;
+
+    impl core::llm::LlmProvider for DescribingLlmProvider {
+        fn complete(&self, _messages: &[Message]) -> Result<core::llm::Completion, core::llm::LlmError> {
+            Ok(core::llm::Completion { content: "A photo of a red bicycle.".to_string() })
+        }
+    }
+
+    #[test]
+    fn add_command_with_images_describes_it_before_storage() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-test-add-images-{}", std::process::id()));
+        let path = dir.join("store.json");
+        let history_path = dir.join("history.json");
+
+        let memory = Memory::new(DescribingLlmProvider, LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let command = Command::Add {
+            content: String::new(),
+            user_id: Some("alice".to_string()),
+            agent_id: None,
+            run_id: None,
+            no_infer: true,
+            images: vec!["base64imagedata".to_string()],
+        };
+        run(command, &memory, &path, &history_path, true, true, "llm", "embedding", None);
+
+        let scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let ids = memory.list(&scope, 0, 10, true, None).expect("list should succeed");
+        let id = ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("expected a record");
+        assert_eq!(
+            record.payload.get("content"),
+            Some(&"A photo of a red bicycle.".to_string()),
+            "an image-bearing cli add must be described before storage"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_command_without_images_is_unaffected() {
+        let dir = std::env::temp_dir().join(format!("memoria-cli-test-add-no-images-{}", std::process::id()));
+        let path = dir.join("store.json");
+        let history_path = dir.join("history.json");
+
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let command = Command::Add {
+            content: "Alice is an engineer.".to_string(),
+            user_id: Some("alice".to_string()),
+            agent_id: None,
+            run_id: None,
+            no_infer: true,
+            images: Vec::new(),
+        };
+        run(command, &memory, &path, &history_path, true, true, "llm", "embedding", None);
+
+        let scope = HashMap::from([("user_id".to_string(), "alice".to_string())]);
+        let ids = memory.list(&scope, 0, 10, true, None).expect("list should succeed");
+        let id = ids.first().expect("expected at least one id");
+        let record = memory.get(id).expect("get should succeed").expect("expected a record");
         assert_eq!(record.payload.get("content"), Some(&"Alice is an engineer.".to_string()));
 
         let _ = fs::remove_dir_all(&dir);
