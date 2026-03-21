@@ -201,6 +201,9 @@ struct AddMemoryRequest {
     #[schemars(description = "Extract facts via the LLM provider (default true); false stores content verbatim")]
     infer: bool,
     #[serde(default)]
+    #[schemars(description = "Base64-encoded images; a vision-capable LLM provider describes them before storage")]
+    images: Vec<String>,
+    #[serde(default)]
     #[schemars(description = "Required if MEMORIA_MCP_SECRET is configured on the server; omit otherwise")]
     secret: Option<String>,
 }
@@ -390,7 +393,7 @@ impl MemoriaMcpServer {
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let ids = self
             .memory
-            .add(&[Message::new(Role::User, &request.content)], scope, request.infer)
+            .add(&[Message::with_images(Role::User, request.content, request.images)], scope, request.infer)
             .map_err(|err| err.to_string())?;
         self.persist_after_mutation();
         Ok(Json(ids))
@@ -771,6 +774,20 @@ mod tests {
         ids.into_iter().next().expect("expected at least one id")
     }
 
+    struct DescribingLlmProvider;
+
+    impl memoria_core::llm::LlmProvider for DescribingLlmProvider {
+        fn complete(&self, _messages: &[Message]) -> Result<memoria_core::llm::Completion, memoria_core::llm::LlmError> {
+            Ok(memoria_core::llm::Completion { content: "A photo of a red bicycle.".to_string() })
+        }
+    }
+
+    fn test_memory_with_llm(llm: BoxedLlm) -> SharedMemory {
+        let embedding: BoxedEmbedding = Box::new(LocalHashEmbeddingProvider::new());
+        let vector_store: BoxedVectorStore = Box::new(InMemoryVectorStore::new());
+        Arc::new(Memory::new(llm, embedding, vector_store))
+    }
+
     fn test_server(memory: SharedMemory, mcp_secret: Option<String>) -> MemoriaMcpServer {
         let mut server = MemoriaMcpServer::new(memory, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
         server.persist_history = false;
@@ -906,6 +923,7 @@ mod tests {
             agent_id: None,
             run_id: None,
             infer: false,
+            images: Vec::new(),
             secret: None,
         };
         let Json(ids) = server.add_memory(Parameters(request)).await.expect("add should succeed");
@@ -915,11 +933,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_memory_with_images_describes_it_before_storage() {
+        let memory = test_memory_with_llm(Box::new(DescribingLlmProvider));
+        let server = test_server(memory, None);
+        let request = AddMemoryRequest {
+            content: String::new(),
+            user_id: Some("erin".to_string()),
+            agent_id: None,
+            run_id: None,
+            infer: false,
+            images: vec!["base64imagedata".to_string()],
+            secret: None,
+        };
+        let Json(ids) = server.add_memory(Parameters(request)).await.expect("add should succeed");
+        let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
+        assert_eq!(
+            stored.payload.get("content"),
+            Some(&"A photo of a red bicycle.".to_string()),
+            "an image-bearing add must be described before storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_memory_without_images_is_unaffected() {
+        let memory = test_memory();
+        let server = test_server(memory, None);
+        let request = AddMemoryRequest {
+            content: "Frank likes tea now.".to_string(),
+            user_id: Some("frank".to_string()),
+            agent_id: None,
+            run_id: None,
+            infer: false,
+            images: Vec::new(),
+            secret: None,
+        };
+        let Json(ids) = server.add_memory(Parameters(request)).await.expect("add should succeed");
+        let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
+        assert_eq!(stored.payload.get("content"), Some(&"Frank likes tea now.".to_string()));
+    }
+
+    #[tokio::test]
     async fn add_memory_rejects_a_missing_secret_when_one_is_configured() {
         let memory = test_memory();
         let server = test_server(memory, Some("s3cret".to_string()));
         let request =
-            AddMemoryRequest { content: "anything".to_string(), user_id: Some("erin".to_string()), agent_id: None, run_id: None, infer: false, secret: None };
+            AddMemoryRequest { content: "anything".to_string(), user_id: Some("erin".to_string()), agent_id: None, run_id: None, infer: false, images: Vec::new(), secret: None };
         assert!(server.add_memory(Parameters(request)).await.is_err());
     }
 
@@ -1006,7 +1064,7 @@ mod tests {
         let memory = test_memory();
         let server = MemoriaMcpServer::new(memory, None, store_path.clone(), history_path, true);
         let request =
-            AddMemoryRequest { content: "Kim leads the platform team.".to_string(), user_id: Some("kim".to_string()), agent_id: None, run_id: None, infer: false, secret: None };
+            AddMemoryRequest { content: "Kim leads the platform team.".to_string(), user_id: Some("kim".to_string()), agent_id: None, run_id: None, infer: false, images: Vec::new(), secret: None };
         server.add_memory(Parameters(request)).await.expect("add should succeed");
         let saved = std::fs::read_to_string(&store_path).expect("snapshot file should exist");
         assert!(saved.contains("Kim leads the platform team."));
@@ -1043,7 +1101,7 @@ mod tests {
         let server = MemoriaMcpServer::new(memory, None, PathBuf::from("/dev/null"), history_path.clone(), false);
 
         let add_request =
-            AddMemoryRequest { content: "Liam manages infrastructure.".to_string(), user_id: Some("liam".to_string()), agent_id: None, run_id: None, infer: false, secret: None };
+            AddMemoryRequest { content: "Liam manages infrastructure.".to_string(), user_id: Some("liam".to_string()), agent_id: None, run_id: None, infer: false, images: Vec::new(), secret: None };
         let Json(ids) = server.add_memory(Parameters(add_request)).await.expect("add should succeed");
         let id = ids.into_iter().next().expect("expected an id");
         server.delete_memory(Parameters(DeleteMemoryRequest { id: id.clone(), secret: None })).await.expect("delete should succeed");
