@@ -214,6 +214,42 @@ fn parse_filter_arg(s: &str) -> Result<core::filter::FilterExpr, String> {
     core::filter::parse_filter_expr(&value).map_err(|err| format!("malformed filters: {err}"))
 }
 
+fn filter_value_to_json(value: &core::filter::FilterValue) -> serde_json::Value {
+    match value {
+        core::filter::FilterValue::String(s) => serde_json::Value::String(s.clone()),
+        core::filter::FilterValue::Number(n) => serde_json::Number::from_f64(*n).map_or(serde_json::Value::Null, serde_json::Value::Number),
+        core::filter::FilterValue::Bool(b) => serde_json::Value::Bool(*b),
+    }
+}
+
+fn filter_op_to_json(op: &core::filter::FilterOp) -> serde_json::Value {
+    match op {
+        core::filter::FilterOp::Eq(v) => serde_json::json!({"eq": filter_value_to_json(v)}),
+        core::filter::FilterOp::Ne(v) => serde_json::json!({"ne": filter_value_to_json(v)}),
+        core::filter::FilterOp::In(vs) => serde_json::json!({"in": vs.iter().map(filter_value_to_json).collect::<Vec<_>>()}),
+        core::filter::FilterOp::Nin(vs) => serde_json::json!({"nin": vs.iter().map(filter_value_to_json).collect::<Vec<_>>()}),
+        core::filter::FilterOp::Gt(v) => serde_json::json!({"gt": filter_value_to_json(v)}),
+        core::filter::FilterOp::Gte(v) => serde_json::json!({"gte": filter_value_to_json(v)}),
+        core::filter::FilterOp::Lt(v) => serde_json::json!({"lt": filter_value_to_json(v)}),
+        core::filter::FilterOp::Lte(v) => serde_json::json!({"lte": filter_value_to_json(v)}),
+        core::filter::FilterOp::Contains(s) => serde_json::json!({"contains": s}),
+        core::filter::FilterOp::Icontains(s) => serde_json::json!({"icontains": s}),
+        core::filter::FilterOp::Wildcard => serde_json::Value::String("*".to_string()),
+    }
+}
+
+fn filter_expr_to_json(expr: &core::filter::FilterExpr) -> serde_json::Value {
+    match expr {
+        core::filter::FilterExpr::Field(field, op) => serde_json::json!({field.clone(): filter_op_to_json(op)}),
+        core::filter::FilterExpr::And(clauses) => serde_json::json!({"AND": clauses.iter().map(filter_expr_to_json).collect::<Vec<_>>()}),
+        core::filter::FilterExpr::Or(clauses) => serde_json::json!({"OR": clauses.iter().map(filter_expr_to_json).collect::<Vec<_>>()}),
+        core::filter::FilterExpr::Not(inner) => match inner.as_ref() {
+            core::filter::FilterExpr::And(clauses) => serde_json::json!({"NOT": clauses.iter().map(filter_expr_to_json).collect::<Vec<_>>()}),
+            other => serde_json::json!({"NOT": [filter_expr_to_json(other)]}),
+        },
+    }
+}
+
 fn build_scope(user_id: Option<String>, agent_id: Option<String>, run_id: Option<String>) -> HashMap<String, String> {
     let mut scope = HashMap::new();
     if let Some(v) = user_id {
@@ -289,6 +325,236 @@ fn print_history(entries: &[core::memory::HistoryEntry], json: bool, quiet: bool
             };
             println!("{event}\t{}", entry.content);
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteIdsResponse {
+    ids: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteSearchResponse {
+    results: Vec<core::vector_store::SearchResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteHistoryResponse {
+    entries: Vec<core::memory::HistoryEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteErrorBody {
+    error: String,
+}
+
+fn remote_error_message(response: reqwest::blocking::Response) -> String {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    serde_json::from_str::<RemoteErrorBody>(&body).map_or_else(|_| format!("server returned {status}"), |parsed| parsed.error)
+}
+
+fn print_remote_error_and_exit(err: &reqwest::Error) -> ! {
+    eprintln!("error: {err}");
+    std::process::exit(1);
+}
+
+fn remote_request(client: &reqwest::blocking::Client, method: reqwest::Method, url: &str, api_key: Option<&str>) -> reqwest::blocking::RequestBuilder {
+    let builder = client.request(method, url);
+    match api_key {
+        Some(key) => builder.bearer_auth(key),
+        None => builder,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_remote(command: Command, base_url: &str, api_key: Option<&str>, json: bool, quiet: bool) {
+    let client = reqwest::blocking::Client::new();
+    match command {
+        Command::Add { content, user_id, agent_id, run_id, no_infer, images } => {
+            let body = serde_json::json!({
+                "content": content,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "infer": !no_infer,
+                "images": images,
+            });
+            let response = remote_request(&client, reqwest::Method::POST, &format!("{base_url}/memories"), api_key).json(&body).send();
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let parsed: RemoteIdsResponse = response.json().unwrap_or(RemoteIdsResponse { ids: Vec::new() });
+                    print_ids(&parsed.ids, json, quiet);
+                }
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::Search { query, user_id, agent_id, run_id, top_k, threshold, rerank, filter, explain } => {
+            let mut body = serde_json::json!({
+                "query": query,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "top_k": top_k,
+                "threshold": threshold,
+                "show_expired": true,
+                "rerank": rerank,
+                "explain": explain,
+            });
+            if let Some(filter) = &filter {
+                body["filters"] = filter_expr_to_json(filter);
+            }
+            let response = remote_request(&client, reqwest::Method::POST, &format!("{base_url}/search"), api_key).json(&body).send();
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let parsed: RemoteSearchResponse = response.json().unwrap_or(RemoteSearchResponse { results: Vec::new() });
+                    print_search_results(&parsed.results, json, quiet);
+                }
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::Get { id } => {
+            let response = remote_request(&client, reqwest::Method::GET, &format!("{base_url}/memories/{id}"), api_key).send();
+            match response {
+                Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                    eprintln!("not found: {id}");
+                    std::process::exit(1);
+                }
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<VectorRecord>() {
+                        Ok(record) => print_record(&record, json, quiet),
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::List { user_id, agent_id, run_id, offset, limit } => {
+            let mut url = reqwest::Url::parse(&format!("{base_url}/memories")).expect("base_url must already be a valid URL");
+            {
+                let mut query = url.query_pairs_mut();
+                if let Some(user_id) = &user_id {
+                    query.append_pair("user_id", user_id);
+                }
+                if let Some(agent_id) = &agent_id {
+                    query.append_pair("agent_id", agent_id);
+                }
+                if let Some(run_id) = &run_id {
+                    query.append_pair("run_id", run_id);
+                }
+                query.append_pair("offset", &offset.to_string());
+                query.append_pair("limit", &limit.to_string());
+            }
+            let response = remote_request(&client, reqwest::Method::GET, url.as_str(), api_key).send();
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let parsed: RemoteIdsResponse = response.json().unwrap_or(RemoteIdsResponse { ids: Vec::new() });
+                    print_ids(&parsed.ids, json, quiet);
+                }
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::Update { id, content, set } => {
+            let metadata = if set.is_empty() { None } else { Some(set.into_iter().collect::<HashMap<_, _>>()) };
+            let body = serde_json::json!({ "content": content, "metadata": metadata });
+            let response = remote_request(&client, reqwest::Method::PUT, &format!("{base_url}/memories/{id}"), api_key).json(&body).send();
+            match response {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::Delete { id } => {
+            let response = remote_request(&client, reqwest::Method::DELETE, &format!("{base_url}/memories/{id}"), api_key).send();
+            match response {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::History { id, offset, limit } => {
+            let mut url = reqwest::Url::parse(&format!("{base_url}/memories/{id}/history")).expect("base_url must already be a valid URL");
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("offset", &offset.to_string());
+                query.append_pair("limit", &limit.to_string());
+            }
+            let response = remote_request(&client, reqwest::Method::GET, url.as_str(), api_key).send();
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let parsed: RemoteHistoryResponse = response.json().unwrap_or(RemoteHistoryResponse { entries: Vec::new() });
+                    print_history(&parsed.entries, json, quiet);
+                }
+                Ok(response) => {
+                    eprintln!("error: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::Init => {
+            if !quiet {
+                println!("server manages its own storage; nothing to initialize (MEMORIA_SERVER_URL={base_url})");
+            }
+        }
+        Command::Whoami => {
+            if !quiet {
+                let info = WhoamiInfo {
+                    store: format!("{base_url} (remote server)"),
+                    llm_provider: "managed by server".to_string(),
+                    embedding_provider: "managed by server".to_string(),
+                    reranker: None,
+                };
+                if json {
+                    println!("{}", serde_json::to_string(&info).unwrap_or_default());
+                } else {
+                    println!("store: {}", info.store);
+                    println!("llm provider: {}", info.llm_provider);
+                    println!("embedding provider: {}", info.embedding_provider);
+                }
+            }
+        }
+        Command::Status => {
+            let response = remote_request(&client, reqwest::Method::GET, &format!("{base_url}/ready"), api_key).send();
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    if !quiet {
+                        println!("ok");
+                    }
+                }
+                Ok(response) => {
+                    eprintln!("unhealthy: {}", remote_error_message(response));
+                    std::process::exit(1);
+                }
+                Err(err) => print_remote_error_and_exit(&err),
+            }
+        }
+        Command::Completions { .. } => unreachable!("main() handles and returns on Command::Completions before run_remote() is ever called"),
     }
 }
 
@@ -444,6 +710,10 @@ fn main() {
     }
     let json = cli.json;
     let quiet = cli.quiet;
+    if let Ok(server_url) = std::env::var("MEMORIA_SERVER_URL") {
+        run_remote(cli.command, server_url.trim_end_matches('/'), std::env::var("MEMORIA_API_KEY").ok().as_deref(), json, quiet);
+        return;
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let env_override = std::env::var("MEMORIA_STORE_PATH").ok();
     let file_config = read_config_file(&config_file_path(&home));
@@ -637,6 +907,172 @@ fn run<L, E, V>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    fn spawn_fake_server(status: u16, response_body: &str) -> (String, std::sync::mpsc::Receiver<CapturedRequest>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let response_body = response_body.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = text.lines().next().unwrap_or_default().to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let body_start = text.find("\r\n\r\n").map_or(text.len(), |i| i + 4);
+                let body = text[body_start..].to_string();
+                let _ = tx.send(CapturedRequest { method, path, body });
+                let response = format!(
+                    "HTTP/1.1 {status} status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn run_remote_add_sends_the_real_expected_request_body() {
+        let (base_url, rx) = spawn_fake_server(201, r#"{"ids":["rec-1"]}"#);
+        run_remote(
+            Command::Add { content: "hello".to_string(), user_id: Some("alice".to_string()), agent_id: None, run_id: None, no_infer: true, images: vec![] },
+            &base_url,
+            None,
+            false,
+            true,
+        );
+        let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/memories");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body must be real JSON");
+        assert_eq!(body["content"], "hello");
+        assert_eq!(body["user_id"], "alice");
+        assert_eq!(body["infer"], false, "no_infer=true must send infer=false");
+    }
+
+    #[test]
+    fn run_remote_search_sends_a_real_filter_that_round_trips_through_the_real_parser() {
+        let (base_url, rx) = spawn_fake_server(200, r#"{"results":[]}"#);
+        let filter = parse_filter_arg(r#"{"user_id":"alice"}"#).expect("expected a valid filter");
+        run_remote(
+            Command::Search {
+                query: "q".to_string(),
+                user_id: None,
+                agent_id: None,
+                run_id: None,
+                top_k: 10,
+                threshold: None,
+                rerank: false,
+                filter: Some(filter),
+                explain: false,
+            },
+            &base_url,
+            None,
+            false,
+            true,
+        );
+        let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/search");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body must be real JSON");
+        assert_eq!(body["show_expired"], true, "cli's own established search behavior always requests show_expired");
+        let sent_filter: serde_json::Value = body["filters"].clone();
+        let round_tripped = core::filter::parse_filter_expr(&sent_filter).expect("the filter this cli sends must itself be valid, re-parseable filter JSON");
+        assert_eq!(round_tripped, core::filter::FilterExpr::Field("user_id".to_string(), core::filter::FilterOp::Eq(core::filter::FilterValue::String("alice".to_string()))));
+    }
+
+    #[test]
+    fn run_remote_get_sends_a_real_get_request_to_the_real_path() {
+        let (base_url, rx) = spawn_fake_server(200, r#"{"id":"rec-1","vector":[],"payload":{"content":"hi"}}"#);
+        run_remote(Command::Get { id: "rec-1".to_string() }, &base_url, None, false, true);
+        let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+        assert_eq!(captured.method, "GET");
+        assert_eq!(captured.path, "/memories/rec-1");
+    }
+
+    #[test]
+    fn run_remote_delete_sends_a_real_delete_request_to_the_real_path() {
+        let (base_url, rx) = spawn_fake_server(200, "");
+        run_remote(Command::Delete { id: "rec-1".to_string() }, &base_url, None, false, true);
+        let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+        assert_eq!(captured.method, "DELETE");
+        assert_eq!(captured.path, "/memories/rec-1");
+    }
+
+    #[test]
+    fn run_remote_sends_the_configured_api_key_as_a_bearer_token() {
+        let (base_url, rx) = spawn_fake_server(200, "");
+        run_remote(Command::Delete { id: "rec-1".to_string() }, &base_url, Some("secret-key"), false, true);
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+    }
+
+    #[test]
+    fn remote_search_response_deserializes_into_the_real_same_search_result_type_embedded_mode_uses() {
+        let json = r#"{"results":[{"id":"rec-1","score":0.5,"payload":{"content":"hi"},"score_details":null}]}"#;
+        let parsed: RemoteSearchResponse = serde_json::from_str(json).expect("expected valid JSON");
+        assert_eq!(parsed.results.len(), 1);
+        assert_eq!(parsed.results[0].id, "rec-1");
+        assert!((parsed.results[0].score - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn remote_history_response_deserializes_into_the_real_same_history_entry_type_embedded_mode_uses() {
+        let json = r#"{"entries":[{"event":"Added","content":"hi"}]}"#;
+        let parsed: RemoteHistoryResponse = serde_json::from_str(json).expect("expected valid JSON");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].content, "hi");
+    }
+
+    #[test]
+    fn remote_error_message_extracts_the_real_error_field_from_a_real_json_error_body() {
+        let (base_url, _rx) = spawn_fake_server(404, r#"{"error":"not found: rec-1"}"#);
+        let response = reqwest::blocking::Client::new().get(&base_url).send().expect("the fake server must respond");
+        assert_eq!(remote_error_message(response), "not found: rec-1");
+    }
+
+    #[test]
+    fn remote_error_message_falls_back_to_a_generic_message_for_a_non_json_error_body() {
+        let (base_url, _rx) = spawn_fake_server(500, "not json at all");
+        let response = reqwest::blocking::Client::new().get(&base_url).send().expect("the fake server must respond");
+        let message = remote_error_message(response);
+        assert!(message.contains("500"), "expected the real status code in the fallback message, got: {message}");
+    }
+
+    #[test]
+    fn filter_expr_to_json_round_trips_a_bare_equality_condition() {
+        let expr = core::filter::FilterExpr::Field("user_id".to_string(), core::filter::FilterOp::Eq(core::filter::FilterValue::String("alice".to_string())));
+        let json = filter_expr_to_json(&expr);
+        let parsed = core::filter::parse_filter_expr(&json).expect("must re-parse");
+        assert_eq!(parsed, expr);
+    }
+
+    #[test]
+    fn filter_expr_to_json_round_trips_and_or_not_and_wildcard() {
+        let expr = core::filter::FilterExpr::And(vec![
+            core::filter::FilterExpr::Or(vec![
+                core::filter::FilterExpr::Field("a".to_string(), core::filter::FilterOp::Gt(core::filter::FilterValue::Number(5.0))),
+                core::filter::FilterExpr::Field("b".to_string(), core::filter::FilterOp::Wildcard),
+            ]),
+            core::filter::FilterExpr::Not(Box::new(core::filter::FilterExpr::And(vec![core::filter::FilterExpr::Field(
+                "c".to_string(),
+                core::filter::FilterOp::Contains("x".to_string()),
+            )]))),
+        ]);
+        let json = filter_expr_to_json(&expr);
+        let parsed = core::filter::parse_filter_expr(&json).expect("must re-parse");
+        assert_eq!(parsed, expr);
+    }
 
     #[test]
     fn resolve_llm_provider_defaults_to_local() {

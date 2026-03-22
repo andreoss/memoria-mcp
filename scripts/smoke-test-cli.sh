@@ -102,6 +102,29 @@ check "a fresh process confirms the deleted record is really gone" "1" "$?"
 history_after_delete_output="$("${cli_bin}" --json history "${record_id}")"
 check "a fresh process sees both the added and deleted events after the record is gone" "true" "$(contains "${history_after_delete_output}" "Deleted")"
 
+if [[ -n "${MEMORIA_SMOKE_TEST_SERVER_URL:-}" ]]; then
+  export MEMORIA_SERVER_URL="${MEMORIA_SMOKE_TEST_SERVER_URL}"
+  remote_user_id="smoke-test-remote-$$"
+
+  remote_add_output="$("${cli_bin}" add "Remote smoke test content" --user-id "${remote_user_id}" --no-infer)"
+  check "remote add exits 0" "0" "$?"
+  remote_record_id="${remote_add_output}"
+  check "remote add returned a real record id" "true" "$(contains "${remote_record_id}" "rec-")"
+
+  remote_search_output="$("${cli_bin}" search "Remote smoke test" --user-id "${remote_user_id}")"
+  check "remote search finds the record within scope" "true" "$(contains "${remote_search_output}" "${remote_record_id}")"
+
+  remote_get_output="$("${cli_bin}" get "${remote_record_id}")"
+  check "remote get returns the real content" "true" "$(contains "${remote_get_output}" "Remote smoke test content")"
+
+  "${cli_bin}" delete "${remote_record_id}" >/dev/null
+  check "remote delete exits 0" "0" "$?"
+  "${cli_bin}" get "${remote_record_id}" >/dev/null 2>&1
+  check "a fresh remote request confirms the deleted record is really gone" "1" "$?"
+
+  unset MEMORIA_SERVER_URL
+fi
+
 if [[ "${failures}" -gt 0 ]]; then
   echo "SMOKE TEST FAILED: ${failures} check(s) failed."
   exit 1
