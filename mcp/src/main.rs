@@ -20,6 +20,185 @@ type BoxedEmbedding = Box<dyn EmbeddingProvider + Send + Sync>;
 type BoxedVectorStore = Box<dyn VectorStore + Send + Sync>;
 type SharedMemory = Arc<Memory<BoxedLlm, BoxedEmbedding, BoxedVectorStore>>;
 
+#[derive(Clone)]
+enum Backend {
+    Local(SharedMemory),
+    Remote(RemoteClient),
+}
+
+#[derive(Clone)]
+struct RemoteClient {
+    base_url: String,
+    api_key: Option<String>,
+    http: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteErrorBody {
+    error: String,
+}
+
+#[derive(Deserialize)]
+struct IdsResponse {
+    ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    results: Vec<memoria_core::vector_store::SearchResult>,
+}
+
+#[derive(Deserialize)]
+struct HistoryResponseBody {
+    entries: Vec<memoria_core::memory::HistoryEntry>,
+}
+
+#[derive(Deserialize)]
+struct DeleteAllResponseBody {
+    deleted: usize,
+}
+
+#[derive(Deserialize)]
+struct EntitiesResponseBody {
+    entities: Vec<memoria_core::memory::EntitySummary>,
+}
+
+impl RemoteClient {
+    fn new(base_url: String, api_key: Option<String>) -> Self {
+        Self { base_url, api_key, http: reqwest::Client::new() }
+    }
+
+    fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => builder.bearer_auth(key),
+            None => builder,
+        }
+    }
+
+    async fn send<T: serde::de::DeserializeOwned>(&self, builder: reqwest::RequestBuilder) -> Result<T, String> {
+        let response = self.authed(builder).send().await.map_err(|err| format!("request to server failed: {err}"))?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
+        if status.is_success() {
+            serde_json::from_slice(&bytes).map_err(|err| format!("malformed response from server: {err}"))
+        } else {
+            let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
+            Err(format!("server returned {status}: {message}"))
+        }
+    }
+
+    async fn get_record(&self, id: &str) -> Result<Option<memoria_core::vector_store::VectorRecord>, String> {
+        let response = self.authed(self.http.get(format!("{}/memories/{id}", self.base_url))).send().await.map_err(|err| format!("request to server failed: {err}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
+        if status.is_success() {
+            serde_json::from_slice(&bytes).map(Some).map_err(|err| format!("malformed response from server: {err}"))
+        } else {
+            let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
+            Err(format!("server returned {status}: {message}"))
+        }
+    }
+
+    async fn search(&self, request: &SearchMemoriesRequest) -> Result<Vec<memoria_core::vector_store::SearchResult>, String> {
+        let body = serde_json::json!({
+            "query": request.query,
+            "user_id": request.user_id,
+            "agent_id": request.agent_id,
+            "run_id": request.run_id,
+            "top_k": request.top_k,
+            "threshold": request.threshold,
+            "show_expired": request.show_expired,
+            "explain": request.explain,
+        });
+        let parsed: SearchResponse = self.send(self.http.post(format!("{}/search", self.base_url)).json(&body)).await?;
+        Ok(parsed.results)
+    }
+
+    async fn list_ids(&self, user_id: Option<&str>, agent_id: Option<&str>, run_id: Option<&str>, offset: usize, limit: usize, show_expired: bool) -> Result<Vec<String>, String> {
+        use std::fmt::Write as _;
+        let mut url = format!("{}/memories?offset={offset}&limit={limit}", self.base_url);
+        if let Some(v) = user_id {
+            let _ = write!(url, "&user_id={}", urlencode(v));
+        }
+        if let Some(v) = agent_id {
+            let _ = write!(url, "&agent_id={}", urlencode(v));
+        }
+        if let Some(v) = run_id {
+            let _ = write!(url, "&run_id={}", urlencode(v));
+        }
+        if show_expired {
+            url.push_str("&show_expired=true");
+        }
+        let parsed: IdsResponse = self.send(self.http.get(url)).await?;
+        Ok(parsed.ids)
+    }
+
+    async fn history(&self, id: &str, offset: usize, limit: usize) -> Result<Vec<memoria_core::memory::HistoryEntry>, String> {
+        let url = format!("{}/memories/{id}/history?offset={offset}&limit={limit}", self.base_url);
+        let parsed: HistoryResponseBody = self.send(self.http.get(url)).await?;
+        Ok(parsed.entries)
+    }
+
+    async fn add(&self, request: &AddMemoryRequest) -> Result<Vec<String>, String> {
+        let body = serde_json::json!({
+            "content": request.content,
+            "user_id": request.user_id,
+            "agent_id": request.agent_id,
+            "run_id": request.run_id,
+            "infer": request.infer,
+            "images": request.images,
+        });
+        let parsed: IdsResponse = self.send(self.http.post(format!("{}/memories", self.base_url)).json(&body)).await?;
+        Ok(parsed.ids)
+    }
+
+    async fn update(&self, id: &str, content: Option<&str>, metadata: Option<&HashMap<String, String>>) -> Result<(), String> {
+        let body = serde_json::json!({ "content": content, "metadata": metadata });
+        let response = self.authed(self.http.put(format!("{}/memories/{id}", self.base_url)).json(&body)).send().await.map_err(|err| format!("request to server failed: {err}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
+            let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
+            Err(format!("server returned {status}: {message}"))
+        }
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), String> {
+        self.authed(self.http.delete(format!("{}/memories/{id}", self.base_url))).send().await.map_err(|err| format!("request to server failed: {err}"))?;
+        Ok(())
+    }
+
+    async fn delete_all(&self, user_id: Option<&str>, agent_id: Option<&str>, run_id: Option<&str>) -> Result<usize, String> {
+        let body = serde_json::json!({ "user_id": user_id, "agent_id": agent_id, "run_id": run_id });
+        let parsed: DeleteAllResponseBody = self.send(self.http.delete(format!("{}/memories", self.base_url)).json(&body)).await?;
+        Ok(parsed.deleted)
+    }
+
+    async fn list_entities(&self) -> Result<Vec<memoria_core::memory::EntitySummary>, String> {
+        let parsed: EntitiesResponseBody = self.send(self.http.get(format!("{}/entities", self.base_url))).await?;
+        Ok(parsed.entities)
+    }
+}
+
+fn urlencode(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(byte as char),
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
 fn scope_from_optional(user_id: Option<String>, agent_id: Option<String>, run_id: Option<String>) -> HashMap<String, String> {
     let mut scope = HashMap::new();
     if let Some(v) = user_id {
@@ -375,7 +554,7 @@ where
 
 #[derive(Clone)]
 struct MemoriaMcpServer {
-    memory: SharedMemory,
+    backend: Backend,
     mcp_secret: Option<String>,
     store_path: PathBuf,
     history_path: PathBuf,
@@ -386,34 +565,45 @@ struct MemoriaMcpServer {
 
 #[tool_router]
 impl MemoriaMcpServer {
-    fn new(memory: SharedMemory, mcp_secret: Option<String>, store_path: PathBuf, history_path: PathBuf, persist_json_snapshot: bool) -> Self {
-        Self { memory, mcp_secret, store_path, history_path, persist_json_snapshot, persist_history: true, tool_router: Self::tool_router() }
+    fn new(backend: Backend, mcp_secret: Option<String>, store_path: PathBuf, history_path: PathBuf, persist_json_snapshot: bool) -> Self {
+        Self { backend, mcp_secret, store_path, history_path, persist_json_snapshot, persist_history: true, tool_router: Self::tool_router() }
     }
 
     fn persist_after_mutation(&self) {
+        let Backend::Local(memory) = &self.backend else {
+            return;
+        };
         if self.persist_json_snapshot {
-            let _ = save_store(&self.memory, &self.store_path);
+            let _ = save_store(memory, &self.store_path);
         }
         if self.persist_history {
-            let _ = save_history(&self.memory, &self.history_path);
+            let _ = save_history(memory, &self.history_path);
         }
     }
 
     #[tool(description = "Search memories with a semantic query, optionally scoped to a user, agent, or run")]
     async fn search_memories(&self, Parameters(request): Parameters<SearchMemoriesRequest>) -> Result<Json<SearchMemoriesResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
-        let results = self
-            .memory
-            .search(&request.query, request.top_k, &scope, request.threshold, request.show_expired, None, false, request.explain)
-            .map_err(|err| err.to_string())?;
+        let results = match &self.backend {
+            Backend::Local(memory) => {
+                let scope = scope_from_optional(request.user_id.clone(), request.agent_id.clone(), request.run_id.clone());
+                memory
+                    .search(&request.query, request.top_k, &scope, request.threshold, request.show_expired, None, false, request.explain)
+                    .map_err(|err| err.to_string())?
+            }
+            Backend::Remote(client) => client.search(&request).await?,
+        };
         Ok(Json(SearchMemoriesResult { results: results.into_iter().map(MemoryResult::from).collect() }))
     }
 
     #[tool(description = "Fetch a single memory by id")]
     async fn get_memory(&self, Parameters(request): Parameters<GetMemoryRequest>) -> Result<Json<MemoryRecord>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        match self.memory.get(&request.id).map_err(|err| err.to_string())? {
+        let found = match &self.backend {
+            Backend::Local(memory) => memory.get(&request.id).map_err(|err| err.to_string())?,
+            Backend::Remote(client) => client.get_record(&request.id).await?,
+        };
+        match found {
             Some(record) => Ok(Json(MemoryRecord::from(record))),
             None => Err(format!("no memory found with id {}", request.id)),
         }
@@ -422,34 +612,50 @@ impl MemoriaMcpServer {
     #[tool(description = "List memories, optionally scoped to a user, agent, or run")]
     async fn get_memories(&self, Parameters(request): Parameters<GetMemoriesRequest>) -> Result<Json<GetMemoriesResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
-        let ids = self.memory.list(&scope, request.offset, request.limit, request.show_expired, None).map_err(|err| err.to_string())?;
-        let memories = ids
-            .into_iter()
-            .filter_map(|id| self.memory.get(&id).ok().flatten())
-            .map(MemoryRecord::from)
-            .collect();
+        let memories = match &self.backend {
+            Backend::Local(memory) => {
+                let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+                let ids = memory.list(&scope, request.offset, request.limit, request.show_expired, None).map_err(|err| err.to_string())?;
+                ids.into_iter().filter_map(|id| memory.get(&id).ok().flatten()).map(MemoryRecord::from).collect()
+            }
+            Backend::Remote(client) => {
+                let ids = client
+                    .list_ids(request.user_id.as_deref(), request.agent_id.as_deref(), request.run_id.as_deref(), request.offset, request.limit, request.show_expired)
+                    .await?;
+                let mut memories = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Ok(Some(record)) = client.get_record(&id).await {
+                        memories.push(MemoryRecord::from(record));
+                    }
+                }
+                memories
+            }
+        };
         Ok(Json(GetMemoriesResult { memories }))
     }
 
     #[tool(description = "Fetch the change history (add/delete events) for a single memory")]
     async fn memory_history(&self, Parameters(request): Parameters<MemoryHistoryRequest>) -> Result<Json<MemoryHistoryResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let entries = self
-            .memory
-            .history(&request.id, request.offset, request.limit)
-            .map_err(|err| err.to_string())?;
+        let entries = match &self.backend {
+            Backend::Local(memory) => memory.history(&request.id, request.offset, request.limit).map_err(|err| err.to_string())?,
+            Backend::Remote(client) => client.history(&request.id, request.offset, request.limit).await?,
+        };
         Ok(Json(MemoryHistoryResult { entries: entries.into_iter().map(HistoryEntry::from).collect() }))
     }
 
     #[tool(description = "Extract facts from a message and store them under a scope (or store content verbatim if infer=false)")]
     async fn add_memory(&self, Parameters(request): Parameters<AddMemoryRequest>) -> Result<Json<AddMemoryResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
-        let ids = self
-            .memory
-            .add(&[Message::with_images(Role::User, request.content, request.images)], scope, request.infer)
-            .map_err(|err| err.to_string())?;
+        let ids = match &self.backend {
+            Backend::Local(memory) => {
+                let scope = scope_from_optional(request.user_id.clone(), request.agent_id.clone(), request.run_id.clone());
+                memory
+                    .add(&[Message::with_images(Role::User, request.content.clone(), request.images.clone())], scope, request.infer)
+                    .map_err(|err| err.to_string())?
+            }
+            Backend::Remote(client) => client.add(&request).await?,
+        };
         self.persist_after_mutation();
         Ok(Json(AddMemoryResult { ids }))
     }
@@ -457,9 +663,18 @@ impl MemoriaMcpServer {
     #[tool(description = "Update a memory's content and/or metadata")]
     async fn update_memory(&self, Parameters(request): Parameters<UpdateMemoryRequest>) -> Result<Json<MemoryRecord>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        self.memory.update(&request.id, request.content.as_deref(), request.metadata).map_err(|err| err.to_string())?;
+        let found = match &self.backend {
+            Backend::Local(memory) => {
+                memory.update(&request.id, request.content.as_deref(), request.metadata.clone()).map_err(|err| err.to_string())?;
+                memory.get(&request.id).map_err(|err| err.to_string())?
+            }
+            Backend::Remote(client) => {
+                client.update(&request.id, request.content.as_deref(), request.metadata.as_ref()).await?;
+                client.get_record(&request.id).await?
+            }
+        };
         self.persist_after_mutation();
-        match self.memory.get(&request.id).map_err(|err| err.to_string())? {
+        match found {
             Some(record) => Ok(Json(MemoryRecord::from(record))),
             None => Err(format!("no memory found with id {}", request.id)),
         }
@@ -468,7 +683,10 @@ impl MemoriaMcpServer {
     #[tool(description = "Delete a single memory by id")]
     async fn delete_memory(&self, Parameters(request): Parameters<DeleteMemoryRequest>) -> Result<Json<DeleteMemoryResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        self.memory.delete(&request.id).map_err(|err| err.to_string())?;
+        match &self.backend {
+            Backend::Local(memory) => memory.delete(&request.id).map_err(|err| err.to_string())?,
+            Backend::Remote(client) => client.delete(&request.id).await?,
+        }
         self.persist_after_mutation();
         Ok(Json(DeleteMemoryResult { deleted: true }))
     }
@@ -476,13 +694,18 @@ impl MemoriaMcpServer {
     #[tool(description = "Delete every memory matching a scope (user, agent, and/or run) -- at least one is required")]
     async fn delete_all_memories(&self, Parameters(request): Parameters<DeleteAllMemoriesRequest>) -> Result<Json<DeleteAllResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
-        if scope.is_empty() {
+        if request.user_id.is_none() && request.agent_id.is_none() && request.run_id.is_none() {
             return Err(
                 "delete_all_memories requires at least one of user_id, agent_id, or run_id -- server has no separate admin tier to gate an unscoped wipe the way the REST API does".to_string(),
             );
         }
-        let deleted = self.memory.reset(&scope, None).map_err(|err| err.to_string())?;
+        let deleted = match &self.backend {
+            Backend::Local(memory) => {
+                let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
+                memory.reset(&scope, None).map_err(|err| err.to_string())?
+            }
+            Backend::Remote(client) => client.delete_all(request.user_id.as_deref(), request.agent_id.as_deref(), request.run_id.as_deref()).await?,
+        };
         self.persist_after_mutation();
         Ok(Json(DeleteAllResult { deleted }))
     }
@@ -490,7 +713,10 @@ impl MemoriaMcpServer {
     #[tool(description = "List distinct users, agents, and runs with a memory count for each")]
     async fn list_entities(&self, Parameters(request): Parameters<ListEntitiesRequest>) -> Result<Json<ListEntitiesResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
-        let entities = self.memory.list_entities().map_err(|err| err.to_string())?;
+        let entities = match &self.backend {
+            Backend::Local(memory) => memory.list_entities().map_err(|err| err.to_string())?,
+            Backend::Remote(client) => client.list_entities().await?,
+        };
         Ok(Json(ListEntitiesResult { entities: entities.into_iter().map(EntitySummary::from).collect() }))
     }
 }
@@ -744,6 +970,19 @@ fn resolve_vector_store(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_secret = std::env::var("MEMORIA_MCP_SECRET").ok().filter(|value| !value.is_empty());
+
+    if let Ok(server_url) = std::env::var("MEMORIA_SERVER_URL") {
+        let api_key = std::env::var("MEMORIA_API_KEY").ok();
+        eprintln!("mode: remote (server={server_url})");
+        let backend = Backend::Remote(RemoteClient::new(server_url, api_key));
+        let mut server = MemoriaMcpServer::new(backend, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
+        server.persist_history = false;
+        let service = server.serve(stdio()).await?;
+        service.waiting().await?;
+        return Ok(());
+    }
+
     let llm_provider_choice = std::env::var("MEMORIA_LLM_PROVIDER").ok();
     let (llm_provider, llm_label) = resolve_llm_provider(
         llm_provider_choice.as_deref(),
@@ -802,8 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let memory = Arc::new(Memory::new(llm_provider, embedding_provider, vector_store));
     memory.load_history_snapshot(load_history(&history_path));
-    let mcp_secret = std::env::var("MEMORIA_MCP_SECRET").ok().filter(|value| !value.is_empty());
-    let server = MemoriaMcpServer::new(memory, mcp_secret, store_path, history_path, persist_json_snapshot);
+    let server = MemoriaMcpServer::new(Backend::Local(memory), mcp_secret, store_path, history_path, persist_json_snapshot);
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
@@ -844,9 +1082,16 @@ mod tests {
     }
 
     fn test_server(memory: SharedMemory, mcp_secret: Option<String>) -> MemoriaMcpServer {
-        let mut server = MemoriaMcpServer::new(memory, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
+        let mut server = MemoriaMcpServer::new(Backend::Local(memory), mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
         server.persist_history = false;
         server
+    }
+
+    fn local_memory(server: &MemoriaMcpServer) -> &SharedMemory {
+        match &server.backend {
+            Backend::Local(memory) => memory,
+            Backend::Remote(_) => panic!("expected a local backend in this test"),
+        }
     }
 
     #[test]
@@ -1006,7 +1251,7 @@ mod tests {
         };
         let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(request)).await.expect("add should succeed");
         assert_eq!(ids.len(), 1);
-        let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
+        let stored = local_memory(&server).get(&ids[0]).expect("get should succeed").expect("expected a record");
         assert_eq!(stored.payload.get("content"), Some(&"Erin runs a bakery.".to_string()));
     }
 
@@ -1024,7 +1269,7 @@ mod tests {
             secret: None,
         };
         let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(request)).await.expect("add should succeed");
-        let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
+        let stored = local_memory(&server).get(&ids[0]).expect("get should succeed").expect("expected a record");
         assert_eq!(
             stored.payload.get("content"),
             Some(&"A photo of a red bicycle.".to_string()),
@@ -1046,7 +1291,7 @@ mod tests {
             secret: None,
         };
         let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(request)).await.expect("add should succeed");
-        let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
+        let stored = local_memory(&server).get(&ids[0]).expect("get should succeed").expect("expected a record");
         assert_eq!(stored.payload.get("content"), Some(&"Frank likes tea now.".to_string()));
     }
 
@@ -1085,7 +1330,7 @@ mod tests {
         let request = DeleteMemoryRequest { id: id.clone(), secret: None };
         let Json(DeleteMemoryResult { deleted }) = server.delete_memory(Parameters(request)).await.expect("delete should succeed");
         assert!(deleted);
-        assert!(server.memory.get(&id).expect("get should succeed").is_none());
+        assert!(local_memory(&server).get(&id).expect("get should succeed").is_none());
     }
 
     #[tokio::test]
@@ -1106,7 +1351,7 @@ mod tests {
         let request = DeleteAllMemoriesRequest { user_id: Some("henry".to_string()), agent_id: None, run_id: None, secret: None };
         let Json(result) = server.delete_all_memories(Parameters(request)).await.expect("delete_all should succeed");
         assert_eq!(result.deleted, 2);
-        let remaining = server.memory.list_all(0, usize::MAX, true, None).expect("list should succeed");
+        let remaining = local_memory(&server).list_all(0, usize::MAX, true, None).expect("list should succeed");
         assert_eq!(remaining.len(), 1);
     }
 
@@ -1140,7 +1385,7 @@ mod tests {
         let store_path = dir.join("store.json");
         let history_path = dir.join("history.json");
         let memory = test_memory();
-        let server = MemoriaMcpServer::new(memory, None, store_path.clone(), history_path, true);
+        let server = MemoriaMcpServer::new(Backend::Local(memory), None, store_path.clone(), history_path, true);
         let request =
             AddMemoryRequest { content: "Kim leads the platform team.".to_string(), user_id: Some("kim".to_string()), agent_id: None, run_id: None, infer: false, images: Vec::new(), secret: None };
         server.add_memory(Parameters(request)).await.expect("add should succeed");
@@ -1176,7 +1421,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("memoria-mcp-history-test-{}", std::process::id()));
         let history_path = dir.join("history.json");
         let memory = test_memory();
-        let server = MemoriaMcpServer::new(memory, None, PathBuf::from("/dev/null"), history_path.clone(), false);
+        let server = MemoriaMcpServer::new(Backend::Local(memory), None, PathBuf::from("/dev/null"), history_path.clone(), false);
 
         let add_request =
             AddMemoryRequest { content: "Liam manages infrastructure.".to_string(), user_id: Some("liam".to_string()), agent_id: None, run_id: None, infer: false, images: Vec::new(), secret: None };
@@ -1424,5 +1669,118 @@ mod tests {
     #[test]
     fn resolve_embedding_provider_unknown_choice_is_a_clear_error() {
         assert!(resolve_embedding_provider(Some("bogus"), None, None, None).is_err());
+    }
+
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    fn spawn_fake_server(status: u16, response_body: &str) -> (String, std::sync::mpsc::Receiver<CapturedRequest>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let response_body = response_body.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = text.lines().next().unwrap_or_default().to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let body_start = text.find("\r\n\r\n").map_or(text.len(), |i| i + 4);
+                let body = text[body_start..].to_string();
+                let _ = tx.send(CapturedRequest { method, path, body });
+                let response = format!(
+                    "HTTP/1.1 {status} status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn remote_test_server(base_url: String, mcp_secret: Option<String>) -> MemoriaMcpServer {
+        let backend = Backend::Remote(RemoteClient::new(base_url, None));
+        let mut server = MemoriaMcpServer::new(backend, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
+        server.persist_history = false;
+        server
+    }
+
+    #[tokio::test]
+    async fn add_memory_remote_sends_the_real_expected_request_body() {
+        let (base_url, rx) = spawn_fake_server(201, r#"{"ids":["rec-1"]}"#);
+        let server = remote_test_server(base_url, None);
+        let request = AddMemoryRequest { content: "hello".to_string(), user_id: Some("alice".to_string()), agent_id: None, run_id: None, infer: false, images: vec![], secret: None };
+        let Json(result) = server.add_memory(Parameters(request)).await.expect("add should succeed");
+        assert_eq!(result.ids, vec!["rec-1".to_string()]);
+        let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/memories");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body must be real JSON");
+        assert_eq!(body["content"], "hello");
+        assert_eq!(body["user_id"], "alice");
+        assert_eq!(body["infer"], false);
+    }
+
+    #[tokio::test]
+    async fn search_memories_remote_sends_the_real_expected_request_body_and_parses_a_real_response() {
+        let (base_url, rx) = spawn_fake_server(200, r#"{"results":[{"id":"rec-1","score":0.5,"payload":{"content":"hi"},"score_details":null}]}"#);
+        let server = remote_test_server(base_url, None);
+        let request = SearchMemoriesRequest {
+            query: "hi".to_string(),
+            user_id: Some("alice".to_string()),
+            agent_id: None,
+            run_id: None,
+            top_k: 5,
+            threshold: None,
+            show_expired: false,
+            explain: false,
+            secret: None,
+        };
+        let Json(result) = server.search_memories(Parameters(request)).await.expect("search should succeed");
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].id, "rec-1");
+        let captured = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/search");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("body must be real JSON");
+        assert_eq!(body["query"], "hi");
+        assert_eq!(body["user_id"], "alice");
+        assert_eq!(body["top_k"], 5);
+    }
+
+    #[tokio::test]
+    async fn delete_all_memories_remote_rejects_an_empty_scope_without_ever_making_a_request() {
+        let (base_url, rx) = spawn_fake_server(200, r#"{"deleted":0}"#);
+        let server = remote_test_server(base_url, None);
+        let request = DeleteAllMemoriesRequest { user_id: None, agent_id: None, run_id: None, secret: None };
+        let err = server.delete_all_memories(Parameters(request)).await.err().expect("expected a validation error");
+        assert!(err.contains("requires at least one of user_id, agent_id, or run_id"), "got: {err}");
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "no request should have been sent to the server");
+    }
+
+    #[tokio::test]
+    async fn get_memory_remote_maps_a_non_2xx_response_to_a_real_specific_error() {
+        let (base_url, _rx) = spawn_fake_server(500, r#"{"error":"boom"}"#);
+        let server = remote_test_server(base_url, None);
+        let request = GetMemoryRequest { id: "rec-1".to_string(), secret: None };
+        let err = server.get_memory(Parameters(request)).await.err().expect("expected an error");
+        assert!(err.contains("500"), "got: {err}");
+        assert!(err.contains("boom"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_memory_remote_returns_the_real_not_found_message_on_404() {
+        let (base_url, _rx) = spawn_fake_server(404, r#"{"error":"not found: rec-1"}"#);
+        let server = remote_test_server(base_url, None);
+        let request = GetMemoryRequest { id: "rec-1".to_string(), secret: None };
+        let err = server.get_memory(Parameters(request)).await.err().expect("expected an error");
+        assert_eq!(err, "no memory found with id rec-1");
     }
 }
