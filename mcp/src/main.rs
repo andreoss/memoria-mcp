@@ -290,6 +290,36 @@ struct DeleteAllResult {
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
+struct SearchMemoriesResult {
+    results: Vec<MemoryResult>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct GetMemoriesResult {
+    memories: Vec<MemoryRecord>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct MemoryHistoryResult {
+    entries: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct AddMemoryResult {
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct DeleteMemoryResult {
+    deleted: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ListEntitiesResult {
+    entities: Vec<EntitySummary>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 struct EntitySummary {
     entity_type: String,
     entity_id: String,
@@ -370,14 +400,14 @@ impl MemoriaMcpServer {
     }
 
     #[tool(description = "Search memories with a semantic query, optionally scoped to a user, agent, or run")]
-    async fn search_memories(&self, Parameters(request): Parameters<SearchMemoriesRequest>) -> Result<Json<Vec<MemoryResult>>, String> {
+    async fn search_memories(&self, Parameters(request): Parameters<SearchMemoriesRequest>) -> Result<Json<SearchMemoriesResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let results = self
             .memory
             .search(&request.query, request.top_k, &scope, request.threshold, request.show_expired, None, false, request.explain)
             .map_err(|err| err.to_string())?;
-        Ok(Json(results.into_iter().map(MemoryResult::from).collect()))
+        Ok(Json(SearchMemoriesResult { results: results.into_iter().map(MemoryResult::from).collect() }))
     }
 
     #[tool(description = "Fetch a single memory by id")]
@@ -390,30 +420,30 @@ impl MemoriaMcpServer {
     }
 
     #[tool(description = "List memories, optionally scoped to a user, agent, or run")]
-    async fn get_memories(&self, Parameters(request): Parameters<GetMemoriesRequest>) -> Result<Json<Vec<MemoryRecord>>, String> {
+    async fn get_memories(&self, Parameters(request): Parameters<GetMemoriesRequest>) -> Result<Json<GetMemoriesResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let ids = self.memory.list(&scope, request.offset, request.limit, request.show_expired, None).map_err(|err| err.to_string())?;
-        let records = ids
+        let memories = ids
             .into_iter()
             .filter_map(|id| self.memory.get(&id).ok().flatten())
             .map(MemoryRecord::from)
             .collect();
-        Ok(Json(records))
+        Ok(Json(GetMemoriesResult { memories }))
     }
 
     #[tool(description = "Fetch the change history (add/delete events) for a single memory")]
-    async fn memory_history(&self, Parameters(request): Parameters<MemoryHistoryRequest>) -> Result<Json<Vec<HistoryEntry>>, String> {
+    async fn memory_history(&self, Parameters(request): Parameters<MemoryHistoryRequest>) -> Result<Json<MemoryHistoryResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let entries = self
             .memory
             .history(&request.id, request.offset, request.limit)
             .map_err(|err| err.to_string())?;
-        Ok(Json(entries.into_iter().map(HistoryEntry::from).collect()))
+        Ok(Json(MemoryHistoryResult { entries: entries.into_iter().map(HistoryEntry::from).collect() }))
     }
 
     #[tool(description = "Extract facts from a message and store them under a scope (or store content verbatim if infer=false)")]
-    async fn add_memory(&self, Parameters(request): Parameters<AddMemoryRequest>) -> Result<Json<Vec<String>>, String> {
+    async fn add_memory(&self, Parameters(request): Parameters<AddMemoryRequest>) -> Result<Json<AddMemoryResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let scope = scope_from_optional(request.user_id, request.agent_id, request.run_id);
         let ids = self
@@ -421,7 +451,7 @@ impl MemoriaMcpServer {
             .add(&[Message::with_images(Role::User, request.content, request.images)], scope, request.infer)
             .map_err(|err| err.to_string())?;
         self.persist_after_mutation();
-        Ok(Json(ids))
+        Ok(Json(AddMemoryResult { ids }))
     }
 
     #[tool(description = "Update a memory's content and/or metadata")]
@@ -436,11 +466,11 @@ impl MemoriaMcpServer {
     }
 
     #[tool(description = "Delete a single memory by id")]
-    async fn delete_memory(&self, Parameters(request): Parameters<DeleteMemoryRequest>) -> Result<Json<bool>, String> {
+    async fn delete_memory(&self, Parameters(request): Parameters<DeleteMemoryRequest>) -> Result<Json<DeleteMemoryResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         self.memory.delete(&request.id).map_err(|err| err.to_string())?;
         self.persist_after_mutation();
-        Ok(Json(true))
+        Ok(Json(DeleteMemoryResult { deleted: true }))
     }
 
     #[tool(description = "Delete every memory matching a scope (user, agent, and/or run) -- at least one is required")]
@@ -458,10 +488,10 @@ impl MemoriaMcpServer {
     }
 
     #[tool(description = "List distinct users, agents, and runs with a memory count for each")]
-    async fn list_entities(&self, Parameters(request): Parameters<ListEntitiesRequest>) -> Result<Json<Vec<EntitySummary>>, String> {
+    async fn list_entities(&self, Parameters(request): Parameters<ListEntitiesRequest>) -> Result<Json<ListEntitiesResult>, String> {
         check_secret(self.mcp_secret.as_deref(), request.secret.as_deref())?;
         let entities = self.memory.list_entities().map_err(|err| err.to_string())?;
-        Ok(Json(entities.into_iter().map(EntitySummary::from).collect()))
+        Ok(Json(ListEntitiesResult { entities: entities.into_iter().map(EntitySummary::from).collect() }))
     }
 }
 
@@ -862,7 +892,7 @@ mod tests {
             explain: false,
             secret: None,
         };
-        let Json(results) = server.search_memories(Parameters(request)).await.expect("search should succeed");
+        let Json(SearchMemoriesResult { results }) = server.search_memories(Parameters(request)).await.expect("search should succeed");
         assert_eq!(results.len(), 1);
     }
 
@@ -882,7 +912,7 @@ mod tests {
             explain: true,
             secret: None,
         };
-        let Json(results) = server.search_memories(Parameters(request)).await.expect("search should succeed");
+        let Json(SearchMemoriesResult { results }) = server.search_memories(Parameters(request)).await.expect("search should succeed");
         let details = results[0].score_details.as_ref().expect("explain=true must return score_details");
         assert!((details.final_score - results[0].score).abs() < 1e-6, "final_score must equal the real returned score");
     }
@@ -933,9 +963,9 @@ mod tests {
         let server = test_server(memory, None);
         let request =
             GetMemoriesRequest { user_id: Some("alice".to_string()), agent_id: None, run_id: None, offset: 0, limit: 50, show_expired: false, secret: None };
-        let Json(records) = server.get_memories(Parameters(request)).await.expect("list should succeed");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].payload.get("user_id"), Some(&"alice".to_string()));
+        let Json(GetMemoriesResult { memories }) = server.get_memories(Parameters(request)).await.expect("list should succeed");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].payload.get("user_id"), Some(&"alice".to_string()));
     }
 
     #[tokio::test]
@@ -955,7 +985,7 @@ mod tests {
         memory.delete(&id).expect("delete should succeed");
         let server = test_server(memory, None);
         let request = MemoryHistoryRequest { id, offset: 0, limit: 100, secret: None };
-        let Json(entries) = server.memory_history(Parameters(request)).await.expect("history should succeed");
+        let Json(MemoryHistoryResult { entries }) = server.memory_history(Parameters(request)).await.expect("history should succeed");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].event, "added");
         assert_eq!(entries[1].event, "deleted");
@@ -974,7 +1004,7 @@ mod tests {
             images: Vec::new(),
             secret: None,
         };
-        let Json(ids) = server.add_memory(Parameters(request)).await.expect("add should succeed");
+        let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(request)).await.expect("add should succeed");
         assert_eq!(ids.len(), 1);
         let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
         assert_eq!(stored.payload.get("content"), Some(&"Erin runs a bakery.".to_string()));
@@ -993,7 +1023,7 @@ mod tests {
             images: vec!["base64imagedata".to_string()],
             secret: None,
         };
-        let Json(ids) = server.add_memory(Parameters(request)).await.expect("add should succeed");
+        let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(request)).await.expect("add should succeed");
         let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
         assert_eq!(
             stored.payload.get("content"),
@@ -1015,7 +1045,7 @@ mod tests {
             images: Vec::new(),
             secret: None,
         };
-        let Json(ids) = server.add_memory(Parameters(request)).await.expect("add should succeed");
+        let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(request)).await.expect("add should succeed");
         let stored = server.memory.get(&ids[0]).expect("get should succeed").expect("expected a record");
         assert_eq!(stored.payload.get("content"), Some(&"Frank likes tea now.".to_string()));
     }
@@ -1053,7 +1083,7 @@ mod tests {
         let id = add_fact(&memory, "Grace paints landscapes.", "grace");
         let server = test_server(memory, None);
         let request = DeleteMemoryRequest { id: id.clone(), secret: None };
-        let Json(deleted) = server.delete_memory(Parameters(request)).await.expect("delete should succeed");
+        let Json(DeleteMemoryResult { deleted }) = server.delete_memory(Parameters(request)).await.expect("delete should succeed");
         assert!(deleted);
         assert!(server.memory.get(&id).expect("get should succeed").is_none());
     }
@@ -1087,7 +1117,7 @@ mod tests {
         add_fact(&memory, "Jack likes hiking.", "jack");
         let server = test_server(memory, None);
         let request = ListEntitiesRequest { secret: None };
-        let Json(entities) = server.list_entities(Parameters(request)).await.expect("list_entities should succeed");
+        let Json(ListEntitiesResult { entities }) = server.list_entities(Parameters(request)).await.expect("list_entities should succeed");
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].entity_type, "user_id");
         assert_eq!(entities[0].entity_id, "jack");
@@ -1150,7 +1180,7 @@ mod tests {
 
         let add_request =
             AddMemoryRequest { content: "Liam manages infrastructure.".to_string(), user_id: Some("liam".to_string()), agent_id: None, run_id: None, infer: false, images: Vec::new(), secret: None };
-        let Json(ids) = server.add_memory(Parameters(add_request)).await.expect("add should succeed");
+        let Json(AddMemoryResult { ids }) = server.add_memory(Parameters(add_request)).await.expect("add should succeed");
         let id = ids.into_iter().next().expect("expected an id");
         server.delete_memory(Parameters(DeleteMemoryRequest { id: id.clone(), secret: None })).await.expect("delete should succeed");
 
