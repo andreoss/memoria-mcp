@@ -20,6 +20,7 @@ base64 = "0.22.1"
 getrandom = "0.4.3"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 argon2 = "0.5"
+form_urlencoded = "1"
 
 [features]
 ollama = ["core/ollama"]

@@ -998,11 +998,7 @@ fn handle_get_requests(
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    form_urlencoded::parse(query.as_bytes()).into_owned().collect()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4204,6 +4200,23 @@ mod tests {
     #[test]
     fn parse_query_with_empty_string_is_empty() {
         assert!(parse_query("").is_empty());
+    }
+
+    #[test]
+    fn parse_query_percent_decodes_a_value_containing_reserved_characters() {
+        let params = parse_query("user_id=alice%40example.com&run_id=a%20b");
+        assert_eq!(params.get("user_id"), Some(&"alice@example.com".to_string()));
+        assert_eq!(params.get("run_id"), Some(&"a b".to_string()));
+    }
+
+    #[test]
+    fn handle_list_memory_finds_a_record_scoped_to_a_user_id_needing_percent_encoding() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new());
+        handle_create_memory(&memory, br#"{"content":"x","user_id":"alice@example.com","infer":false}"#);
+        let (status, body) = handle_list_memory(&memory, "user_id=alice%40example.com");
+        assert_eq!(status, 200);
+        let response: ListMemoryResponse = serde_json::from_slice(&body).expect("expected valid JSON");
+        assert_eq!(response.ids.len(), 1, "a percent-encoded scope value must match the real, decoded stored value");
     }
 
     #[test]
