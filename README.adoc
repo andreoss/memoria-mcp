@@ -1,0 +1,91 @@
+= memoria
+
+A self-hosted memory layer for AI agents and LLM applications: extracts,
+stores, retrieves, and ranks durable facts from conversations, so an
+application can recall relevant context about a user, agent, or session
+across time instead of replaying full transcripts.
+
+== Crates
+
+Four crates, one shared engine:
+
+[cols="1,3"]
+|===
+| Crate | What it is
+
+| `core` (published as `memoria-core`)
+| The engine: `add`/`search`/`update`/`delete`/`reset`/`history`, three
+  pluggable provider traits (LLM, embedding, vector store), no I/O
+  framework of its own
+
+| `cli`
+| A local-first command-line tool, JSON-snapshot or SQLite persistence,
+  one process per invocation
+
+| `server`
+| A self-hosted HTTP API over the same engine — auth, rate limiting,
+  real hybrid search and reranking, distributed as a non-root Docker
+  image
+
+| `mcp`
+| A https://modelcontextprotocol.io/[Model Context Protocol] server over
+  the same engine, for AI clients (Claude Desktop, Claude Code, etc.) to
+  use directly — stdio transport, nine tools
+|===
+
+`cli`, `server`, and `mcp` each embed `core` directly and choose their own
+persistence; none of them proxy to one another (though `server` and `mcp`
+can point at the same SQLite file, since they speak the same on-disk
+format).
+
+== Quick start
+
+Requires the pinned toolchain in `rust-toolchain.toml` (installed
+automatically by `rustup` on first build).
+
+[source,sh]
+----
+cargo build --workspace
+----
+
+*CLI* (binary at `target/debug/cli`; calls itself `memoria`) — store a
+fact under a scope, then query it back. `add` runs fact extraction, so
+the stored memory is the extracted fact, not the raw sentence:
+
+[source,sh]
+----
+$ ./target/debug/cli add "I'm on the Redis migration; Postgres is gone." \
+    --user-id alice --agent-id ops --run-id 2026-02-08
+9f2c1a...
+
+$ ./target/debug/cli search "what datastore does alice use now" \
+    --user-id alice --top-k 5 --explain
+9f2c1a...	0.83	Alice uses Redis; Postgres has been removed.
+----
+
+`--explain` prints the semantic/keyword/entity-boost breakdown behind each
+score. Narrow results with a JSON filter expression (`--filter`), keep a
+message verbatim with `--no-infer`, and scope to any combination of
+`--user-id`, `--agent-id`, `--run-id`. `--json` switches every command to
+machine-readable output.
+
+*Server*:
+
+[source,sh]
+----
+MEMORIA_API_KEY=dev-key MEMORIA_JWT_SECRET=dev-secret ./target/debug/server
+curl -H "Authorization: Bearer dev-key" http://localhost:8080/health
+----
+
+*MCP server* — point an MCP client (e.g. Claude Code's `claude mcp add`)
+at the compiled `target/debug/mcp` binary; it speaks stdio, no daemon or
+network port involved.
+
+Real providers (Ollama, FastEmbed) and SQLite persistence are behind
+Cargo features (`ollama`, `fastembed`, `sqlite` — `mcp` enables `sqlite`
+by default). Every default is a real, local, non-AI placeholder so the
+whole workspace builds and runs with zero external services.
+
+== License
+
+GPL-3.
