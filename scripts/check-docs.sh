@@ -24,7 +24,7 @@ if [[ -z "${changed_files}" ]]; then
 fi
 
 code_dirs=("core/src/" "cli/src/" "server/src/")
-docs_dir="docs/"
+doc_file="README.adoc"
 
 touches_code=false
 touches_docs=false
@@ -36,13 +36,13 @@ while IFS= read -r file; do
       break
     fi
   done
-  if [[ "${file}" == "${docs_dir}"* ]]; then
+  if [[ "${file}" == "${doc_file}" ]]; then
     touches_docs=true
   fi
 done <<< "${changed_files}"
 
 if [[ "${touches_code}" == true && "${touches_docs}" == false ]]; then
-  echo "Docs check failed: changes under core/src/, cli/src/, or server/src/ require a change under docs/ in the same PR."
+  echo "Docs check failed: changes under core/src/, cli/src/, or server/src/ require a change to ${doc_file} in the same PR."
   echo "Changed files:"
   echo "${changed_files}"
   exit 1

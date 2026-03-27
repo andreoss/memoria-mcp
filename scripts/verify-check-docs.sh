@@ -36,10 +36,10 @@ set -e
 echo "exit code: ${code_only_violation}"
 git reset --quiet --hard HEAD~1
 
-echo "== Scenario 2: change core/src/ and docs/ (expect zero) =="
+echo "== Scenario 2: change core/src/ and README.adoc (expect zero) =="
 printf '// test\n' >> core/src/embedding.rs
-printf 'added\n' >> docs/overview.md
-git add core/src/embedding.rs docs/overview.md
+printf 'added\n' >> README.adoc
+git add core/src/embedding.rs README.adoc
 git commit --quiet -m "temp: code and docs"
 set +e
 bash scripts/check-docs.sh "$(git rev-parse HEAD~1)" "HEAD"
