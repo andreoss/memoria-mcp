@@ -63,9 +63,16 @@ struct EntitiesResponseBody {
     entities: Vec<memoria_core::memory::EntitySummary>,
 }
 
+async fn error_message(response: reqwest::Response) -> Result<String, String> {
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
+    let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
+    Ok(format!("server returned {status}: {message}"))
+}
+
 impl RemoteClient {
-    fn new(base_url: String, api_key: Option<String>) -> Self {
-        Self { base_url, api_key, http: reqwest::Client::new() }
+    fn new(base_url: &str, api_key: Option<String>) -> Self {
+        Self { base_url: base_url.trim_end_matches('/').to_string(), api_key, http: reqwest::Client::new() }
     }
 
     fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -75,15 +82,18 @@ impl RemoteClient {
         }
     }
 
+    async fn ensure_success(&self, builder: reqwest::RequestBuilder) -> Result<(), String> {
+        let response = self.authed(builder).send().await.map_err(|err| format!("request to server failed: {err}"))?;
+        if response.status().is_success() { Ok(()) } else { Err(error_message(response).await?) }
+    }
+
     async fn send<T: serde::de::DeserializeOwned>(&self, builder: reqwest::RequestBuilder) -> Result<T, String> {
         let response = self.authed(builder).send().await.map_err(|err| format!("request to server failed: {err}"))?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
-        if status.is_success() {
+        if response.status().is_success() {
+            let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
             serde_json::from_slice(&bytes).map_err(|err| format!("malformed response from server: {err}"))
         } else {
-            let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
-            Err(format!("server returned {status}: {message}"))
+            Err(error_message(response).await?)
         }
     }
 
@@ -92,13 +102,11 @@ impl RemoteClient {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
-        if status.is_success() {
+        if response.status().is_success() {
+            let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
             serde_json::from_slice(&bytes).map(Some).map_err(|err| format!("malformed response from server: {err}"))
         } else {
-            let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
-            Err(format!("server returned {status}: {message}"))
+            Err(error_message(response).await?)
         }
     }
 
@@ -118,19 +126,23 @@ impl RemoteClient {
     }
 
     async fn list_ids(&self, user_id: Option<&str>, agent_id: Option<&str>, run_id: Option<&str>, offset: usize, limit: usize, show_expired: bool) -> Result<Vec<String>, String> {
-        use std::fmt::Write as _;
-        let mut url = format!("{}/memories?offset={offset}&limit={limit}", self.base_url);
-        if let Some(v) = user_id {
-            let _ = write!(url, "&user_id={}", urlencode(v));
-        }
-        if let Some(v) = agent_id {
-            let _ = write!(url, "&agent_id={}", urlencode(v));
-        }
-        if let Some(v) = run_id {
-            let _ = write!(url, "&run_id={}", urlencode(v));
-        }
-        if show_expired {
-            url.push_str("&show_expired=true");
+        let mut url = reqwest::Url::parse(&format!("{}/memories", self.base_url)).map_err(|err| format!("invalid server URL: {err}"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("offset", &offset.to_string());
+            query.append_pair("limit", &limit.to_string());
+            if let Some(v) = user_id {
+                query.append_pair("user_id", v);
+            }
+            if let Some(v) = agent_id {
+                query.append_pair("agent_id", v);
+            }
+            if let Some(v) = run_id {
+                query.append_pair("run_id", v);
+            }
+            if show_expired {
+                query.append_pair("show_expired", "true");
+            }
         }
         let parsed: IdsResponse = self.send(self.http.get(url)).await?;
         Ok(parsed.ids)
@@ -157,20 +169,11 @@ impl RemoteClient {
 
     async fn update(&self, id: &str, content: Option<&str>, metadata: Option<&HashMap<String, String>>) -> Result<(), String> {
         let body = serde_json::json!({ "content": content, "metadata": metadata });
-        let response = self.authed(self.http.put(format!("{}/memories/{id}", self.base_url)).json(&body)).send().await.map_err(|err| format!("request to server failed: {err}"))?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
-            let message = serde_json::from_slice::<RemoteErrorBody>(&bytes).map_or_else(|_| String::from_utf8_lossy(&bytes).into_owned(), |body| body.error);
-            Err(format!("server returned {status}: {message}"))
-        }
+        self.ensure_success(self.http.put(format!("{}/memories/{id}", self.base_url)).json(&body)).await
     }
 
     async fn delete(&self, id: &str) -> Result<(), String> {
-        self.authed(self.http.delete(format!("{}/memories/{id}", self.base_url))).send().await.map_err(|err| format!("request to server failed: {err}"))?;
-        Ok(())
+        self.ensure_success(self.http.delete(format!("{}/memories/{id}", self.base_url))).await
     }
 
     async fn delete_all(&self, user_id: Option<&str>, agent_id: Option<&str>, run_id: Option<&str>) -> Result<usize, String> {
@@ -183,20 +186,6 @@ impl RemoteClient {
         let parsed: EntitiesResponseBody = self.send(self.http.get(format!("{}/entities", self.base_url))).await?;
         Ok(parsed.entities)
     }
-}
-
-fn urlencode(value: &str) -> String {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(byte as char),
-            _ => {
-                let _ = write!(encoded, "%{byte:02X}");
-            }
-        }
-    }
-    encoded
 }
 
 fn scope_from_optional(user_id: Option<String>, agent_id: Option<String>, run_id: Option<String>) -> HashMap<String, String> {
@@ -622,9 +611,19 @@ impl MemoriaMcpServer {
                 let ids = client
                     .list_ids(request.user_id.as_deref(), request.agent_id.as_deref(), request.run_id.as_deref(), request.offset, request.limit, request.show_expired)
                     .await?;
-                let mut memories = Vec::with_capacity(ids.len());
-                for id in ids {
-                    if let Ok(Some(record)) = client.get_record(&id).await {
+                let mut tasks = tokio::task::JoinSet::new();
+                for (index, id) in ids.into_iter().enumerate() {
+                    let client = client.clone();
+                    tasks.spawn(async move { (index, client.get_record(&id).await) });
+                }
+                let mut fetched = Vec::with_capacity(tasks.len());
+                while let Some(joined) = tasks.join_next().await {
+                    fetched.push(joined.map_err(|err| format!("record fetch task failed: {err}"))?);
+                }
+                fetched.sort_by_key(|(index, _)| *index);
+                let mut memories = Vec::with_capacity(fetched.len());
+                for (_, result) in fetched {
+                    if let Some(record) = result? {
                         memories.push(MemoryRecord::from(record));
                     }
                 }
@@ -973,9 +972,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_secret = std::env::var("MEMORIA_MCP_SECRET").ok().filter(|value| !value.is_empty());
 
     if let Ok(server_url) = std::env::var("MEMORIA_SERVER_URL") {
-        let api_key = std::env::var("MEMORIA_API_KEY").ok();
+        let api_key = std::env::var("MEMORIA_API_KEY").ok().filter(|value| !value.is_empty());
         eprintln!("mode: remote (server={server_url})");
-        let backend = Backend::Remote(RemoteClient::new(server_url, api_key));
+        let backend = Backend::Remote(RemoteClient::new(&server_url, api_key));
         let mut server = MemoriaMcpServer::new(backend, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
         server.persist_history = false;
         let service = server.serve(stdio()).await?;
@@ -1705,7 +1704,27 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
-    fn remote_test_server(base_url: String, mcp_secret: Option<String>) -> MemoriaMcpServer {
+    fn spawn_routed_fake_server(routes: Vec<(&'static str, u16, &'static str)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = text.lines().next().unwrap_or_default().split_whitespace().nth(1).unwrap_or_default().to_string();
+                let route = routes.iter().find(|(route_path, _, _)| path.starts_with(route_path) || path.split('?').next() == Some(route_path));
+                let (status, body) = route.map_or((404, ""), |(_, status, body)| (*status, *body));
+                let response = format!("HTTP/1.1 {status} status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn remote_test_server(base_url: &str, mcp_secret: Option<String>) -> MemoriaMcpServer {
         let backend = Backend::Remote(RemoteClient::new(base_url, None));
         let mut server = MemoriaMcpServer::new(backend, mcp_secret, PathBuf::from("/dev/null"), PathBuf::from("/dev/null"), false);
         server.persist_history = false;
@@ -1715,7 +1734,7 @@ mod tests {
     #[tokio::test]
     async fn add_memory_remote_sends_the_real_expected_request_body() {
         let (base_url, rx) = spawn_fake_server(201, r#"{"ids":["rec-1"]}"#);
-        let server = remote_test_server(base_url, None);
+        let server = remote_test_server(&base_url, None);
         let request = AddMemoryRequest { content: "hello".to_string(), user_id: Some("alice".to_string()), agent_id: None, run_id: None, infer: false, images: vec![], secret: None };
         let Json(result) = server.add_memory(Parameters(request)).await.expect("add should succeed");
         assert_eq!(result.ids, vec!["rec-1".to_string()]);
@@ -1731,7 +1750,7 @@ mod tests {
     #[tokio::test]
     async fn search_memories_remote_sends_the_real_expected_request_body_and_parses_a_real_response() {
         let (base_url, rx) = spawn_fake_server(200, r#"{"results":[{"id":"rec-1","score":0.5,"payload":{"content":"hi"},"score_details":null}]}"#);
-        let server = remote_test_server(base_url, None);
+        let server = remote_test_server(&base_url, None);
         let request = SearchMemoriesRequest {
             query: "hi".to_string(),
             user_id: Some("alice".to_string()),
@@ -1758,7 +1777,7 @@ mod tests {
     #[tokio::test]
     async fn delete_all_memories_remote_rejects_an_empty_scope_without_ever_making_a_request() {
         let (base_url, rx) = spawn_fake_server(200, r#"{"deleted":0}"#);
-        let server = remote_test_server(base_url, None);
+        let server = remote_test_server(&base_url, None);
         let request = DeleteAllMemoriesRequest { user_id: None, agent_id: None, run_id: None, secret: None };
         let err = server.delete_all_memories(Parameters(request)).await.err().expect("expected a validation error");
         assert!(err.contains("requires at least one of user_id, agent_id, or run_id"), "got: {err}");
@@ -1768,7 +1787,7 @@ mod tests {
     #[tokio::test]
     async fn get_memory_remote_maps_a_non_2xx_response_to_a_real_specific_error() {
         let (base_url, _rx) = spawn_fake_server(500, r#"{"error":"boom"}"#);
-        let server = remote_test_server(base_url, None);
+        let server = remote_test_server(&base_url, None);
         let request = GetMemoryRequest { id: "rec-1".to_string(), secret: None };
         let err = server.get_memory(Parameters(request)).await.err().expect("expected an error");
         assert!(err.contains("500"), "got: {err}");
@@ -1778,9 +1797,37 @@ mod tests {
     #[tokio::test]
     async fn get_memory_remote_returns_the_real_not_found_message_on_404() {
         let (base_url, _rx) = spawn_fake_server(404, r#"{"error":"not found: rec-1"}"#);
-        let server = remote_test_server(base_url, None);
+        let server = remote_test_server(&base_url, None);
         let request = GetMemoryRequest { id: "rec-1".to_string(), secret: None };
         let err = server.get_memory(Parameters(request)).await.err().expect("expected an error");
         assert_eq!(err, "no memory found with id rec-1");
+    }
+
+    #[test]
+    fn remote_client_trims_a_trailing_slash_from_the_configured_server_url() {
+        let client = RemoteClient::new("http://127.0.0.1:8080/", None);
+        assert_eq!(client.base_url, "http://127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn delete_memory_remote_reports_a_real_error_instead_of_success_when_the_server_rejects_it() {
+        let (base_url, _rx) = spawn_fake_server(404, r#"{"error":"no memory found with id rec-1"}"#);
+        let server = remote_test_server(&base_url, None);
+        let request = DeleteMemoryRequest { id: "rec-1".to_string(), secret: None };
+        let err = server.delete_memory(Parameters(request)).await.err().expect("a failed remote delete must be a real error, not a reported success");
+        assert!(err.contains("404"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_memories_remote_propagates_a_real_error_from_one_failed_record_fetch_instead_of_silently_shortening_the_list() {
+        let base_url = spawn_routed_fake_server(vec![
+            ("/memories/rec-1", 200, r#"{"id":"rec-1","vector":[],"payload":{"content":"ok"}}"#),
+            ("/memories/rec-2", 500, r#"{"error":"boom"}"#),
+            ("/memories", 200, r#"{"ids":["rec-1","rec-2"]}"#),
+        ]);
+        let server = remote_test_server(&base_url, None);
+        let request = GetMemoriesRequest { user_id: Some("alice".to_string()), agent_id: None, run_id: None, offset: 0, limit: 50, show_expired: false, secret: None };
+        let err = server.get_memories(Parameters(request)).await.err().expect("a real fetch failure must surface as an error, not a shorter list");
+        assert!(err.contains("500") && err.contains("boom"), "got: {err}");
     }
 }

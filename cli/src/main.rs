@@ -711,7 +711,8 @@ fn main() {
     let json = cli.json;
     let quiet = cli.quiet;
     if let Ok(server_url) = std::env::var("MEMORIA_SERVER_URL") {
-        run_remote(cli.command, server_url.trim_end_matches('/'), std::env::var("MEMORIA_API_KEY").ok().as_deref(), json, quiet);
+        let api_key = std::env::var("MEMORIA_API_KEY").ok().filter(|value| !value.is_empty());
+        run_remote(cli.command, server_url.trim_end_matches('/'), api_key.as_deref(), json, quiet);
         return;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
