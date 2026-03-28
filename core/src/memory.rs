@@ -118,6 +118,16 @@ pub struct EntitySummary {
 
 const ENTITY_SCOPE_FIELDS: [&str; 3] = ["user_id", "agent_id", "run_id"];
 
+/// A full provider triple, for a consumer that wants to validate configuration
+/// up front rather than one provider at a time.
+///
+/// This type is deliberately *not* used by this workspace's own `cli`/`server`/
+/// `mcp` binaries: each provider validates its own config inside `from_config`
+/// before building anything (`ADR-09`, closed), and a binary may mix a
+/// configured provider with a config-free local one, so there is no point in
+/// the startup path where all three configs exist together. It is kept as
+/// library surface for downstream consumers of `memoria-core`, not as this
+/// project's own startup entry point.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryConfig {
     pub llm: LlmConfig,
@@ -126,7 +136,12 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
-    #[allow(clippy::missing_errors_doc)]
+    /// Validates all three sub-configs, short-circuiting on the first failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError::Config` from whichever sub-config fails first, in
+    /// LLM, embedding, vector-store order.
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         self.llm.validate()?;
         self.embedding.validate()?;
