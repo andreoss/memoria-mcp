@@ -50,8 +50,8 @@ echo "exit code: ${both_pass}"
 git reset --quiet --hard HEAD~1
 
 echo "== Scenario 3: no version bump at all (expect zero) =="
-printf 'temp\n' >> docs/overview.md
-git add docs/overview.md
+printf 'temp\n' >> README.adoc
+git add README.adoc
 git commit --quiet -m "temp: unrelated change"
 set +e
 bash scripts/check-changelog.sh "$(git rev-parse HEAD~1)" "HEAD"
