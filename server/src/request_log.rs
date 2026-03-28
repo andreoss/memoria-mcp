@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -37,6 +35,8 @@ impl RequestLogStore {
         self.entries.lock().expect("request log lock poisoned").clone()
     }
 
+    // Test-only: nothing in the served request path reads the log's length.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.lock().expect("request log lock poisoned").len()
     }

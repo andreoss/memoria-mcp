@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -21,7 +19,6 @@ pub fn generate_random_key(byte_len: usize) -> String {
 }
 
 const HASH_LEN: usize = 32;
-const SALT_LEN: usize = 16;
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; HASH_LEN] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
@@ -88,6 +85,8 @@ pub fn hash_password(password: &str) -> String {
     hash_password_with_params(password, argon2::Params::DEFAULT_T_COST, argon2::Params::DEFAULT_M_COST)
 }
 
+// Test-only: the cheap-parameter hashing seam this crate's own tests use.
+#[cfg(test)]
 pub fn hash_password_with_iterations(password: &str, iterations: u32) -> String {
     hash_password_with_params(password, iterations.max(argon2::Params::MIN_T_COST), argon2::Params::MIN_M_COST)
 }
