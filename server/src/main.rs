@@ -1165,7 +1165,10 @@ fn resolve_reranker(
 }
 
 #[derive(Clone, Copy, Default)]
-#[allow(dead_code)]
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "qdrant", feature = "chroma", feature = "milvus")),
+    allow(dead_code)
+)]
 struct NetworkedStoreEnv<'a> {
     url: Option<&'a str>,
     dimension: Option<&'a str>,
