@@ -145,6 +145,13 @@ impl RateLimiter {
 
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 
+// Engine-level ceilings (ADR-16 bounds the raw HTTP body; these bound what the
+// engine itself accepts once that body is parsed). Defaults are generous enough
+// not to change any working deployment, but bounded rather than absent.
+const DEFAULT_MAX_TOP_K: usize = 1_000;
+const DEFAULT_MAX_CONTENT_BYTES: usize = MAX_REQUEST_BODY_BYTES;
+const DEFAULT_MAX_METADATA_BYTES: usize = 8_192;
+
 #[derive(serde::Deserialize)]
 struct CreateMemoryRequest {
     content: Option<String>,
@@ -2063,12 +2070,47 @@ where
     axum::serve(listener, app).with_graceful_shutdown(shutdown).await.expect("server should not fail while serving");
 }
 
+#[derive(Debug)]
+struct EngineLimits {
+    top_k: usize,
+    content_bytes: usize,
+    metadata_bytes: usize,
+}
+
+fn parse_positive_limit(name: &str, value: Option<String>, default: usize) -> Result<usize, String> {
+    let Some(raw) = value else { return Ok(default) };
+    let parsed: usize = raw.trim().parse().map_err(|_| format!("{name} must be a positive integer, got {raw:?}"))?;
+    if parsed == 0 {
+        return Err(format!("{name} must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
+fn resolve_engine_limits(max_top_k: Option<String>, max_content_bytes: Option<String>, max_metadata_bytes: Option<String>) -> Result<EngineLimits, String> {
+    Ok(EngineLimits {
+        top_k: parse_positive_limit("MEMORIA_MAX_TOP_K", max_top_k, DEFAULT_MAX_TOP_K)?,
+        content_bytes: parse_positive_limit("MEMORIA_MAX_CONTENT_BYTES", max_content_bytes, DEFAULT_MAX_CONTENT_BYTES)?,
+        metadata_bytes: parse_positive_limit("MEMORIA_MAX_METADATA_BYTES", max_metadata_bytes, DEFAULT_MAX_METADATA_BYTES)?,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() {
     let api_key_env = std::env::var("MEMORIA_API_KEY").ok();
     let allow_no_auth_env = std::env::var("MEMORIA_ALLOW_NO_AUTH").ok();
     let token = match resolve_auth_config(api_key_env, allow_no_auth_env) {
         Ok(token) => token,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    let limits = match resolve_engine_limits(
+        std::env::var("MEMORIA_MAX_TOP_K").ok(),
+        std::env::var("MEMORIA_MAX_CONTENT_BYTES").ok(),
+        std::env::var("MEMORIA_MAX_METADATA_BYTES").ok(),
+    ) {
+        Ok(limits) => limits,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(1);
@@ -2187,7 +2229,14 @@ fn main() {
     eprintln!("history: {}", history_path.display());
 
     let rate_limiter = RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC);
-    let mut memory = Memory::new(llm_provider, embedding_provider, vector_store);
+    eprintln!(
+        "limits: top_k<={}, content<={} bytes, metadata<={} bytes",
+        limits.top_k, limits.content_bytes, limits.metadata_bytes
+    );
+    let mut memory = Memory::new(llm_provider, embedding_provider, vector_store)
+        .with_max_top_k(limits.top_k)
+        .with_max_content_length(limits.content_bytes)
+        .with_max_metadata_bytes(limits.metadata_bytes);
     if let Some((reranker, _)) = reranker {
         memory = memory.with_reranker(reranker);
     }
@@ -4823,5 +4872,70 @@ mod tests {
             let response_text = String::from_utf8_lossy(&response);
             assert!(response_text.starts_with("HTTP/1.1 5"), "got: {response_text}");
         });
+    }
+
+    #[test]
+    fn resolve_engine_limits_defaults_when_nothing_is_set() {
+        let limits = resolve_engine_limits(None, None, None).expect("defaults must resolve");
+        assert_eq!(limits.top_k, DEFAULT_MAX_TOP_K);
+        assert_eq!(limits.content_bytes, DEFAULT_MAX_CONTENT_BYTES);
+        assert_eq!(limits.metadata_bytes, DEFAULT_MAX_METADATA_BYTES);
+    }
+
+    #[test]
+    fn resolve_engine_limits_honors_each_override() {
+        let limits = resolve_engine_limits(Some("5".to_string()), Some("64".to_string()), Some("32".to_string())).expect("overrides must resolve");
+        assert_eq!(limits.top_k, 5);
+        assert_eq!(limits.content_bytes, 64);
+        assert_eq!(limits.metadata_bytes, 32);
+    }
+
+    #[test]
+    fn resolve_engine_limits_rejects_a_non_numeric_value() {
+        let err = resolve_engine_limits(Some("lots".to_string()), None, None).expect_err("a non-numeric limit must fail at startup");
+        assert!(err.contains("MEMORIA_MAX_TOP_K"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_engine_limits_rejects_zero() {
+        let err = resolve_engine_limits(None, Some("0".to_string()), None).expect_err("a zero limit must fail at startup, not silently reject every request");
+        assert!(err.contains("MEMORIA_MAX_CONTENT_BYTES"), "got: {err}");
+    }
+
+    #[test]
+    fn a_search_over_the_configured_top_k_ceiling_is_rejected() {
+        let memory = Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()).with_max_top_k(5);
+        handle_create_memory(&memory, br#"{"content":"Alice is an engineer.","user_id":"alice"}"#);
+
+        let (status, body) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice","top_k":50}"#);
+        assert_eq!(status, 400, "a top_k over the configured ceiling must be rejected, not silently served");
+        let message = String::from_utf8_lossy(&body);
+        assert!(message.contains("ceiling"), "got: {message}");
+
+        let (status, _) = handle_search_memory(&memory, br#"{"query":"engineer","user_id":"alice","top_k":5}"#);
+        assert_eq!(status, 200, "a top_k at the ceiling must still be served");
+    }
+
+    #[test]
+    fn content_over_the_configured_length_ceiling_is_rejected() {
+        let memory =
+            Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()).with_max_content_length(16);
+
+        let (status, _) = handle_create_memory(&memory, br#"{"content":"short","user_id":"alice","infer":false}"#);
+        assert_eq!(status, 201, "content under the ceiling must still be accepted");
+
+        let long = format!(r#"{{"content":"{}","user_id":"alice","infer":false}}"#, "x".repeat(64));
+        let (status, _) = handle_create_memory(&memory, long.as_bytes());
+        assert_eq!(status, 400, "content over the configured ceiling must be rejected");
+    }
+
+    #[test]
+    fn metadata_over_the_configured_byte_ceiling_is_rejected() {
+        let memory =
+            Memory::new(LocalSentenceLlmProvider::new(), LocalHashEmbeddingProvider::new(), InMemoryVectorStore::new()).with_max_metadata_bytes(16);
+
+        let long_scope = format!(r#"{{"content":"fine","user_id":"{}","infer":false}}"#, "a".repeat(64));
+        let (status, _) = handle_create_memory(&memory, long_scope.as_bytes());
+        assert_eq!(status, 400, "a scope payload over the configured ceiling must be rejected");
     }
 }

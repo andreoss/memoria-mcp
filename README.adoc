@@ -77,6 +77,12 @@ MEMORIA_API_KEY=dev-key MEMORIA_JWT_SECRET=dev-secret ./target/debug/server
 curl -H "Authorization: Bearer dev-key" http://localhost:8080/health
 ----
 
+The server applies three engine-level ceilings on top of its HTTP body limit,
+each overridable and each validated at startup: `MEMORIA_MAX_TOP_K` (default
+1000), `MEMORIA_MAX_CONTENT_BYTES` (default 1 MiB), and
+`MEMORIA_MAX_METADATA_BYTES` (default 8192). A request over any of them is
+rejected with a 400 naming the limit.
+
 *MCP server* — point an MCP client (e.g. Claude Code's `claude mcp add`)
 at the compiled `target/debug/mcp` binary; it speaks stdio, no daemon or
 network port involved.
