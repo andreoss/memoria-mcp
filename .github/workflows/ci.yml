@@ -48,7 +48,7 @@ jobs:
       - name: Run Verify-Check-Changelog
         run: bash scripts/verify-check-changelog.sh
 
-      - name: Warm Cargo Cache (verify-smoke-test-server.sh builds --offline)
+      - name: Warm Cargo Cache (verify-smoke-test-server.sh rebuilds the server)
         run: cargo build -p server
 
       - name: Run Verify-Smoke-Test-Server

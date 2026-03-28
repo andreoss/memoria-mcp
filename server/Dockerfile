@@ -1,7 +1,7 @@
 FROM rust:1-slim-trixie AS build-fastembed
 RUN apt-get update && apt-get install -y --no-install-recommends g++ ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml rust-toolchain.toml ./
 COPY core ./core
 COPY cli ./cli
 COPY server ./server
@@ -23,7 +23,7 @@ ENTRYPOINT ["/usr/local/bin/server"]
 
 FROM rust:1-slim-bookworm AS build-sqlite
 WORKDIR /workspace
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml rust-toolchain.toml ./
 COPY core ./core
 COPY cli ./cli
 COPY server ./server
@@ -41,7 +41,7 @@ ENTRYPOINT ["/usr/local/bin/server"]
 
 FROM rust:1-slim-bookworm AS build
 WORKDIR /workspace
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml rust-toolchain.toml ./
 COPY core ./core
 COPY cli ./cli
 COPY server ./server

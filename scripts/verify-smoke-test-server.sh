@@ -10,7 +10,7 @@ not_running_rc=$?
 echo "exit code: ${not_running_rc}"
 
 echo "== Scenario 2: server running with the right key (expect zero) =="
-cargo build --offline -p server >/dev/null 2>&1
+cargo build -p server >/dev/null 2>&1
 scratch_dir="$(mktemp -d)"
 MEMORIA_API_KEY=verify-smoke-key \
   MEMORIA_JWT_SECRET=verify-smoke-jwt-secret \
