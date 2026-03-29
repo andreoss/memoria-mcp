@@ -87,6 +87,23 @@ rejected with a 400 naming the limit.
 at the compiled `target/debug/mcp` binary; it speaks stdio, no daemon or
 network port involved.
 
+== Vector stores
+
+The default store is in-process and needs nothing external. Six backends
+exist behind Cargo features: in-memory, SQLite, pgvector, Qdrant, Chroma,
+and Milvus. Only SQLite (FTS5) and pgvector (`ts_rank_cd`) implement the
+keyword half of hybrid search; on the other four, `search` is semantic
+only.
+
+The pgvector backend (`MEMORIA_POSTGRES_URL`, `MEMORIA_POSTGRES_DIMENSION`,
+`MEMORIA_POSTGRES_TABLE`) creates its own schema and indexes on first open
+— an HNSW index for `<->` search, GIN indexes for keyword and scope
+filtering — draws connections from a pool rather than sharing one, and
+negotiates TLS when the connection string asks for it (`sslmode=require`
+and friends), so managed Postgres works without extra configuration. A
+self-signed server certificate needs its CA in the host trust store; there
+is no in-repo knob for a custom CA file.
+
 Real providers (Ollama, FastEmbed) and SQLite persistence are behind
 Cargo features (`ollama`, `fastembed`, `sqlite` — `mcp` enables `sqlite`
 by default). Every default is a real, local, non-AI placeholder so the
