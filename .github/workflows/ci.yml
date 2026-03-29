@@ -76,6 +76,12 @@ jobs:
       - name: Cargo Test (Workspace)
         run: cargo test --workspace
 
+      - name: Install cargo-machete (Unused-Dependency Check)
+        run: cargo install cargo-machete --locked
+
+      - name: Cargo Machete (Unused Dependencies, Workspace)
+        run: cargo machete
+
       - name: Cargo Build (ollama feature)
         run: cargo build -p memoria-core -p cli -p server -p mcp --features ollama
 
