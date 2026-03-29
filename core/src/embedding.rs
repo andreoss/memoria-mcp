@@ -166,7 +166,6 @@ pub trait EmbeddingContractTests: EmbeddingProvider {
 
 impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
 
-#[cfg(feature = "ollama")]
 // T1693: embedding is a short request; it gets a tighter budget than generation.
 #[cfg(feature = "ollama")]
 const OLLAMA_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);

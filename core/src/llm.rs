@@ -286,7 +286,6 @@ pub fn normalize_ollama_base_url(raw: &str) -> String {
 pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
 const OLLAMA_DEFAULT_PORT: u16 = 11434;
 
-#[cfg(feature = "ollama")]
 // T1693: Client::new() has no timeout at all, so a stalled local model hung the
 // caller indefinitely and both providers' own Timeout branches were unreachable.
 // Generation gets the longer budget: a first call after a model load is slow,
