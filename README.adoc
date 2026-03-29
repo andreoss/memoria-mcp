@@ -95,13 +95,13 @@ and Milvus. Only SQLite (FTS5) and pgvector (`ts_rank_cd`) implement the
 keyword half of hybrid search; on the other four, `search` is semantic
 only.
 
-The pgvector backend (`MEMORIA_POSTGRES_URL`, `MEMORIA_POSTGRES_DIMENSION`,
 A search reads a bounded candidate window out of the store —
 `max(top_k × 20, 500)` records — before the keyword pass, entity boost,
 truncation and reranking run over it. The window is far wider than `top_k`
 because those later passes only rescore records already in it; it is bounded
 at all so a backend with an ANN index can use one.
 
+The pgvector backend (`MEMORIA_POSTGRES_URL`, `MEMORIA_POSTGRES_DIMENSION`,
 `MEMORIA_POSTGRES_TABLE`) creates its own schema and indexes on first open
 — an HNSW index for `<->` search, GIN indexes for keyword and scope
 filtering — draws connections from a pool rather than sharing one, and
