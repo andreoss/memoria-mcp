@@ -63,6 +63,19 @@ struct EntitiesResponseBody {
     entities: Vec<memoria_core::memory::EntitySummary>,
 }
 
+// T1692: OLLAMA_HOST is Ollama's own variable, and the one a user setting up a
+// remote host reaches for first. It is a fallback, below the MEMORIA_* variable
+// in precedence, so no existing deployment changes behavior. Empty values are
+// treated as unset, matching the existing MEMORIA_API_KEY/MEMORIA_MCP_SECRET guard.
+fn resolve_ollama_base_url(memoria_value: Option<String>, ollama_host: Option<String>) -> Option<String> {
+    let usable = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+    usable(memoria_value).or_else(|| usable(ollama_host))
+}
+
+fn ollama_base_url_env(memoria_var: &str) -> Option<String> {
+    resolve_ollama_base_url(std::env::var(memoria_var).ok(), std::env::var("OLLAMA_HOST").ok())
+}
+
 async fn error_message(response: reqwest::Response) -> Result<String, String> {
     let status = response.status();
     let bytes = response.bytes().await.map_err(|err| format!("failed to read server response: {err}"))?;
@@ -989,7 +1002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (llm_provider, llm_label) = resolve_llm_provider(
         llm_provider_choice.as_deref(),
         std::env::var("MEMORIA_LLM_MODEL").ok(),
-        std::env::var("MEMORIA_LLM_BASE_URL").ok(),
+        ollama_base_url_env("MEMORIA_LLM_BASE_URL"),
         std::env::var("MEMORIA_CANDLE_CACHE_DIR").ok(),
     )
     .map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
@@ -997,7 +1010,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (embedding_provider, embedding_label) = resolve_embedding_provider(
         std::env::var("MEMORIA_EMBEDDING_PROVIDER").ok().as_deref(),
         std::env::var("MEMORIA_EMBEDDING_MODEL").ok(),
-        std::env::var("MEMORIA_EMBEDDING_BASE_URL").ok(),
+        ollama_base_url_env("MEMORIA_EMBEDDING_BASE_URL"),
         std::env::var("MEMORIA_FASTEMBED_CACHE_DIR").ok(),
     )
     .map_err(|message| -> Box<dyn std::error::Error> { message.into() })?;
@@ -1832,5 +1845,28 @@ mod tests {
         let request = GetMemoriesRequest { user_id: Some("alice".to_string()), agent_id: None, run_id: None, offset: 0, limit: 50, show_expired: false, secret: None };
         let err = server.get_memories(Parameters(request)).await.err().expect("a real fetch failure must surface as an error, not a shorter list");
         assert!(err.contains("500") && err.contains("boom"), "got: {err}");
+    }
+
+    #[test]
+    fn the_memoria_base_url_variable_wins_over_ollama_host() {
+        let resolved = resolve_ollama_base_url(Some("http://memoria:11434".to_string()), Some("192.0.2.1".to_string()));
+        assert_eq!(resolved.as_deref(), Some("http://memoria:11434"));
+    }
+
+    #[test]
+    fn ollama_host_is_used_when_the_memoria_variable_is_unset() {
+        let resolved = resolve_ollama_base_url(None, Some("192.0.2.1".to_string()));
+        assert_eq!(resolved.as_deref(), Some("192.0.2.1"), "normalization happens in core, not here");
+    }
+
+    #[test]
+    fn an_empty_base_url_variable_falls_through_to_ollama_host() {
+        let resolved = resolve_ollama_base_url(Some("   ".to_string()), Some("192.0.2.1".to_string()));
+        assert_eq!(resolved.as_deref(), Some("192.0.2.1"), "an empty value must be treated as unset");
+    }
+
+    #[test]
+    fn neither_variable_set_resolves_to_none() {
+        assert_eq!(resolve_ollama_base_url(None, None), None);
     }
 }

@@ -511,8 +511,12 @@ where
             messages.iter().map(|m| (m.content.clone(), Some(m.role))).collect()
         };
         let mut ids = Vec::new();
-        for (content, role) in &items {
-            let vector = self.embedding.embed(content)?;
+        // T1695: one batch call rather than one round trip per extracted fact. The
+        // default trait implementation is still a per-text loop, so a provider
+        // without a batch endpoint behaves exactly as before.
+        let contents: Vec<&str> = items.iter().map(|(content, _)| content.as_str()).collect();
+        let vectors = self.embedding.embed_batch(&contents)?;
+        for ((content, role), vector) in items.iter().zip(vectors) {
             if let Ok(results) = self.vector_store.search(&vector, 100, &scope, None) {
                 if results.iter().any(|r| r.payload.get("content") == Some(content)) {
                     continue;

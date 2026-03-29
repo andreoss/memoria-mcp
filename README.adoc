@@ -104,6 +104,25 @@ and friends), so managed Postgres works without extra configuration. A
 self-signed server certificate needs its CA in the host trust store; there
 is no in-repo knob for a custom CA file.
 
+== Ollama
+
+The `ollama` feature points the LLM and embedding providers at a real Ollama
+instance. Either `MEMORIA_LLM_BASE_URL`/`MEMORIA_EMBEDDING_BASE_URL` or
+Ollama's own `OLLAMA_HOST` supplies the endpoint — the `MEMORIA_*` variables
+win where both are set, and an empty value counts as unset. A bare host is
+completed, so `OLLAMA_HOST=192.0.2.1` means `http://192.0.2.1:11434`:
+
+[source,sh]
+----
+OLLAMA_HOST=192.0.2.1 MEMORIA_LLM_PROVIDER=ollama \
+  MEMORIA_LLM_MODEL=qwen2.5-coder:1.5b ./target/debug/cli add "..." --user-id alice
+----
+
+Requests carry an explicit timeout (2 minutes for generation, 1 for
+embedding), `LlmConfig`'s `temperature` is sent in the request's `options`,
+and embedding uses the batch `/api/embed` endpoint, falling back to the
+legacy per-prompt `/api/embeddings` on a 404 from an older server.
+
 Real providers (Ollama, FastEmbed) and SQLite persistence are behind
 Cargo features (`ollama`, `fastembed`, `sqlite` — `mcp` enables `sqlite`
 by default). Every default is a real, local, non-AI placeholder so the

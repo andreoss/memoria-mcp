@@ -167,6 +167,11 @@ pub trait EmbeddingContractTests: EmbeddingProvider {
 impl<T: EmbeddingProvider + ?Sized> EmbeddingContractTests for T {}
 
 #[cfg(feature = "ollama")]
+// T1693: embedding is a short request; it gets a tighter budget than generation.
+#[cfg(feature = "ollama")]
+const OLLAMA_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+#[cfg(feature = "ollama")]
 pub struct OllamaEmbeddingProvider {
     client: reqwest::blocking::Client,
     base_url: String,
@@ -179,8 +184,11 @@ impl OllamaEmbeddingProvider {
     pub fn from_config(config: EmbeddingConfig) -> Result<Self, crate::CoreError> {
         config.validate()?;
         Ok(Self {
-            client: reqwest::blocking::Client::new(),
-            base_url: config.base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            client: reqwest::blocking::Client::builder()
+                .timeout(OLLAMA_EMBED_TIMEOUT)
+                .build()
+                .map_err(|err| crate::CoreError::Config(err.to_string()))?,
+            base_url: crate::llm::normalize_ollama_base_url(&config.base_url.unwrap_or_else(|| crate::llm::OLLAMA_DEFAULT_BASE_URL.to_string())),
             model: config.model,
         })
     }
@@ -200,6 +208,34 @@ fn parse_embeddings_response(json: &serde_json::Value) -> Result<Vec<f32>, Embed
         .ok_or_else(|| EmbeddingError::Backend("missing embedding field in response".to_string()))
 }
 
+
+// T1695: /api/embeddings is the legacy single-prompt endpoint, so a multi-fact
+// add() paid one full round trip per fact. /api/embed takes a batch. Older
+// Ollama builds predate it, so a 404 falls back to the legacy path rather than
+// making a newer server a hard requirement.
+#[cfg(feature = "ollama")]
+fn build_batch_embeddings_request(model: &str, texts: &[&str]) -> serde_json::Value {
+    serde_json::json!({"model": model, "input": texts})
+}
+
+#[cfg(feature = "ollama")]
+#[allow(clippy::cast_possible_truncation)]
+fn parse_batch_embeddings_response(json: &serde_json::Value, expected: usize) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    let rows = json
+        .get("embeddings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| EmbeddingError::Backend("missing embeddings field in response".to_string()))?;
+    if rows.len() != expected {
+        return Err(EmbeddingError::Backend(format!("expected {expected} embeddings, got {}", rows.len())));
+    }
+    rows.iter()
+        .map(|row| {
+            row.as_array()
+                .map(|values| values.iter().filter_map(serde_json::Value::as_f64).map(|v| v as f32).collect())
+                .ok_or_else(|| EmbeddingError::Backend("an embeddings entry was not an array".to_string()))
+        })
+        .collect()
+}
 #[cfg(feature = "ollama")]
 impl EmbeddingProvider for OllamaEmbeddingProvider {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
@@ -226,6 +262,31 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
 
         let json: serde_json::Value = response.json().map_err(|err| EmbeddingError::Backend(err.to_string()))?;
         parse_embeddings_response(&json)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.iter().any(|text| text.is_empty()) {
+            return Err(EmbeddingError::EmptyInput);
+        }
+        let request = build_batch_embeddings_request(&self.model, texts);
+        let response = self
+            .client
+            .post(format!("{}/api/embed", self.base_url))
+            .json(&request)
+            .send()
+            .map_err(|err| if err.is_timeout() { EmbeddingError::Timeout } else { EmbeddingError::Backend(err.to_string()) })?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return texts.iter().map(|text| self.embed(text)).collect();
+        }
+        if !response.status().is_success() {
+            return Err(EmbeddingError::Backend(format!("HTTP {}", response.status())));
+        }
+        let json: serde_json::Value = response.json().map_err(|err| EmbeddingError::Backend(err.to_string()))?;
+        parse_batch_embeddings_response(&json, texts.len())
     }
 }
 
@@ -436,8 +497,77 @@ mod tests {
 
     #[cfg(feature = "ollama")]
     mod ollama_tests {
-        use super::super::{build_embeddings_request, parse_embeddings_response, OllamaEmbeddingProvider};
+        use super::super::{build_embeddings_request, parse_embeddings_response, EmbeddingConfig, EmbeddingError, EmbeddingProvider, OllamaEmbeddingProvider};
         use super::*;
+
+        // T1695: a dependency-free single-connection mock, the same technique cli's and
+        // mcp's own remote tests use. Verifies the real request shape and the real
+        // fallback, neither of which the live host could exercise: the Ollama instance
+        // available for this work runs without embedding support.
+        fn spawn_embed_server(status_line: &'static str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind should succeed");
+            let port = listener.local_addr().expect("addr should resolve").port();
+            let handle = std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                let (mut stream, _) = listener.accept().expect("accept should succeed");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).expect("read should succeed");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let response = format!("{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).expect("write should succeed");
+                stream.flush().expect("flush should succeed");
+                request
+            });
+            (format!("http://127.0.0.1:{port}"), handle)
+        }
+
+        #[test]
+        fn embed_batch_posts_one_request_to_the_batch_endpoint() {
+            let (url, handle) = spawn_embed_server("HTTP/1.1 200 OK", r#"{"embeddings":[[1.0,2.0],[3.0,4.0]]}"#);
+            let config = EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: Some(url), api_key: None, dimensions: None };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("provider should build");
+
+            let embeddings = provider.embed_batch(&["first", "second"]).expect("batch embedding should succeed");
+
+            assert_eq!(embeddings, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+            let request = handle.join().expect("the mock server should not panic");
+            assert!(request.starts_with("POST /api/embed "), "must use the batch endpoint, not the legacy one: {request}");
+            assert!(request.contains(r#""input":["first","second"]"#), "both texts must go in one request: {request}");
+        }
+
+        #[test]
+        fn embed_batch_falls_back_to_the_legacy_endpoint_when_batch_is_not_found() {
+            let (url, handle) = spawn_embed_server("HTTP/1.1 404 Not Found", r#"{"error":"not found"}"#);
+            let config = EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: Some(url), api_key: None, dimensions: None };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("provider should build");
+
+            // The mock serves exactly one connection, so the fallback's own request fails to
+            // connect -- what matters is that a 404 is not surfaced as a batch error.
+            let result = provider.embed_batch(&["first"]);
+
+            let request = handle.join().expect("the mock server should not panic");
+            assert!(request.starts_with("POST /api/embed "), "the batch endpoint must be tried first: {request}");
+            match result {
+                Err(EmbeddingError::Backend(message)) => {
+                    assert!(!message.contains("404"), "a 404 must trigger the legacy fallback, not be reported as-is: {message}");
+                }
+                other => panic!("expected the fallback to be attempted, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn embed_batch_rejects_an_empty_text_without_calling_the_backend() {
+            let config = EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: Some("http://127.0.0.1:1".to_string()), api_key: None, dimensions: None };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("provider should build");
+            assert!(matches!(provider.embed_batch(&["fine", ""]), Err(EmbeddingError::EmptyInput)));
+        }
+
+        #[test]
+        fn embed_batch_of_nothing_is_an_empty_result_without_a_request() {
+            let config = EmbeddingConfig { model: "nomic-embed-text".to_string(), base_url: Some("http://127.0.0.1:1".to_string()), api_key: None, dimensions: None };
+            let provider = OllamaEmbeddingProvider::from_config(config).expect("provider should build");
+            assert_eq!(provider.embed_batch(&[]).expect("an empty batch is not an error"), Vec::<Vec<f32>>::new());
+        }
 
         #[test]
         fn build_embeddings_request_has_the_expected_shape() {

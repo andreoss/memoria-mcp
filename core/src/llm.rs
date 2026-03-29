@@ -260,11 +260,46 @@ pub trait LlmContractTests: LlmProvider {
 
 impl<T: LlmProvider + ?Sized> LlmContractTests for T {}
 
+/// Normalizes an Ollama base URL.
+///
+/// Ollama's own `OLLAMA_HOST` convention accepts a bare host, `host:port`, or a
+/// full URL, but both providers build request URLs by concatenation, so anything
+/// missing a scheme or port would produce an unparseable request. An explicit
+/// scheme is left alone; a bare host gains `http://` and Ollama's default port.
+#[must_use]
+pub fn normalize_ollama_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return OLLAMA_DEFAULT_BASE_URL.to_string();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    if trimmed.contains(':') {
+        return format!("http://{trimmed}");
+    }
+    format!("http://{trimmed}:{OLLAMA_DEFAULT_PORT}")
+}
+
+/// The default Ollama endpoint, used when neither a config value nor
+/// `OLLAMA_HOST` supplies one.
+pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
+const OLLAMA_DEFAULT_PORT: u16 = 11434;
+
+#[cfg(feature = "ollama")]
+// T1693: Client::new() has no timeout at all, so a stalled local model hung the
+// caller indefinitely and both providers' own Timeout branches were unreachable.
+// Generation gets the longer budget: a first call after a model load is slow,
+// but it is not unbounded.
+#[cfg(feature = "ollama")]
+const OLLAMA_GENERATE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
 #[cfg(feature = "ollama")]
 pub struct OllamaLlmProvider {
     client: reqwest::blocking::Client,
     base_url: String,
     model: String,
+    temperature: Option<f32>,
 }
 
 #[cfg(feature = "ollama")]
@@ -273,16 +308,20 @@ impl OllamaLlmProvider {
     pub fn from_config(config: LlmConfig) -> Result<Self, crate::CoreError> {
         config.validate()?;
         Ok(Self {
-            client: reqwest::blocking::Client::new(),
-            base_url: config.base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            client: reqwest::blocking::Client::builder()
+                .timeout(OLLAMA_GENERATE_TIMEOUT)
+                .build()
+                .map_err(|err| crate::CoreError::Config(err.to_string()))?,
+            base_url: normalize_ollama_base_url(&config.base_url.unwrap_or_else(|| OLLAMA_DEFAULT_BASE_URL.to_string())),
             model: config.model,
+            temperature: config.temperature,
         })
     }
 }
 
 #[cfg(feature = "ollama")]
-fn build_chat_request(model: &str, messages: &[Message]) -> serde_json::Value {
-    serde_json::json!({
+fn build_chat_request(model: &str, messages: &[Message], temperature: Option<f32>) -> serde_json::Value {
+    let mut request = serde_json::json!({
         "model": model,
         "messages": messages.iter().map(|m| {
             let mut message = serde_json::json!({
@@ -295,7 +334,13 @@ fn build_chat_request(model: &str, messages: &[Message]) -> serde_json::Value {
             message
         }).collect::<Vec<_>>(),
         "stream": false,
-    })
+    });
+    // T1694: LlmConfig::temperature was validated and honored by the candle provider
+    // but silently dropped here -- Ollama takes it inside `options`, not at the top level.
+    if let Some(temperature) = temperature {
+        request["options"] = serde_json::json!({ "temperature": temperature });
+    }
+    request
 }
 
 #[cfg(feature = "ollama")]
@@ -313,7 +358,7 @@ impl LlmProvider for OllamaLlmProvider {
         if messages.is_empty() {
             return Err(LlmError::EmptyMessages);
         }
-        let request = build_chat_request(&self.model, messages);
+        let request = build_chat_request(&self.model, messages, self.temperature);
         let response = self
             .client
             .post(format!("{}/api/chat", self.base_url))
@@ -481,6 +526,28 @@ impl LlmProvider for CandleLlmProvider {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bare_host_gains_a_scheme_and_ollamas_default_port() {
+        assert_eq!(super::normalize_ollama_base_url("192.0.2.1"), "http://192.0.2.1:11434");
+        assert_eq!(super::normalize_ollama_base_url("ollama.internal"), "http://ollama.internal:11434");
+    }
+
+    #[test]
+    fn a_host_with_a_port_gains_only_a_scheme() {
+        assert_eq!(super::normalize_ollama_base_url("192.0.2.1:11500"), "http://192.0.2.1:11500");
+    }
+
+    #[test]
+    fn an_explicit_scheme_is_left_alone_apart_from_a_trailing_slash() {
+        assert_eq!(super::normalize_ollama_base_url("https://ollama.example.com"), "https://ollama.example.com");
+        assert_eq!(super::normalize_ollama_base_url("http://192.0.2.1:11434/"), "http://192.0.2.1:11434");
+    }
+
+    #[test]
+    fn an_empty_value_falls_back_to_the_default_endpoint() {
+        assert_eq!(super::normalize_ollama_base_url("   "), super::OLLAMA_DEFAULT_BASE_URL);
+    }
     use super::{extract_facts, LlmConfig, LlmContractTests, LlmError, LlmProvider, LocalSentenceLlmProvider, Message, Role};
     use crate::test_support::{EchoLlmProvider, FakeLlmProvider};
 
@@ -722,13 +789,27 @@ mod tests {
 
     #[cfg(feature = "ollama")]
     mod ollama_tests {
+
+        #[test]
+        fn build_chat_request_sends_temperature_inside_options() {
+            let messages = vec![Message::new(Role::User, "hello")];
+            let request = build_chat_request("qwen2.5:0.5b", &messages, Some(0.2));
+            assert!((request["options"]["temperature"].as_f64().expect("temperature must be sent") - 0.2).abs() < 1e-6);
+        }
+
+        #[test]
+        fn build_chat_request_omits_options_when_no_temperature_is_configured() {
+            let messages = vec![Message::new(Role::User, "hello")];
+            let request = build_chat_request("qwen2.5:0.5b", &messages, None);
+            assert!(request.get("options").is_none(), "an unset temperature must not send an empty options object");
+        }
         use super::super::{build_chat_request, parse_chat_response, OllamaLlmProvider};
         use super::*;
 
         #[test]
         fn build_chat_request_has_the_expected_shape() {
             let messages = [Message::new(Role::System, "be terse"), Message::new(Role::User, "hello")];
-            let request = build_chat_request("qwen2.5:0.5b", &messages);
+            let request = build_chat_request("qwen2.5:0.5b", &messages, None);
             assert_eq!(request["model"], "qwen2.5:0.5b");
             assert_eq!(request["stream"], false);
             assert_eq!(request["messages"][0]["role"], "system");
@@ -740,14 +821,14 @@ mod tests {
         #[test]
         fn build_chat_request_threads_images_through_for_a_message_that_has_them() {
             let messages = [Message::with_images(Role::User, "describe this", vec!["base64data".to_string()])];
-            let request = build_chat_request("llava", &messages);
+            let request = build_chat_request("llava", &messages, None);
             assert_eq!(request["messages"][0]["images"], serde_json::json!(["base64data"]));
         }
 
         #[test]
         fn build_chat_request_omits_images_for_a_message_that_has_none() {
             let messages = [Message::new(Role::User, "hello")];
-            let request = build_chat_request("qwen2.5:0.5b", &messages);
+            let request = build_chat_request("qwen2.5:0.5b", &messages, None);
             assert!(request["messages"][0].get("images").is_none());
         }
 
