@@ -807,6 +807,21 @@ impl PgVectorStore {
             &format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', payload ->> 'content')) STORED"),
         )?;
         Self::run_idempotent_ddl(&mut client, &format!("CREATE INDEX IF NOT EXISTS {table}_content_tsv_idx ON {table} USING GIN (content_tsv)"))?;
+        // ADR-46 follow-up (T1685-T1687): without these two, every semantic search is
+        // an exact sequential scan and every scope filter is an unindexed jsonb
+        // containment test. HNSW rather than IVFFlat because open() runs this DDL at
+        // startup, when the table is usually empty -- IVFFlat trains its lists from
+        // existing rows and builds a poor index on an empty table, while HNSW does not
+        // need training data. vector_l2_ops because every query orders by <-> (L2); an
+        // index built for a different operator class would simply never be used.
+        Self::run_idempotent_ddl(
+            &mut client,
+            &format!("CREATE INDEX IF NOT EXISTS {table}_vector_hnsw_idx ON {table} USING hnsw (vector vector_l2_ops)"),
+        )?;
+        Self::run_idempotent_ddl(
+            &mut client,
+            &format!("CREATE INDEX IF NOT EXISTS {table}_payload_idx ON {table} USING GIN (payload jsonb_path_ops)"),
+        )?;
         Ok(Self { client: Mutex::new(client), dimension, table: table.to_string() })
     }
 
