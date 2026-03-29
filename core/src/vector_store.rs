@@ -783,8 +783,41 @@ impl VectorStore for SqliteVectorStore {
 }
 
 #[cfg(feature = "postgres")]
+type PgConnectionManager = r2d2_postgres::PostgresConnectionManager<tokio_postgres_rustls::MakeRustlsConnect>;
+
+#[cfg(feature = "postgres")]
+type PgPool = r2d2::Pool<PgConnectionManager>;
+
+#[cfg(feature = "postgres")]
+type PgPooledConnection = r2d2::PooledConnection<PgConnectionManager>;
+
+// ADR-46 follow-up (T1688/T1689): one shared connection behind a Mutex serialized
+// every query from every request while `server` runs a multi-threaded runtime.
+#[cfg(feature = "postgres")]
+const PG_POOL_MAX_CONNECTIONS: u32 = 8;
+
+// T1690: the connector is built for every store, not only for TLS URLs. rust-postgres
+// decides from the connection string's own sslmode whether to negotiate at all, so a
+// plain `sslmode=disable` URL behaves exactly as it did with NoTls, while `require`
+// (every managed Postgres) now works instead of failing at connect time.
+#[cfg(feature = "postgres")]
+fn rustls_tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect, VectorStoreError> {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+    for cert in loaded.certs {
+        drop(roots.add(cert));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|err| VectorStoreError::Backend(err.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
+#[cfg(feature = "postgres")]
 pub struct PgVectorStore {
-    client: Mutex<postgres::Client>,
+    pool: PgPool,
     dimension: usize,
     table: String,
 }
@@ -796,7 +829,10 @@ impl PgVectorStore {
         if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || table.is_empty() {
             return Err(VectorStoreError::Backend(format!("invalid table name: {table}")));
         }
-        let mut client = postgres::Client::connect(connection_string, postgres::NoTls).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let config: postgres::Config = connection_string.parse().map_err(|err: postgres::Error| VectorStoreError::Backend(err.to_string()))?;
+        let manager = r2d2_postgres::PostgresConnectionManager::new(config, rustls_tls_connector()?);
+        let pool = r2d2::Pool::builder().max_size(PG_POOL_MAX_CONNECTIONS).build(manager).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
+        let mut client = pool.get().map_err(|err| VectorStoreError::Backend(err.to_string()))?;
         Self::run_idempotent_ddl(&mut client, "CREATE EXTENSION IF NOT EXISTS vector")?;
         Self::run_idempotent_ddl(
             &mut client,
@@ -822,10 +858,15 @@ impl PgVectorStore {
             &mut client,
             &format!("CREATE INDEX IF NOT EXISTS {table}_payload_idx ON {table} USING GIN (payload jsonb_path_ops)"),
         )?;
-        Ok(Self { client: Mutex::new(client), dimension, table: table.to_string() })
+        drop(client);
+        Ok(Self { pool, dimension, table: table.to_string() })
     }
 
-    fn run_idempotent_ddl(client: &mut postgres::Client, sql: &str) -> Result<(), VectorStoreError> {
+    fn connection(&self) -> Result<PgPooledConnection, VectorStoreError> {
+        self.pool.get().map_err(|err| VectorStoreError::Backend(err.to_string()))
+    }
+
+    fn run_idempotent_ddl(client: &mut PgPooledConnection, sql: &str) -> Result<(), VectorStoreError> {
         match client.execute(sql, &[]) {
             Ok(_) => Ok(()),
             Err(err)
@@ -856,7 +897,7 @@ impl VectorStore for PgVectorStore {
         }
         let vector = pgvector::Vector::from(record.vector);
         let payload = serde_json::to_value(&record.payload).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         client
             .execute(
                 &format!(
@@ -873,7 +914,7 @@ impl VectorStore for PgVectorStore {
     fn search(&self, vector: &[f32], top_k: usize, filters: &HashMap<String, String>, threshold: Option<f32>) -> Result<Vec<SearchResult>, VectorStoreError> {
         let query_vector = pgvector::Vector::from(vector.to_vec());
         let filters_json = Self::filters_to_jsonb(filters);
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let limit = top_k.min(i64::MAX as usize) as i64;
         let rows = if let Some(threshold) = threshold {
@@ -908,7 +949,7 @@ impl VectorStore for PgVectorStore {
     }
 
     fn get(&self, id: &str) -> Result<Option<VectorRecord>, VectorStoreError> {
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         let row = client
             .query_opt(&format!("SELECT vector, payload FROM {} WHERE id = $1", self.table), &[&id])
             .map_err(|err| VectorStoreError::Backend(err.to_string()))?;
@@ -926,7 +967,7 @@ impl VectorStore for PgVectorStore {
     fn update(&self, record: VectorRecord) -> Result<(), VectorStoreError> {
         let vector = pgvector::Vector::from(record.vector);
         let payload = serde_json::to_value(&record.payload).map_err(|err| VectorStoreError::Backend(err.to_string()))?;
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         let affected = client
             .execute(&format!("UPDATE {} SET vector = $2, payload = $3 WHERE id = $1", self.table), &[&record.id, &vector, &payload])
             .map_err(|err| VectorStoreError::Backend(err.to_string()));
@@ -938,7 +979,7 @@ impl VectorStore for PgVectorStore {
     }
 
     fn delete(&self, id: &str) -> Result<(), VectorStoreError> {
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         client.execute(&format!("DELETE FROM {} WHERE id = $1", self.table), &[&id]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
     }
 
@@ -947,7 +988,7 @@ impl VectorStore for PgVectorStore {
         let limit = limit.min(i64::MAX as usize) as i64;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let offset = offset.min(i64::MAX as usize) as i64;
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         let rows = client
             .query(&format!("SELECT id FROM {} ORDER BY id LIMIT $1 OFFSET $2", self.table), &[&limit, &offset])
             .map_err(|err| VectorStoreError::Backend(err.to_string()));
@@ -956,7 +997,7 @@ impl VectorStore for PgVectorStore {
     }
 
     fn reset(&self) -> Result<(), VectorStoreError> {
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         client.execute(&format!("DELETE FROM {}", self.table), &[]).map(|_| ()).map_err(|err| VectorStoreError::Backend(err.to_string()))
     }
 
@@ -964,7 +1005,7 @@ impl VectorStore for PgVectorStore {
         let filters_json = Self::filters_to_jsonb(filters);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let limit = top_k.min(i64::MAX as usize) as i64;
-        let mut client = self.client.lock().expect("lock poisoned");
+        let mut client = self.connection()?;
         let rows = client
             .query(
                 &format!(
@@ -2579,7 +2620,7 @@ mod tests {
             };
             let table = format!("memoria_pg_test_concurrent_open_{}", std::process::id());
             #[allow(clippy::needless_collect)]
-            let handles: Vec<_> = (0..8)
+            let handles: Vec<_> = (0..8_u8)
                 .map(|_| {
                     let url = url.clone();
                     let table = table.clone();
@@ -2709,6 +2750,70 @@ mod tests {
 
             let results = store.keyword_search("ephemeral", 10, &HashMap::new()).expect("keyword_search should succeed").expect("postgres store must support keyword_search");
             assert!(results.is_empty(), "a deleted record must not surface in keyword_search results");
+        }
+
+        // T1690: proves the store reaches TLS negotiation at all, which the previous
+        // hardcoded `postgres::NoTls` could never do. Run against a TLS-enabled server:
+        //   MEMORIA_TEST_POSTGRES_TLS_URL=postgres://postgres:pw@127.0.0.1:5433/memoria?sslmode=require
+        #[test]
+        #[ignore = "requires a real TLS-enabled Postgres at MEMORIA_TEST_POSTGRES_TLS_URL"]
+        fn a_url_requiring_tls_reaches_tls_negotiation() {
+            let Ok(url) = std::env::var("MEMORIA_TEST_POSTGRES_TLS_URL") else {
+                return;
+            };
+            match PgVectorStore::open(&url, 2, "memoria_pg_test_tls_probe") {
+                Ok(store) => {
+                    let record = VectorRecord::new("tls-1", vec![1.0, 2.0], HashMap::new());
+                    store.insert(record).expect("a TLS connection must work like any other");
+                    store.reset().expect("reset should succeed");
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    assert!(
+                        !message.contains("no support for TLS") && !message.contains("does not support SSL"),
+                        "the server offered TLS and the client must attempt it, not refuse outright: {message}"
+                    );
+                    assert!(
+                        message.contains("TLS handshake") || message.contains("certificate") || message.contains("UnknownIssuer"),
+                        "a TLS failure must be a certificate-trust failure, not a connection-shape failure: {message}"
+                    );
+                }
+            }
+        }
+
+        // T1689: the store previously held one connection behind a Mutex, so every
+        // query serialized regardless of how many threads called it. This exercises
+        // the pool from more threads than a single connection could ever serve at once.
+        #[test]
+        #[ignore = "requires a real Postgres at MEMORIA_TEST_POSTGRES_URL"]
+        fn concurrent_callers_share_the_connection_pool() {
+            let Some(url) = test_url() else { return };
+            let store = std::sync::Arc::new(PgVectorStore::open(&url, 2, "memoria_pg_test_pool_concurrency").expect("open should succeed"));
+            store.reset().expect("reset should succeed");
+
+            let handles: Vec<_> = (0..8)
+                .map(|thread: u8| {
+                    let store = std::sync::Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        for index in 0..10_u8 {
+                            let id = format!("pool-{thread}-{index}");
+                            let mut payload = HashMap::new();
+                            payload.insert("user_id".to_string(), "pool".to_string());
+                            store.insert(VectorRecord::new(&id, vec![f32::from(thread), f32::from(index)], payload.clone())).expect("insert should succeed");
+                            store.search(&[f32::from(thread), f32::from(index)], 5, &payload, None).expect("search should succeed");
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("no worker may panic");
+            }
+
+            let mut scope = HashMap::new();
+            scope.insert("user_id".to_string(), "pool".to_string());
+            let found = store.search(&[0.0, 0.0], 100, &scope, None).expect("search should succeed");
+            assert_eq!(found.len(), 80, "every concurrent insert must be visible afterwards");
+            store.reset().expect("reset should succeed");
         }
     }
 
