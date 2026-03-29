@@ -14,6 +14,21 @@ const LINKED_MEMORY_IDS_KEY: &str = "linked_memory_ids";
 const ENTITY_BOOST_FRACTION: f32 = 0.15;
 const ENTITY_MATCHES_PER_QUERY_ENTITY: usize = 5;
 
+// How many records a search pulls out of the store before the keyword pass, entity
+// boost, truncation and reranking run over them. This was unbounded (`usize::MAX`),
+// which meant every search read the whole scope and -- verified with EXPLAIN against
+// a real pgvector instance -- no ANN index could ever be used, because an index scan
+// needs a bounded ORDER BY ... LIMIT. The window is deliberately far wider than
+// `top_k`: the keyword and entity passes only rescore records already in it, so it
+// has to be wide enough for a keyword-strong, semantically-distant record to still
+// be present.
+const SEARCH_CANDIDATE_MULTIPLIER: usize = 20;
+const SEARCH_CANDIDATE_FLOOR: usize = 500;
+
+fn search_candidate_limit(top_k: usize) -> usize {
+    top_k.saturating_mul(SEARCH_CANDIDATE_MULTIPLIER).max(SEARCH_CANDIDATE_FLOOR)
+}
+
 fn is_entity_record(payload: &HashMap<String, String>) -> bool {
     payload.get(ENTITY_RECORD_KIND_KEY).map(String::as_str) == Some(ENTITY_RECORD_KIND_VALUE)
 }
@@ -246,7 +261,8 @@ where
             }
         }
         let vector = self.embedding.embed(query)?;
-        let mut results = self.vector_store.search(&vector, usize::MAX, scope, threshold)?;
+        let candidate_limit = search_candidate_limit(top_k);
+        let mut results = self.vector_store.search(&vector, candidate_limit, scope, threshold)?;
         results.retain(|r| !is_entity_record(&r.payload));
         if !show_expired {
             let today = today_ymd_string();
@@ -266,7 +282,7 @@ where
                 });
             }
         }
-        if let Some(keyword_results) = self.vector_store.keyword_search(query, usize::MAX, scope)? {
+        if let Some(keyword_results) = self.vector_store.keyword_search(query, candidate_limit, scope)? {
             if !keyword_results.is_empty() {
                 combine_with_keyword_scores(&mut results, &keyword_results, explain);
             }
@@ -650,6 +666,35 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_candidate_window_never_drops_below_its_floor() {
+        assert_eq!(super::search_candidate_limit(1), super::SEARCH_CANDIDATE_FLOOR);
+        assert_eq!(super::search_candidate_limit(10), super::SEARCH_CANDIDATE_FLOOR);
+    }
+
+    #[test]
+    fn the_candidate_window_scales_with_top_k_once_past_the_floor() {
+        assert_eq!(super::search_candidate_limit(100), 2000);
+        assert_eq!(super::search_candidate_limit(usize::MAX), usize::MAX, "an absurd top_k must not overflow");
+    }
+
+    #[test]
+    fn a_scope_larger_than_the_top_k_still_returns_a_full_page() {
+        let memory = Memory::new(FakeLlmProvider::with_facts("fact"), FakeEmbeddingProvider::new(), InMemoryVectorStore::new());
+        let mut scope = HashMap::new();
+        scope.insert("user_id".to_string(), "wide".to_string());
+        for index in 0..600 {
+            let mut payload = scope.clone();
+            payload.insert("content".to_string(), format!("record number {index}"));
+            let vector = FakeEmbeddingProvider::new().embed(&format!("record number {index}")).expect("embed should succeed");
+            memory.vector_store.insert(VectorRecord::new(format!("wide-{index}"), vector, payload)).expect("insert should succeed");
+        }
+
+        let results = memory.search("record number 7", 5, &scope, None, false, None, false, false).expect("search should succeed");
+
+        assert_eq!(results.len(), 5, "a scope wider than the candidate floor must still fill a page");
+    }
     use super::*;
     use crate::embedding::EmbeddingConfig;
     use crate::filter::{FilterExpr, FilterOp, FilterValue};
