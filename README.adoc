@@ -83,9 +83,39 @@ each overridable and each validated at startup: `MEMORIA_MAX_TOP_K` (default
 `MEMORIA_MAX_METADATA_BYTES` (default 8192). A request over any of them is
 rejected with a 400 naming the limit.
 
-*MCP server* — point an MCP client (e.g. Claude Code's `claude mcp add`)
-at the compiled `target/debug/mcp` binary; it speaks stdio, no daemon or
-network port involved.
+*MCP server* — the compiled `target/debug/mcp` binary speaks stdio, no
+daemon or network port involved. `install` writes it into every detected
+MCP client's configuration:
+
+[source,sh]
+----
+$ ./target/debug/mcp install --env MEMORIA_SQLITE_PATH=$HOME/.memoria/memoria.db
+claude-code	added	/home/alice/.claude.json
+claude-desktop	not-detected	/home/alice/.config/Claude/claude_desktop_config.json
+cursor	not-detected	/home/alice/.cursor/mcp.json
+opencode	added	/home/alice/.config/opencode/opencode.json
+codex	added	/home/alice/.codex/config.toml
+----
+
+A client counts as detected when its config file or config directory
+exists; `--client NAME` (repeatable: `claude-code`, `claude-desktop`,
+`cursor`, `opencode`, `codex`) configures that client regardless and limits
+the run to the named ones. The entry is named `memoria` and its command is
+the binary's own resolved path unless `--command` says otherwise. Only that
+entry is touched: a changed file is copied to `<file>.bak` first and
+replaced atomically, keeping its permissions and any symlink. A file that
+does not parse — opencode's JSONC with comments, say — is reported and
+left alone, and the exit status is 1. JSON files are rewritten with
+sorted keys; Codex's TOML is edited as text, so comments survive.
+`--dry-run` reports without writing; re-running is a no-op (`unchanged`).
+Replacing an existing entry keeps its env keys unless `--env` sets the same
+key, so re-running after a rebuild does not drop `MEMORIA_SERVER_URL` or an
+API key.
+`uninstall` takes the same `--client`/`--dry-run` and removes the entry.
+opencode's existing `opencode.jsonc` is edited when there is no `opencode.json`,
+rather than creating a second file. `HOME`, `XDG_CONFIG_HOME`,
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are
+honored when locating files.
 
 == Vector stores
 

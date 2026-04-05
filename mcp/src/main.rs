@@ -7,13 +7,15 @@ use memoria_core::memory::Memory;
 use memoria_core::vector_store::{InMemoryVectorStore, VectorStore};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{InitializeResult, ServerCapabilities};
 use rmcp::transport::stdio;
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod install;
 
 type BoxedLlm = Box<dyn LlmProvider + Send + Sync>;
 type BoxedEmbedding = Box<dyn EmbeddingProvider + Send + Sync>;
@@ -735,8 +737,8 @@ impl MemoriaMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoriaMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "memoria: a local-first memory layer for AI agents. Tools: search_memories, get_memory, \
              get_memories, memory_history, add_memory, update_memory, delete_memory, \
              delete_all_memories, list_entities. See ADR-38.",
@@ -985,6 +987,9 @@ fn resolve_vector_store(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(command) = <install::Cli as clap::Parser>::parse().command {
+        std::process::exit(install::execute(command));
+    }
     let mcp_secret = std::env::var("MEMORIA_MCP_SECRET").ok().filter(|value| !value.is_empty());
 
     if let Ok(server_url) = std::env::var("MEMORIA_SERVER_URL") {
